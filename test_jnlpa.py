@@ -111,6 +111,18 @@ def evaluate_model(lbl_enc, proj, name):
     print(f"Macro F1: {f1_macro:.3f} | Micro F1: {f1_micro:.3f}")
     print(f"Precision (macro/micro): {prec_macro:.3f} / {prec_micro:.3f}")
     print(f"Recall (macro/micro): {rec_macro:.3f} / {rec_micro:.3f}")
+
+    if(name == "GLiNER-BioMed fine-tuned"):
+        filename = "fine_tuned_results.md"
+    else:
+        filename = "base_model_results.md"
+
+    with open(filename, "w") as f:
+        f.write(f"=== {name} ===\n")
+        f.write(f"Macro F1: {f1_macro:.3f} | Micro F1: {f1_micro:.3f}\n")
+        f.write(f"Precision (macro/micro): {prec_macro:.3f} / {prec_micro:.3f}\n")
+        f.write(f"Recall (macro/micro): {rec_macro:.3f} / {rec_micro:.3f}\n")    
+        
     return y_true, y_pred
 
 # =====================================================
@@ -121,3 +133,4 @@ evaluate_model(lbl_enc, proj, "GLiNER-BioMed base")
 
 print("\n🚀 Valutazione del modello fine-tunato...")
 evaluate_model(lbl_enc_ft, proj_ft, "GLiNER-BioMed fine-tuned")
+
