@@ -88,7 +88,7 @@ for lab, lid in label2id.items():
 # ===============================================================
 # 5️⃣ (Bilanciamento ridotto per training rapido)
 # ===============================================================
-target_per_class = 200  # ✅ 200 esempi per classe
+target_per_class = 500  # ✅ 200 esempi per classe
 
 balanced = (
     df_train.groupby("label_id")
@@ -145,7 +145,7 @@ for lab, lid in label2id.items():
     print(f"{lab:<12} → {counts_test.get(lid,0)} esempi")
 
 # --- Selezione casuale di 300 esempi ---
-test_sample_size = 300
+test_sample_size = 500
 df_test_sampled = df_test.sample(n=min(len(df_test), test_sample_size), random_state=42)
 df_test_sampled.to_csv("test_data_random.csv", index=False)
 

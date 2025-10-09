@@ -157,7 +157,7 @@ opt = torch.optim.Adam(
     lr=1e-4
 )
 
-epochs = 3
+epochs = 6
 accum_steps = 16  # ~batch virtuale da 16
 model.train()
 core.train()
