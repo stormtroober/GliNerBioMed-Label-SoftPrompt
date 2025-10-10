@@ -1,3 +1,16 @@
+"""
+Fine-tuning del label encoder di GLiNER-BioMed (bi-encoder architecture)
+-----------------------------------------------------------------------
+
+Questo script congela l'encoder del testo e addestra soltanto
+l'encoder delle descrizioni + il livello di proiezione.
+L'obiettivo è migliorare la rappresentazione semantica delle descrizioni
+dei tipi di entità (label) per aumentarne la similarità con gli span corretti.
+
+Dataset: train_data_balanced.csv (es. derivato da JNLPBA)
+"""
+
+
 import random
 import torch
 import torch.nn as nn
@@ -46,6 +59,7 @@ txt_enc = core.token_rep_layer.bert_layer.model
 lbl_enc = core.token_rep_layer.labels_encoder.model
 proj    = core.token_rep_layer.labels_projection
 
+# --- tokenizer dei due encoder ---
 txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
 lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
 
@@ -63,8 +77,14 @@ for p in core.token_rep_layer.labels_projection.parameters():
 
 def get_span_vec_tokens(text, token_span, tokenizer, encoder):
     """
-    Converte lo span (s_word, e_word) in subword indices con word_ids()
-    e calcola la media dei vettori subword corrispondenti.
+    Dato un testo e la posizione di uno span (es. (3, 4) → "gene expression"),
+    calcola l'embedding medio dei subtoken corrispondenti.
+
+    Esempio:
+        text = "One ATF/CRE motif is located in the distal promoter region"
+        token_span = (7, 8) → ["distal", "promoter"]
+
+    → ritorna un vettore torch.Size([hidden_dim]) che rappresenta quello span.
     """
     s_word, e_word = token_span
     words = text.split()  # perché 'text' è costruito da ' '.join(tokens)
@@ -82,6 +102,7 @@ def get_span_vec_tokens(text, token_span, tokenizer, encoder):
     sw = next(i for i, w in enumerate(word_ids) if w == s_word)
     ew = max(i for i, w in enumerate(word_ids) if w == e_word)
 
+    # Ottieni le rappresentazioni hidden dei subtoken (senza gradiente)
     with torch.no_grad():
         hidden = encoder(**{k: enc[k] for k in ["input_ids", "attention_mask"]}).last_hidden_state.squeeze(0)
 
@@ -89,7 +110,15 @@ def get_span_vec_tokens(text, token_span, tokenizer, encoder):
 
 
 def get_label_vecs(labels):
-    """Ottiene gli embedding medi per le descrizioni delle label"""
+    """
+    Calcola l'embedding medio di ogni descrizione di label.
+    Passa nel label encoder + proiezione (trainabile).
+
+    Esempio:
+        labels = ["DNA", "Protein", "Cell line"]
+        desc_texts = ["Deoxyribonucleic acid molecules that carry genetic info", ...]
+    → ritorna tensor shape (num_labels, hidden_dim)
+    """
     batch = lbl_tok(labels, return_tensors="pt", padding=True, truncation=True).to(device)
     out = lbl_enc(**batch)
     attn = batch["attention_mask"].float().unsqueeze(-1)
@@ -116,6 +145,10 @@ train_data = [(row["text"], eval(row["entity_span"]), int(row["label_id"])) for 
 # ===============================================================
 
 def verify_alignment(sample_size=5):
+    """
+    Mostra alcuni esempi per verificare che lo span annotato
+    corrisponda effettivamente ai subtoken giusti.
+    """
     print("\n=== 🔍 Verifica allineamento token/subword ===")
     sample_rows = random.sample(train_data, sample_size)
     for text, token_span, gold_id in sample_rows:
@@ -145,7 +178,7 @@ def verify_alignment(sample_size=5):
     print("\n✅ Se la ricostruzione coincide con l'entità annotata, l'allineamento è corretto.\n")
 
 # Esegui subito la verifica
-verify_alignment(sample_size=5)
+verify_alignment(sample_size=2)
 
 # ===============================================================
 # 4. TRAINING
@@ -157,7 +190,7 @@ opt = torch.optim.Adam(
     lr=1e-4
 )
 
-epochs = 6
+epochs = 2
 accum_steps = 16  # ~batch virtuale da 16
 model.train()
 core.train()
@@ -168,11 +201,19 @@ for epoch in range(epochs):
 
     opt.zero_grad()
     for step, (text, token_span, gold_id) in enumerate(train_data, start=1):
-        label_vecs = get_label_vecs(desc_texts)                 # grad attraverso label-encoder OK
-        span_vec = get_span_vec_tokens(text, token_span, txt_tok, txt_enc)  # no grad sul text-encoder
+        # --- 1️⃣ calcolo embedding descrizioni (con gradiente) ---
+        label_vecs = get_label_vecs(desc_texts)
+        # --- 2️⃣ calcolo embedding dello span (senza gradiente sul text encoder) ---
+        span_vec = get_span_vec_tokens(text, token_span, txt_tok, txt_enc)
+        # --- 3️⃣ similarità (dot product normalizzato) ---
+        # span_vec shape: (384,)
+        # label_vecs shape: (num_labels, 384)
         logits = F.normalize(span_vec, dim=-1) @ F.normalize(label_vecs, dim=-1).T
+        # --- 4️⃣ loss: cross-entropy tra predizioni e label corretta ---
+        # predici un'unica label_id per ogni span
         loss = criterion(logits.unsqueeze(0), torch.tensor([gold_id], device=logits.device))
-
+        
+        # --- 5️⃣ backprop con gradient accumulation ---
         (loss / accum_steps).backward()  # scala la loss per accumulation
         total_loss += loss.item()
 
@@ -195,8 +236,11 @@ model.eval()
 y_true, y_pred = [], []
 
 for text, token_span, gold_id in train_data:
+    # 1️⃣ ottieni rappresentazione dello span (frozen)
     span_vec = get_span_vec_tokens(text, token_span, txt_tok, txt_enc)
+    # 2️⃣ ottieni rappresentazioni label (aggiornate)
     label_vecs = get_label_vecs(desc_texts)
+    # 3️⃣ calcola similarità e prendi la label con score massimo
     logits = F.normalize(span_vec, dim=-1) @ F.normalize(label_vecs, dim=-1).T
     pred_id = logits.argmax().item()
     y_true.append(gold_id)
@@ -214,3 +258,18 @@ print("\n=== 📈 Risultati finali ===")
 print(f"Macro F1: {f1_macro:.3f} | Micro F1: {f1_micro:.3f}")
 print(f"Macro Precision: {prec_macro:.3f} | Macro Recall: {rec_macro:.3f}")
 print(f"Micro Precision: {prec_micro:.3f} | Micro Recall: {rec_micro:.3f}")
+
+"""
+-------------
+- Text encoder (fT_enc): congelato, produce embedding per token/span
+- Label encoder (fE_enc) + projection: trainabili → imparano rappresentazioni migliori delle descrizioni
+- Similarità span-label = dot product (cosine) → CrossEntropyLoss per classificazione multiclass
+- Metriche: macro/micro F1
+
+Esempio interpretativo:
+Se "ATF/CRE motif" corrisponde alla classe "DNA",
+il modello impara ad aumentare la similarità tra
+l'embedding di "ATF/CRE motif" e la descrizione di "DNA"
+("Deoxyribonucleic acid molecules that carry genetic information")
+e a ridurre quella con le altre descrizioni (Protein, Cell line, ...).
+"""

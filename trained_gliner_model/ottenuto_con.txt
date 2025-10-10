@@ -1,0 +1,39 @@
+# ===============================================================
+# 4. TRAINING
+# ===============================================================
+criterion = nn.CrossEntropyLoss()
+opt = torch.optim.Adam(
+    list(core.token_rep_layer.labels_encoder.parameters()) +
+    list(core.token_rep_layer.labels_projection.parameters()),
+    lr=1e-4
+)
+
+epochs = 6
+accum_steps = 16  # ~batch virtuale da 16
+model.train()
+core.train()
+
+for epoch in range(epochs):
+    random.shuffle(train_data)
+    total_loss = 0.0
+
+    opt.zero_grad()
+    for step, (text, token_span, gold_id) in enumerate(train_data, start=1):
+        label_vecs = get_label_vecs(desc_texts)                 # grad attraverso label-encoder OK
+        span_vec = get_span_vec_tokens(text, token_span, txt_tok, txt_enc)  # no grad sul text-encoder
+        logits = F.normalize(span_vec, dim=-1) @ F.normalize(label_vecs, dim=-1).T
+        loss = criterion(logits.unsqueeze(0), torch.tensor([gold_id], device=logits.device))
+
+        (loss / accum_steps).backward()  # scala la loss per accumulation
+        total_loss += loss.item()
+
+        if step % accum_steps == 0:
+            opt.step()
+            opt.zero_grad()
+
+    # flush finale se restano grad non step-ati
+    if step % accum_steps != 0:
+        opt.step()
+        opt.zero_grad()
+
+    print(f"Epoch {epoch+1}/{epochs} | avg_loss={total_loss/len(train_data):.4f}")
