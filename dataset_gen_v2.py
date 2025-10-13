@@ -136,7 +136,7 @@ for ex in encoded_dataset:
             label_counts[l] += 1
 
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
-min_count = 10
+min_count = 100
 balanced_examples = defaultdict(list)
 
 for ex in encoded_dataset:

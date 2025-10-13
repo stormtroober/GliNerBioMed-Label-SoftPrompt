@@ -18,6 +18,10 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 from gliner import GLiNER
 from sklearn.metrics import precision_recall_fscore_support
+from tqdm import tqdm
+import time
+import numpy as np
+
 
 # ===============================================================
 # ⚙️ SETUP BASE
@@ -28,7 +32,7 @@ torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🖥️  Device: {device}")
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 EPOCHS = 2
 LR = 1e-4
 WD = 0.01
@@ -169,7 +173,7 @@ def encode_label_text_train(desc_texts):
     return proj(pooled)  # (C, H)
 
 # ===============================================================
-# ⚙️ TRAINING
+# ⚙️ TRAINING (versione con timing e progress bar)
 # ===============================================================
 core.train()
 loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
@@ -181,37 +185,53 @@ optim = torch.optim.AdamW(
     weight_decay=WD
 )
 
+print(f"\n🚀 Inizio training su {device} | batch_size={BATCH_SIZE} | epochs={EPOCHS}\n")
+
 for epoch in range(1, EPOCHS + 1):
     total_loss = 0.0
+    step_times = []
+    start_epoch = time.time()
 
-    for step, batch in enumerate(loader, 1):
+    # tqdm progress bar
+    pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", leave=True)
+    moving_loss = []
+
+    for step, batch in enumerate(pbar, 1):
+        step_start = time.time()
         batch = {k: v.to(device) for k, v in batch.items()}
         optim.zero_grad()
 
         # 1️⃣ Encode testo (text encoder congelato)
         with torch.no_grad():
             out = txt_enc(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-        H_tok = F.normalize(out.last_hidden_state, dim=-1)  # (B, L, H)
+        H_tok = F.normalize(out.last_hidden_state, dim=-1)
 
         # 2️⃣ Encode descrizioni label (trainabile)
-        H_lbl = F.normalize(encode_label_text_train(labels_text), dim=-1)  # (C, H)
+        H_lbl = F.normalize(encode_label_text_train(labels_text), dim=-1)
 
         # 3️⃣ Similarità dot product
-        logits = torch.matmul(H_tok, H_lbl.T)  # (B, L, C)
+        logits = torch.matmul(H_tok, H_lbl.T)
 
-        # 4️⃣ Calcolo loss
+        # 4️⃣ Loss
         loss = loss_fn(logits.view(-1, num_labels), batch["labels"].view(-1))
         loss.backward()
         optim.step()
 
         total_loss += loss.item()
+        step_time = time.time() - step_start
+        step_times.append(step_time)
+        moving_loss.append(loss.item())
 
-        # Debug parziale ogni 20 step
-        if step % 20 == 0 or step == 1:
-            print(f"[Epoch {epoch}] Step {step}/{len(loader)} | Loss: {loss.item():.4f}")
+        # Aggiorna progress bar ogni step
+        mean_loss = np.mean(moving_loss[-10:])  # media mobile ultimi 10
+        pbar.set_postfix({
+            "loss": f"{mean_loss:.3f}",
+            "step_time": f"{step_time:.2f}s"
+        })
 
+    epoch_time = time.time() - start_epoch
     avg_loss = total_loss / len(loader)
-    print(f"🧩 Epoch {epoch}/{EPOCHS} | avg_loss={avg_loss:.4f}")
+    print(f"🧩 Epoch {epoch}/{EPOCHS} | avg_loss={avg_loss:.4f} | ⏱️ {epoch_time:.1f}s | ⌛ step medio: {np.mean(step_times):.2f}s")
 
 
 # ===============================================================
