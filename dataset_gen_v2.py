@@ -156,7 +156,7 @@ print(f"\n✅ Dataset bilanciato con {len(balanced_dataset)} frasi ({min_count} 
 # ===============================================================
 records = []
 for i, ex in enumerate(balanced_dataset):
-    tokens = tokenizer.convert_ids_to_tokens(ex["input_ids"], skip_special_tokens=True)
+    tokens = tokenizer.convert_ids_to_tokens(ex["input_ids"], skip_special_tokens=False)
     labels = [
         id2label.get(l, "IGNORE") if l != -100 else "IGNORE"
         for l in ex["labels"].tolist()
