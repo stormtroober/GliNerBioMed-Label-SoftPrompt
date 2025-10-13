@@ -136,7 +136,7 @@ for ex in encoded_dataset:
             label_counts[l] += 1
 
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
-min_count = 100
+min_count = 25
 balanced_examples = defaultdict(list)
 
 for ex in encoded_dataset:
@@ -236,3 +236,33 @@ def verify_final_dataset(records, tokenizer, max_inconsistency_ratio=0.02):
 verify_final_dataset(records, tokenizer, max_inconsistency_ratio=0.02)
 
 print("\n✅ Fine generazione e verifica completa dataset BIO-aware.")
+
+# ===============================================================
+# 8️⃣ CREAZIONE DATASET DI TEST SEMPLIFICATO
+# ===============================================================
+print("\n🧪 Generazione dataset di TEST semplificato...")
+
+TEST_SIZE = 100
+
+# Carica split di test ufficiale
+df_data_test = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["test"])
+df_test = df_data_test.head(TEST_SIZE).copy()
+
+records_test = []
+for i, row in df_test.iterrows():
+    tokens = list(row["tokens"])
+    bio_tags = list(row["ner_tags"])
+    # Converti i BIO tag in label base (dna, protein, ecc.)
+    _, base_labels = zip(*[parse_bio_tag(t) for t in bio_tags])
+    records_test.append({
+        "id": i,
+        "tokens": tokens,
+        "labels": list(base_labels)
+    })
+
+out_path = f"dataset_test_raw_{TEST_SIZE}.json"
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(records_test, f, indent=2, ensure_ascii=False)
+
+print(f"💾 Salvato test set in: {out_path} ({len(records_test)} esempi)")
+print("✅ Fine generazione del dataset di TEST semplificato.")
