@@ -10,6 +10,7 @@ Test set: test_dataset_tokenlevel.json
 """
 
 import json
+from numpy import record
 import torch
 import torch.nn.functional as F
 from gliner import GLiNER
@@ -138,8 +139,23 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name):
         label_matrix = compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj).to(DEVICE)
         
         for record in test_records:
-            input_ids = torch.tensor([record["input_ids"]]).to(DEVICE)
-            attention_mask = torch.tensor([record["attention_mask"]]).to(DEVICE)
+            # Ricrea sempre input_ids e attention_mask dai tokens
+            labels = record["labels"]
+            tokens = record["tokens"]  # includono [CLS]/[SEP]
+
+            ids = txt_tok.convert_tokens_to_ids(tokens)
+
+            # Troncamento sicuro su max length del modello, preservando primo e ultimo token
+            max_len = getattr(txt_tok, "model_max_length", 0) or 0
+            if max_len > 0 and len(ids) > max_len:
+                if len(ids) >= 2 and max_len >= 2:
+                    middle_budget = max_len - 2
+                    ids = [ids[0]] + ids[1:1+middle_budget] + [ids[-1]]
+                else:
+                    ids = ids[:max_len]
+
+            input_ids = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=DEVICE)
             labels = record["labels"]
             
             # Forward pass

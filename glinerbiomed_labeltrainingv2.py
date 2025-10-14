@@ -1,14 +1,4 @@
-# -*- coding: utf-8 -*-
 """
-Automatic Description Learning (FINAL - token-level bi-encoder)
-===============================================================
-Flow:
- 1️⃣ Tokenizzazione BIO-aware → gestione subtoken alignment
- 2️⃣ Text encoder (frozen)
- 3️⃣ Label encoder + projection (trainabili)
- 4️⃣ Similarità token↔descrizione
- 5️⃣ CrossEntropyLoss per token
-
 Dataset: dataset_tokenlevel_balanced.json
 Label set: derivato da label2desc.json / label2id.json
 """
@@ -20,15 +10,14 @@ from transformers import AutoTokenizer
 from gliner import GLiNER
 from tqdm import tqdm
 from collections import Counter
-from datetime import datetime
 import os
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 6
-EPOCHS = 4
+BATCH_SIZE = 16
+EPOCHS = 2
 LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 1e-4
 TEMPERATURE = 1.0

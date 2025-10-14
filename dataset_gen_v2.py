@@ -6,6 +6,7 @@ per GLiNER-BioMed (bi-encoder token-level training).
 ✅ Mantiene i tag coerenti anche nei subtokens (non li maschera tutti!)
 ✅ Gestisce correttamente i token speciali e padding
 ✅ Rende il dataset bilanciato ma realistico
+✅ Esporta SOLO i campi richiesti dal training: tokens, labels
 """
 
 import pandas as pd
@@ -24,7 +25,10 @@ with open("label2id.json") as f:
     label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
 
-tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-small")
+# ⚠️ TODO: allinea questo nome al tokenizer del text encoder usato nel training (txt_tok)
+# Esempio: se il text encoder è DeBERTa v3 small, va bene così; altrimenti impostalo al nome giusto.
+TOKENIZER_NAME = "microsoft/deberta-v3-small"
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
 splits = {
     "train": "data/train-00000-of-00001.parquet",
@@ -59,13 +63,12 @@ def parse_bio_tag(tag: str):
 def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
     """
     Tokenizza e allinea le label a livello di subtoken.
-    Regole aggiornate:
       - B/I → label valida anche sui subtokens (no -100 interni)
       - Special tokens ([CLS]/[SEP]) → -100
     """
     assert len(words) == len(bio_tags)
     bio_info = [parse_bio_tag(t) for t in bio_tags]
-    prefixes, base_labels = zip(*bio_info)
+    _, base_labels = zip(*bio_info)
 
     enc = tokenizer(
         words,
@@ -77,15 +80,12 @@ def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
     )
     word_ids = enc.word_ids(0)
     labels_subtok = []
-    prev_word_idx = None
-
     for word_idx in word_ids:
         if word_idx is None:
             labels_subtok.append(-100)
         else:
             lbl = base_labels[word_idx]
             labels_subtok.append(label2id.get(lbl, label2id["O"]))
-        prev_word_idx = word_idx
 
     enc = {k: v.squeeze(0) for k, v in enc.items()}
     enc["labels"] = torch.tensor(labels_subtok, dtype=torch.long)
@@ -117,12 +117,16 @@ for ex in encoded_dataset:
             label_counts[l] += 1
 
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
-min_count = min(label_counts[lid] for lid in non_o_labels)
-target_per_class = max(30, min(min_count, 600))  # più flessibile
+if non_o_labels:
+    min_count = min(label_counts[lid] for lid in non_o_labels)
+    target_per_class = max(30, min(min_count, 50))
+else:
+    target_per_class = 30  # fallback
 
 balanced_examples = defaultdict(list)
 for ex in encoded_dataset:
-    for lid in set([l for l in ex["labels"].tolist() if l != -100 and id2label[l] != "O"]):
+    present = {l for l in ex["labels"].tolist() if l != -100 and id2label.get(l, "O") != "O"}
+    for lid in present:
         balanced_examples[lid].append(ex)
 
 balanced_dataset = []
@@ -133,23 +137,17 @@ for lid in non_o_labels:
 print(f"\n✅ Dataset bilanciato con {len(balanced_dataset)} frasi (~{target_per_class} per classe)")
 
 # ===============================================================
-# 6️⃣ ESPORTAZIONE IN JSON
+# 6️⃣ ESPORTAZIONE IN JSON (SOLO tokens, labels)
 # ===============================================================
 records = []
-for i, ex in enumerate(balanced_dataset):
+for ex in balanced_dataset:
     input_ids = ex["input_ids"].tolist()
     labels = ex["labels"].tolist()
-    attn_mask = ex["attention_mask"].tolist()
+    # Esportiamo SOLO i campi necessari al training:
     tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-    readable_labels = [id2label.get(l, "IGNORE") if l != -100 else "IGNORE" for l in labels]
-
     records.append({
-        "id": i,
-        "input_ids": input_ids,
-        "attention_mask": attn_mask,
-        "labels": labels,
         "tokens": tokens,
-        "labels_str": readable_labels
+        "labels": labels
     })
 
 out_path = "dataset_tokenlevel_balanced.json"
@@ -176,11 +174,11 @@ verify_final_dataset(records)
 print("\n✅ Fine generazione dataset allineato.")
 
 # ===============================================================
-# 8️⃣ GENERAZIONE TEST SET
+# 8️⃣ GENERAZIONE TEST SET (SOLO tokens, labels)
 # ===============================================================
 print("\n📥 Caricamento test split JNLPBA...")
 df_test_raw = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["test"])
-df_test = df_test_raw.head(3000).copy()  # Prendi prime 3000 frasi per test
+df_test = df_test_raw.head(3000).copy()
 print(f"✅ Test set caricato: {len(df_test)} righe")
 
 print("\n⚙️  Costruzione test set token-level allineato...")
@@ -199,22 +197,14 @@ test_sample_size = 1000
 random.seed(42)
 test_sampled = random.sample(test_encoded_dataset, min(len(test_encoded_dataset), test_sample_size))
 
-# Esportazione test set
 test_records = []
-for i, ex in enumerate(test_sampled):
+for ex in test_sampled:
     input_ids = ex["input_ids"].tolist()
     labels = ex["labels"].tolist()
-    attn_mask = ex["attention_mask"].tolist()
     tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-    readable_labels = [id2label.get(l, "IGNORE") if l != -100 else "IGNORE" for l in labels]
-
     test_records.append({
-        "id": i,
-        "input_ids": input_ids,
-        "attention_mask": attn_mask,
-        "labels": labels,
         "tokens": tokens,
-        "labels_str": readable_labels
+        "labels": labels
     })
 
 test_out_path = "test_dataset_tokenlevel.json"
@@ -223,11 +213,10 @@ with open(test_out_path, "w", encoding="utf-8") as f:
 
 print(f"💾 Test set salvato in: {test_out_path} ({len(test_records)} esempi)")
 
-# Verifica distribuzione test set
+# Distribuzione test set (opzionale ma utile)
 def verify_test_dataset(records):
     total, ignored, valid = 0, 0, 0
     label_dist = Counter()
-    
     for rec in records:
         for lab in rec["labels"]:
             total += 1
@@ -236,12 +225,11 @@ def verify_test_dataset(records):
             else:
                 valid += 1
                 label_dist[lab] += 1
-    
     print(f"\n📊 TEST SET - Tot token: {total} | Label valide: {valid/total*100:.1f}% | Ignorate: {ignored/total*100:.1f}%")
     print("\nDistribuzione etichette nel test set:")
     for label_id, count in label_dist.most_common():
         label_name = id2label.get(label_id, f"ID_{label_id}")
-        percentage = (count / valid) * 100
+        percentage = (count / max(valid, 1)) * 100
         print(f"  {label_name:15s}: {count:6d} ({percentage:5.1f}%)")
 
 verify_test_dataset(test_records)
