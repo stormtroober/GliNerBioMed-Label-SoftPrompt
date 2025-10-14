@@ -20,13 +20,15 @@ from transformers import AutoTokenizer
 from gliner import GLiNER
 from tqdm import tqdm
 from collections import Counter
+from datetime import datetime
+import os
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 6
-EPOCHS = 3
+EPOCHS = 4
 LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 1e-4
 TEMPERATURE = 1.0
@@ -319,3 +321,27 @@ print("=== 🔬 PREDIZIONI FINALI ===")
 for tok, p in zip(tokens, preds):
     if tok in ["[CLS]", "[SEP]"]: continue
     print(f"{tok:15s} → {id2label[p.item()]}")
+
+# ==========================================================
+# 💾 SALVATAGGIO MODELLO
+# ==========================================================
+print("\n💾 Salvataggio modello...")
+
+# Crea cartella savings se non esiste
+os.makedirs("savings", exist_ok=True)
+
+# Genera timestamp
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+save_path = f"savings/model_{timestamp}.pt"
+
+# Salva solo i componenti trainabili
+checkpoint = {
+    'label_encoder_state_dict': lbl_enc.state_dict(),
+    'projection_state_dict': proj.state_dict(),
+    'model_name': MODEL_NAME,
+    'epoch': EPOCHS,
+    'learning_rate': LEARNING_RATE,
+}
+
+torch.save(checkpoint, save_path)
+print(f"✅ Modello salvato in: {save_path}")

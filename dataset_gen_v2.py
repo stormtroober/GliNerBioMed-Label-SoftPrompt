@@ -174,3 +174,76 @@ def verify_final_dataset(records):
 
 verify_final_dataset(records)
 print("\n✅ Fine generazione dataset allineato.")
+
+# ===============================================================
+# 8️⃣ GENERAZIONE TEST SET
+# ===============================================================
+print("\n📥 Caricamento test split JNLPBA...")
+df_test_raw = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["test"])
+df_test = df_test_raw.head(3000).copy()  # Prendi prime 3000 frasi per test
+print(f"✅ Test set caricato: {len(df_test)} righe")
+
+print("\n⚙️  Costruzione test set token-level allineato...")
+test_encoded_dataset = []
+for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding"):
+    words = list(row["tokens"])
+    bio_tags = list(row["ner_tags"])
+    if not words or not bio_tags or len(words) != len(bio_tags):
+        continue
+    ex = encode_and_align_labels(words, bio_tags, tokenizer, label2id)
+    test_encoded_dataset.append(ex)
+
+print(f"\n✅ Creati {len(test_encoded_dataset)} esempi test token-level.")
+
+# Selezione casuale di 300 esempi per test rapido
+test_sample_size = 300
+random.seed(42)
+test_sampled = random.sample(test_encoded_dataset, min(len(test_encoded_dataset), test_sample_size))
+
+# Esportazione test set
+test_records = []
+for i, ex in enumerate(test_sampled):
+    input_ids = ex["input_ids"].tolist()
+    labels = ex["labels"].tolist()
+    attn_mask = ex["attention_mask"].tolist()
+    tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+    readable_labels = [id2label.get(l, "IGNORE") if l != -100 else "IGNORE" for l in labels]
+
+    test_records.append({
+        "id": i,
+        "input_ids": input_ids,
+        "attention_mask": attn_mask,
+        "labels": labels,
+        "tokens": tokens,
+        "labels_str": readable_labels
+    })
+
+test_out_path = "test_dataset_tokenlevel.json"
+with open(test_out_path, "w", encoding="utf-8") as f:
+    json.dump(test_records, f, indent=2, ensure_ascii=False)
+
+print(f"💾 Test set salvato in: {test_out_path} ({len(test_records)} esempi)")
+
+# Verifica distribuzione test set
+def verify_test_dataset(records):
+    total, ignored, valid = 0, 0, 0
+    label_dist = Counter()
+    
+    for rec in records:
+        for lab in rec["labels"]:
+            total += 1
+            if lab == -100:
+                ignored += 1
+            else:
+                valid += 1
+                label_dist[lab] += 1
+    
+    print(f"\n📊 TEST SET - Tot token: {total} | Label valide: {valid/total*100:.1f}% | Ignorate: {ignored/total*100:.1f}%")
+    print("\nDistribuzione etichette nel test set:")
+    for label_id, count in label_dist.most_common():
+        label_name = id2label.get(label_id, f"ID_{label_id}")
+        percentage = (count / valid) * 100
+        print(f"  {label_name:15s}: {count:6d} ({percentage:5.1f}%)")
+
+verify_test_dataset(test_records)
+print("\n✅ Fine generazione test set.")
