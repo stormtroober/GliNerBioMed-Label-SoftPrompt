@@ -57,6 +57,61 @@ print(f"✅ Caricati {len(test_records)} esempi di test")
 # ==========================================================
 # 2️⃣ FUNZIONI HELPER
 # ==========================================================
+def select_checkpoint_interactive(savings_dir="savings"):
+    """Mostra menu interattivo per selezionare checkpoint."""
+    checkpoints = [f for f in os.listdir(savings_dir) if f.endswith('.pt')]
+    
+    if not checkpoints:
+        raise FileNotFoundError(f"Nessun checkpoint trovato in {savings_dir}/")
+    
+    # Ordina per data di modifica (più recente prima)
+    checkpoints_info = []
+    for ckpt in checkpoints:
+        path = os.path.join(savings_dir, ckpt)
+        mtime = os.path.getmtime(path)
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        checkpoints_info.append({
+            'name': ckpt,
+            'path': path,
+            'mtime': mtime,
+            'size_mb': size_mb
+        })
+    
+    checkpoints_info.sort(key=lambda x: x['mtime'], reverse=True)
+    
+    # Mostra menu
+    print("\n" + "="*60)
+    print("📦 SELEZIONE CHECKPOINT")
+    print("="*60)
+    
+    for i, info in enumerate(checkpoints_info, 1):
+        import datetime
+        date_str = datetime.datetime.fromtimestamp(info['mtime']).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"{i}. {info['name']}")
+        print(f"   📅 {date_str} | 💾 {info['size_mb']:.1f} MB")
+    
+    # Input utente
+    while True:
+        try:
+            choice = input(f"\n👉 Seleziona checkpoint (1-{len(checkpoints_info)}) [default: 1]: ").strip()
+            
+            if choice == "":
+                choice = 1
+            else:
+                choice = int(choice)
+            
+            if 1 <= choice <= len(checkpoints_info):
+                selected = checkpoints_info[choice - 1]
+                print(f"✅ Selezionato: {selected['name']}")
+                return selected['path']
+            else:
+                print(f"❌ Numero non valido. Scegli tra 1 e {len(checkpoints_info)}")
+        except ValueError:
+            print("❌ Input non valido. Inserisci un numero.")
+        except KeyboardInterrupt:
+            print("\n\n❌ Operazione annullata.")
+            exit(0)
+
 def compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj):
     """Embedda le descrizioni con encoder + projection."""
     desc_texts = [label2desc[k] for k in label_names]
@@ -200,6 +255,9 @@ results_base = evaluate_model(txt_enc_base, lbl_enc_base, proj_base, txt_tok, lb
 print("\n" + "="*60)
 print("🔸 MODELLO FINE-TUNATO")
 print("="*60)
+
+# Selezione interattiva checkpoint
+CHECKPOINT_PATH = select_checkpoint_interactive("savings")
 
 # Carica stesso modello base
 model_ft = GLiNER.from_pretrained(MODEL_NAME)

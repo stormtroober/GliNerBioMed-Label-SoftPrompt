@@ -330,9 +330,21 @@ print("\n💾 Salvataggio modello...")
 # Crea cartella savings se non esiste
 os.makedirs("savings", exist_ok=True)
 
-# Genera timestamp
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-save_path = f"savings/model_{timestamp}.pt"
+# Calcola lunghezza training set
+train_set_size = len(ds)
+
+# Genera nome file con parametri
+filename = (f"model_trainsize{train_set_size}_"
+           f"bs{BATCH_SIZE}_"
+           f"ep{EPOCHS}_"
+           f"lr{LEARNING_RATE}_"
+           f"wd{WEIGHT_DECAY}_"
+           f"temp{TEMPERATURE}_"
+           f"gc{GRAD_CLIP}_"
+           f"ss{SCHEDULER_STEP}_"
+           f"sg{SCHEDULER_GAMMA}.pt")
+
+save_path = f"savings/{filename}"
 
 # Salva solo i componenti trainabili
 checkpoint = {
@@ -341,6 +353,13 @@ checkpoint = {
     'model_name': MODEL_NAME,
     'epoch': EPOCHS,
     'learning_rate': LEARNING_RATE,
+    'train_set_size': train_set_size,
+    'batch_size': BATCH_SIZE,
+    'weight_decay': WEIGHT_DECAY,
+    'temperature': TEMPERATURE,
+    'grad_clip': GRAD_CLIP,
+    'scheduler_step': SCHEDULER_STEP,
+    'scheduler_gamma': SCHEDULER_GAMMA,
 }
 
 torch.save(checkpoint, save_path)

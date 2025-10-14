@@ -118,7 +118,7 @@ for ex in encoded_dataset:
 
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
 min_count = min(label_counts[lid] for lid in non_o_labels)
-target_per_class = max(30, min(min_count, 60))  # più flessibile
+target_per_class = max(30, min(min_count, 600))  # più flessibile
 
 balanced_examples = defaultdict(list)
 for ex in encoded_dataset:
@@ -196,7 +196,7 @@ for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding")
 print(f"\n✅ Creati {len(test_encoded_dataset)} esempi test token-level.")
 
 # Selezione casuale di 300 esempi per test rapido
-test_sample_size = 300
+test_sample_size = 3000
 random.seed(42)
 test_sampled = random.sample(test_encoded_dataset, min(len(test_encoded_dataset), test_sample_size))
 
