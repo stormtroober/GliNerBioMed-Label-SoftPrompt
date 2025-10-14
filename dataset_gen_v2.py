@@ -118,7 +118,7 @@ for ex in encoded_dataset:
 
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
 min_count = min(label_counts[lid] for lid in non_o_labels)
-target_per_class = max(30, min(min_count, 50))  # più flessibile
+target_per_class = max(30, min(min_count, 60))  # più flessibile
 
 balanced_examples = defaultdict(list)
 for ex in encoded_dataset:

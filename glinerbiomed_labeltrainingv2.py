@@ -19,15 +19,35 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from gliner import GLiNER
 from tqdm import tqdm
+from collections import Counter
 
+# ==========================================================
+# 🔧 CONFIGURAZIONE
+# ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-torch.manual_seed(42)
+BATCH_SIZE = 6
+EPOCHS = 3
+LEARNING_RATE = 1e-5
+WEIGHT_DECAY = 1e-4
+TEMPERATURE = 1.0
+GRAD_CLIP = 1.0
+SCHEDULER_STEP = 2
+SCHEDULER_GAMMA = 0.5
+RANDOM_SEED = 42
+
+DATASET_PATH = "dataset_tokenlevel_balanced.json"
+LABEL2DESC_PATH = "label2desc.json"
+LABEL2ID_PATH = "label2id.json"
+MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+TEST_EXAMPLE_IDX = 5
+
+torch.manual_seed(RANDOM_SEED)
 
 # ==========================================================
 # 0️⃣ MODELLO + TOKENIZER
 # ==========================================================
 print("📦 Caricamento modello base GLiNER-BioMed...")
-model = GLiNER.from_pretrained("Ihor/gliner-biomed-bi-small-v1.0")
+model = GLiNER.from_pretrained(MODEL_NAME)
 core = model.model
 
 txt_enc = core.token_rep_layer.bert_layer.model       # text encoder (frozen)
@@ -45,8 +65,8 @@ for p in proj.parameters(): p.requires_grad = True
 # ==========================================================
 # 1️⃣ LABELS E DESCRIZIONI
 # ==========================================================
-with open("label2desc.json") as f: label2desc = json.load(f)
-with open("label2id.json") as f: label2id = json.load(f)
+with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
+with open(LABEL2ID_PATH) as f: label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
 label_names = list(label2desc.keys())
 
@@ -105,14 +125,13 @@ def collate_batch(batch, pad_id, ignore_index=-100):
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
 # ==========================================================
-# 3️⃣ TRAINING SETUP (FIXED)
+# 3️⃣ TRAINING SETUP
 # ==========================================================
 print("📚 Caricamento dataset...")
-ds = TokenJsonDataset("dataset_tokenlevel_balanced.json", txt_tok, label2id)
-loader = DataLoader(ds, batch_size=4, shuffle=True,
+ds = TokenJsonDataset(DATASET_PATH, txt_tok, label2id)
+loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
                     collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
 
-# 🔧 FIX 1: Weighted CrossEntropy per sbilanciamento
 def compute_class_weights(data_path, label2id):
     with open(data_path, "r") as f:
         data = json.load(f)
@@ -126,58 +145,53 @@ def compute_class_weights(data_path, label2id):
                 counts[label] += 1
                 total += 1
     
-    # Peso inversamente proporzionale
     weights = total / (len(label2id) * counts.clamp(min=1))
     print(f"🔧 Class weights: {weights}")
     return weights
 
-class_weights = compute_class_weights("dataset_tokenlevel_balanced.json", label2id).to(DEVICE)
+class_weights = compute_class_weights(DATASET_PATH, label2id).to(DEVICE)
 ce = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
 
-# 🔧 FIX 2: Learning rate più basso + schedulers
 optimizer = optim.Adam(list(lbl_enc.parameters()) + list(proj.parameters()), 
-                      lr=1e-5, weight_decay=1e-4)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
-
-# 🔧 FIX 3: Temperature scaling per logits
-temperature = 2.0  # Softening dei logits
+                      lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=SCHEDULER_STEP, gamma=SCHEDULER_GAMMA)
 
 txt_enc.eval().to(DEVICE)
 lbl_enc.train().to(DEVICE)
 proj.train().to(DEVICE)
 
 # ==========================================================
-# 4️⃣ TRAINING LOOP (FIXED)
+# 4️⃣ TRAINING LOOP
 # ==========================================================
-print("\n🚀 Inizio training (token-level bi-encoder FIXED)...\n")
+print("\n🚀 Inizio training (token-level bi-encoder)...\n")
 
-for epoch in range(1, 3):  # Più epoche
+for epoch in range(1, EPOCHS + 1):
     total_loss, total_acc, n_tokens = 0.0, 0.0, 0
     class_correct = torch.zeros(len(label_names))
     class_total = torch.zeros(len(label_names))
     
-    for batch in tqdm(loader, desc=f"Epoch {epoch}/3"):
+    for batch in tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}"):
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
         optimizer.zero_grad()
 
-        # 1️⃣ Hidden del testo (frozen)
+        # Hidden del testo (frozen)
         with torch.no_grad():
             out_txt = txt_enc(**{k: batch[k] for k in ["input_ids","attention_mask"]})
             H = F.normalize(out_txt.last_hidden_state, dim=-1)  # [B, T, D]
 
-        # 2️⃣ Hidden delle descrizioni (trainabili)
+        # Hidden delle descrizioni (trainabili)
         label_matrix = compute_label_matrix(label2desc).to(DEVICE)  # [num_labels, D]
 
-        # 3️⃣ Similarità token-label + Temperature scaling
-        logits = torch.matmul(H, label_matrix.T) / temperature  # [B, T, num_labels]
+        # Similarità token-label + Temperature scaling
+        logits = torch.matmul(H, label_matrix.T) / TEMPERATURE  # [B, T, num_labels]
 
-        # 4️⃣ Loss
+        # Loss
         loss = ce(logits.view(-1, len(label_names)), batch["labels"].view(-1))
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(lbl_enc.parameters()) + list(proj.parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(list(lbl_enc.parameters()) + list(proj.parameters()), GRAD_CLIP)
         optimizer.step()
 
-        # 5️⃣ Accuracy per classe
+        # Accuracy per classe
         mask = batch["labels"] != -100
         preds = logits.argmax(-1)
         acc = (preds[mask] == batch["labels"][mask]).float().sum().item()
@@ -192,7 +206,7 @@ for epoch in range(1, 3):  # Più epoche
 
     scheduler.step()
     
-    print(f"Epoch {epoch}/5 | loss={total_loss/len(loader):.4f} | acc={(total_acc/n_tokens)*100:.1f}%")
+    print(f"Epoch {epoch}/{EPOCHS} | loss={total_loss/len(loader):.4f} | acc={(total_acc/n_tokens)*100:.1f}%")
     
     # Accuracy per classe
     print("📊 Accuracy per classe:")
@@ -203,16 +217,11 @@ for epoch in range(1, 3):  # Più epoche
 
 print("\n✅ Fine training.\n")
 
-
-from collections import Counter
-
-# Dopo il training, aggiungi queste analisi:
-
 # ==========================================================
 # 🔍 ANALISI 1: Distribuzione delle etichette nel dataset
 # ==========================================================
 print("\n=== 📊 ANALISI DATASET ===")
-with open("dataset_tokenlevel_balanced.json", "r") as f:
+with open(DATASET_PATH, "r") as f:
     data = json.load(f)
 
 all_labels = []
@@ -290,12 +299,11 @@ with torch.no_grad():
 # ==========================================================
 # 5️⃣ TEST SU FRASE DEL TRAINING
 # ==========================================================
-idx = 5
-example = ds.records[idx]
+example = ds.records[TEST_EXAMPLE_IDX]
 tokens_test = [t for t in example["tokens"] if t not in ["[CLS]", "[SEP]"]]
 sentence = " ".join([t.replace("▁", "") for t in tokens_test])
 
-print(f"\n🔍 Test su frase id={idx}:\n{sentence[:200]}...\n")
+print(f"\n🔍 Test su frase id={TEST_EXAMPLE_IDX}:\n{sentence[:200]}...\n")
 
 enc = txt_tok(sentence.split(), is_split_into_words=True,
               return_tensors="pt", truncation=True, padding=True).to(DEVICE)
