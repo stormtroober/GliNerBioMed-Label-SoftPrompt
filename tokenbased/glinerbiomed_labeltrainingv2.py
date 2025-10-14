@@ -26,9 +26,9 @@ SCHEDULER_STEP = 2
 SCHEDULER_GAMMA = 0.5
 RANDOM_SEED = 42
 
-DATASET_PATH = "dataset_tokenlevel_balanced.json"
-LABEL2DESC_PATH = "label2desc.json"
-LABEL2ID_PATH = "label2id.json"
+DATASET_PATH = "dataset/dataset_tokenlevel_balanced.json"
+LABEL2DESC_PATH = "../label2desc.json"
+LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)

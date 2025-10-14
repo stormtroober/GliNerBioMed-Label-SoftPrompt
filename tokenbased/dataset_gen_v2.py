@@ -21,7 +21,7 @@ import random
 # 1️⃣ CONFIGURAZIONE
 # ===============================================================
 print("📥 Caricamento label2id.json e tokenizer...")
-with open("label2id.json") as f:
+with open("../label2id.json") as f:
     label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
 
@@ -119,9 +119,7 @@ for ex in encoded_dataset:
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
 if non_o_labels:
     min_count = min(label_counts[lid] for lid in non_o_labels)
-    target_per_class = max(30, min(min_count, 50))
-else:
-    target_per_class = 30  # fallback
+    target_per_class = 200 # scegli qui il numero di esempi per classe
 
 balanced_examples = defaultdict(list)
 for ex in encoded_dataset:
@@ -150,7 +148,7 @@ for ex in balanced_dataset:
         "labels": labels
     })
 
-out_path = "dataset_tokenlevel_balanced.json"
+out_path = "dataset/dataset_tokenlevel_balanced.json"
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(records, f, indent=2, ensure_ascii=False)
 
@@ -207,7 +205,7 @@ for ex in test_sampled:
         "labels": labels
     })
 
-test_out_path = "test_dataset_tokenlevel.json"
+test_out_path = "dataset/test_dataset_tokenlevel.json"
 with open(test_out_path, "w", encoding="utf-8") as f:
     json.dump(test_records, f, indent=2, ensure_ascii=False)
 
