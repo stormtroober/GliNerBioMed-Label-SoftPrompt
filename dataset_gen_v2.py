@@ -195,8 +195,7 @@ for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding")
 
 print(f"\n✅ Creati {len(test_encoded_dataset)} esempi test token-level.")
 
-# Selezione casuale di 300 esempi per test rapido
-test_sample_size = 3000
+test_sample_size = 1000
 random.seed(42)
 test_sampled = random.sample(test_encoded_dataset, min(len(test_encoded_dataset), test_sample_size))
 

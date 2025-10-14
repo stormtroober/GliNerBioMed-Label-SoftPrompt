@@ -41,7 +41,6 @@ DATASET_PATH = "dataset_tokenlevel_balanced.json"
 LABEL2DESC_PATH = "label2desc.json"
 LABEL2ID_PATH = "label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
-TEST_EXAMPLE_IDX = 5
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -301,11 +300,11 @@ with torch.no_grad():
 # ==========================================================
 # 5️⃣ TEST SU FRASE DEL TRAINING
 # ==========================================================
-example = ds.records[TEST_EXAMPLE_IDX]
+example = ds.records[0]
 tokens_test = [t for t in example["tokens"] if t not in ["[CLS]", "[SEP]"]]
 sentence = " ".join([t.replace("▁", "") for t in tokens_test])
 
-print(f"\n🔍 Test su frase id={TEST_EXAMPLE_IDX}:\n{sentence[:200]}...\n")
+print(f"\n🔍 Test su frase id={0}:\n{sentence[:200]}...\n")
 
 enc = txt_tok(sentence.split(), is_split_into_words=True,
               return_tensors="pt", truncation=True, padding=True).to(DEVICE)
