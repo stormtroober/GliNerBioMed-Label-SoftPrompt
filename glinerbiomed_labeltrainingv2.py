@@ -1,167 +1,313 @@
-# step2_gliner_check.py
-import torch
-from gliner import GLiNER
-import json
-from pathlib import Path
-from tqdm import tqdm
-import torch.nn.functional as F
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import json
-from gliner import GLiNER
-from pathlib import Path
-from transformers import AutoTokenizer
-from tqdm import tqdm
+# -*- coding: utf-8 -*-
+"""
+Automatic Description Learning (FINAL - token-level bi-encoder)
+===============================================================
+Flow:
+ 1️⃣ Tokenizzazione BIO-aware → gestione subtoken alignment
+ 2️⃣ Text encoder (frozen)
+ 3️⃣ Label encoder + projection (trainabili)
+ 4️⃣ Similarità token↔descrizione
+ 5️⃣ CrossEntropyLoss per token
 
+Dataset: dataset_tokenlevel_balanced.json
+Label set: derivato da label2desc.json / label2id.json
+"""
+
+import json, torch, torch.nn.functional as F
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+from gliner import GLiNER
+from tqdm import tqdm
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(42)
 
-# 1️⃣ Carica il modello completo (GLiNER BioMed)
-print("📥 Caricamento GLiNER BioMed...")
+# ==========================================================
+# 0️⃣ MODELLO + TOKENIZER
+# ==========================================================
+print("📦 Caricamento modello base GLiNER-BioMed...")
 model = GLiNER.from_pretrained("Ihor/gliner-biomed-bi-small-v1.0")
-core = model.model  # SpanModel interno
+core = model.model
 
-# Estrarre i componenti
-txt_enc = core.token_rep_layer.bert_layer.model          # encoder del testo
-lbl_enc = core.token_rep_layer.labels_encoder.model      # encoder delle descrizioni
-proj    = core.token_rep_layer.labels_projection         # proiezione label -> dim testo
+txt_enc = core.token_rep_layer.bert_layer.model       # text encoder (frozen)
+lbl_enc = core.token_rep_layer.labels_encoder.model   # label encoder (trainable)
+proj    = core.token_rep_layer.labels_projection      # projection (trainable)
 
-
-print(txt_enc.config._name_or_path)
-print(lbl_enc.config._name_or_path)
-print("\n✅ Estratti encoder GLiNER:")
-print(" - Text encoder:", type(txt_enc))
-print(" - Label encoder:", type(lbl_enc))
-print(" - Projection:", proj)
-
-# 2️⃣ Carica mapping e descrizioni
-LABEL2DESC = "label2desc.json"
-label2desc = json.loads(Path(LABEL2DESC).read_text())
-if "O" not in label2desc:
-    label2desc["O"] = "outside / non-entity token"
-labels = list(label2desc.keys())
-desc_texts = [label2desc[l] for l in labels]
-print(f"\n📚 Label set ({len(labels)}):", labels)
-
-from transformers import AutoTokenizer
-import torch, json
-from pathlib import Path
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# 1) Ricava i tokenizer corretti dagli encoder
-txt_tok = AutoTokenizer.from_pretrained(txt_enc.config.name_or_path)
-lab_tok = AutoTokenizer.from_pretrained(lbl_enc.config.name_or_path)
-
-# 2) Encoda le descrizioni con il label encoder (+ proiezione)
-enc_lab = lab_tok(desc_texts, padding=True, truncation=True, return_tensors="pt").to(DEVICE)
-with torch.no_grad():
-    Hlab = lbl_enc(**enc_lab).last_hidden_state[:, 0, :]   # [K, 384]
-    Hlab_proj = proj(Hlab)                                  # [K, 768]
-
-print(f"[OK] Hlab raw {tuple(Hlab.shape)} → proj {tuple(Hlab_proj.shape)}")
-
-# 3) Test rapido sul testo GREZZO (non usare il dataset token-level qui)
-text = "T cell priming enhances IL-4 gene expression by increasing nuclear factor of activated T cells."
-enc_txt = txt_tok(text, return_tensors="pt").to(DEVICE)
-with torch.no_grad():
-    Htxt = txt_enc(**enc_txt).last_hidden_state             # [1, L, 768]
-print(f"[OK] Htxt {tuple(Htxt.shape)}")
-
-# 4) Similarità token–label
-Htxt_n = torch.nn.functional.normalize(Htxt, dim=-1)
-Hlab_n = torch.nn.functional.normalize(Hlab_proj, dim=-1)
-S = torch.einsum("bld,kd->blk", Htxt_n, Hlab_n)             # [1, L, K]
-
-print(f"[OK] S {tuple(S.shape)}  mean={S.mean().item():.3f}±{S.std().item():.3f}")
-pred = S[0].argmax(-1)
-print("Primi 10 token e pred:")
-for t, p in zip(txt_tok.convert_ids_to_tokens(enc_txt["input_ids"][0])[:10], pred[:10].tolist()):
-    print(f"{t:15s} → {labels[p]}")
-
-
-for p in txt_enc.parameters():
-    p.requires_grad = False  # FREEZE
-print("✅ Text encoder frozen")
-
-train_params = list(lbl_enc.parameters()) + list(proj.parameters())
-print(f"Trainable params: {sum(p.numel() for p in train_params)/1e6:.2f}M")
-
-# === 2️⃣ Tokenizer e label mapping ===
 txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
-LABEL2ID = "label2id.json"
-label2id = json.loads(Path(LABEL2ID).read_text())
-K = len(label2id)
+lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
+
+# Congeliamo il text encoder
+for p in txt_enc.parameters(): p.requires_grad = False
+for p in lbl_enc.parameters(): p.requires_grad = True
+for p in proj.parameters(): p.requires_grad = True
+
+# ==========================================================
+# 1️⃣ LABELS E DESCRIZIONI
+# ==========================================================
+with open("label2desc.json") as f: label2desc = json.load(f)
+with open("label2id.json") as f: label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
+label_names = list(label2desc.keys())
 
-# === 3️⃣ Dataset loader ===
-DATA_JSON = "dataset_masked_balanced_bio.json"
-recs = json.loads(Path(DATA_JSON).read_text())
+def compute_label_matrix(label2desc: dict) -> torch.Tensor:
+    """Embedda le descrizioni con lbl_enc + proj (trainabili)."""
+    desc_texts = [label2desc[k] for k in label_names]
+    batch = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+    out = lbl_enc(**batch).last_hidden_state
+    mask = batch["attention_mask"].unsqueeze(-1).float()
+    pooled = (out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+    vecs = proj(pooled)
+    return F.normalize(vecs, dim=-1)   # [num_labels, hidden_dim]
 
-def collate_fn(batch):
-    maxlen = max(len(r["tokens"]) for r in batch)
-    pad_id = txt_tok.pad_token_id or 0
-    input_ids, attn, labels = [], [], []
-    for r in batch:
-        ids = txt_tok.convert_tokens_to_ids(r["tokens"])
-        ids += [pad_id]*(maxlen-len(ids))
-        mask = [1]*len(r["tokens"]) + [0]*(maxlen-len(r["tokens"]))
-        lab  = [(-100 if l=="IGNORE" else label2id.get(l,label2id["O"])) for l in r["labels"]]
-        lab += [-100]*(maxlen-len(lab))
-        input_ids.append(ids); attn.append(mask); labels.append(lab)
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "attention_mask": torch.tensor(attn, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long)
-    }
+# ==========================================================
+# 2️⃣ DATASET TOKEN-LEVEL
+# ==========================================================
+class TokenJsonDataset(Dataset):
+    def __init__(self, path_json, tokenizer, label2id):
+        with open(path_json, "r", encoding="utf-8") as f:
+            self.records = json.load(f)
+        self.tok = tokenizer
+        self.label2id = label2id
+        self.pad_id = tokenizer.pad_token_id
 
-loader = DataLoader(recs, batch_size=4, shuffle=True, collate_fn=collate_fn)
+    def __len__(self): return len(self.records)
 
-# === 4️⃣ Training loop ===
-loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-opt = torch.optim.AdamW(train_params, lr=2e-5, weight_decay=0.01)
+    def __getitem__(self, idx):
+        rec = self.records[idx]
+        tokens = rec["tokens"]
+        labels = rec["labels"]
 
-for epoch in range(3):
-    lbl_enc.train(); proj.train()
-    total_loss, steps = 0.0, 0
-    for batch in tqdm(loader, desc=f"Epoch {epoch+1}"):
-        batch = {k: v.to(DEVICE) for k,v in batch.items()}
+        input_ids = self.tok.convert_tokens_to_ids(tokens)
+        attention_mask = [1] * len(input_ids)
+        y = []
+        for lab in labels:
+            if lab == -100: y.append(-100)
+            else: y.append(lab)
 
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(y),
+        }
+
+def collate_batch(batch, pad_id, ignore_index=-100):
+    maxlen = max(len(x["input_ids"]) for x in batch)
+    B = len(batch)
+    input_ids = torch.full((B, maxlen), pad_id, dtype=torch.long)
+    attn_mask = torch.zeros((B, maxlen), dtype=torch.long)
+    labels = torch.full((B, maxlen), ignore_index, dtype=torch.long)
+    for i, ex in enumerate(batch):
+        L = len(ex["input_ids"])
+        input_ids[i, :L] = ex["input_ids"]
+        attn_mask[i, :L] = ex["attention_mask"]
+        labels[i, :L] = ex["labels"]
+    return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
+
+# ==========================================================
+# 3️⃣ TRAINING SETUP (FIXED)
+# ==========================================================
+print("📚 Caricamento dataset...")
+ds = TokenJsonDataset("dataset_tokenlevel_balanced.json", txt_tok, label2id)
+loader = DataLoader(ds, batch_size=4, shuffle=True,
+                    collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
+
+# 🔧 FIX 1: Weighted CrossEntropy per sbilanciamento
+def compute_class_weights(data_path, label2id):
+    with open(data_path, "r") as f:
+        data = json.load(f)
+    
+    counts = torch.zeros(len(label2id))
+    total = 0
+    
+    for record in data:
+        for label in record["labels"]:
+            if label != -100:
+                counts[label] += 1
+                total += 1
+    
+    # Peso inversamente proporzionale
+    weights = total / (len(label2id) * counts.clamp(min=1))
+    print(f"🔧 Class weights: {weights}")
+    return weights
+
+class_weights = compute_class_weights("dataset_tokenlevel_balanced.json", label2id).to(DEVICE)
+ce = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
+
+# 🔧 FIX 2: Learning rate più basso + schedulers
+optimizer = optim.Adam(list(lbl_enc.parameters()) + list(proj.parameters()), 
+                      lr=1e-5, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
+
+# 🔧 FIX 3: Temperature scaling per logits
+temperature = 2.0  # Softening dei logits
+
+txt_enc.eval().to(DEVICE)
+lbl_enc.train().to(DEVICE)
+proj.train().to(DEVICE)
+
+# ==========================================================
+# 4️⃣ TRAINING LOOP (FIXED)
+# ==========================================================
+print("\n🚀 Inizio training (token-level bi-encoder FIXED)...\n")
+
+for epoch in range(1, 3):  # Più epoche
+    total_loss, total_acc, n_tokens = 0.0, 0.0, 0
+    class_correct = torch.zeros(len(label_names))
+    class_total = torch.zeros(len(label_names))
+    
+    for batch in tqdm(loader, desc=f"Epoch {epoch}/3"):
+        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+        optimizer.zero_grad()
+
+        # 1️⃣ Hidden del testo (frozen)
         with torch.no_grad():
-            Htxt = txt_enc(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"]
-            ).last_hidden_state  # [B,L,768]
+            out_txt = txt_enc(**{k: batch[k] for k in ["input_ids","attention_mask"]})
+            H = F.normalize(out_txt.last_hidden_state, dim=-1)  # [B, T, D]
 
-        # Forward label encoder + projection
-        descs = list(label2id.keys())
-        enc_lab = core.token_rep_layer.labels_encoder.tokenizer(
-            descs, padding=True, truncation=True, return_tensors="pt"
-        ).to(DEVICE)
-        Hlab = lbl_enc(**enc_lab).last_hidden_state[:,0,:]  # [K,384]
-        Hlab_proj = proj(Hlab)                              # [K,768]
+        # 2️⃣ Hidden delle descrizioni (trainabili)
+        label_matrix = compute_label_matrix(label2desc).to(DEVICE)  # [num_labels, D]
 
-        # Similarità
-        Htxt_n = torch.nn.functional.normalize(Htxt, dim=-1)
-        Hlab_n = torch.nn.functional.normalize(Hlab_proj, dim=-1)
-        sims = torch.einsum("bld,kd->blk", Htxt_n, Hlab_n)
+        # 3️⃣ Similarità token-label + Temperature scaling
+        logits = torch.matmul(H, label_matrix.T) / temperature  # [B, T, num_labels]
 
-        loss = loss_fn(sims.view(-1,K), batch["labels"].view(-1))
-        opt.zero_grad()
+        # 4️⃣ Loss
+        loss = ce(logits.view(-1, len(label_names)), batch["labels"].view(-1))
         loss.backward()
-        opt.step()
+        torch.nn.utils.clip_grad_norm_(list(lbl_enc.parameters()) + list(proj.parameters()), 1.0)
+        optimizer.step()
 
-        total_loss += loss.item()
-        steps += 1
-        if steps % 20 == 0:
-            print(f"  step {steps} loss={total_loss/steps:.4f}")
+        # 5️⃣ Accuracy per classe
+        mask = batch["labels"] != -100
+        preds = logits.argmax(-1)
+        acc = (preds[mask] == batch["labels"][mask]).float().sum().item()
+        total_acc += acc; n_tokens += mask.sum().item(); total_loss += loss.item()
+        
+        # Statistiche per classe
+        for i in range(len(label_names)):
+            class_mask = (batch["labels"] == i) & mask
+            if class_mask.sum() > 0:
+                class_correct[i] += (preds[class_mask] == i).sum().item()
+                class_total[i] += class_mask.sum().item()
 
-    print(f"Epoch {epoch+1} avg_loss={total_loss/steps:.4f}")
+    scheduler.step()
+    
+    print(f"Epoch {epoch}/5 | loss={total_loss/len(loader):.4f} | acc={(total_acc/n_tokens)*100:.1f}%")
+    
+    # Accuracy per classe
+    print("📊 Accuracy per classe:")
+    for i, label_name in enumerate(label_names):
+        if class_total[i] > 0:
+            acc_class = (class_correct[i] / class_total[i]) * 100
+            print(f"  {label_name:12s}: {acc_class:5.1f}% ({int(class_correct[i])}/{int(class_total[i])})")
 
-torch.save({
-    "lbl_enc": lbl_enc.state_dict(),
-    "proj": proj.state_dict()
-}, "trained_label_encoder.pt")
+print("\n✅ Fine training.\n")
 
-print("✅ Training completo e pesi salvati in trained_label_encoder.pt")
+
+from collections import Counter
+
+# Dopo il training, aggiungi queste analisi:
+
+# ==========================================================
+# 🔍 ANALISI 1: Distribuzione delle etichette nel dataset
+# ==========================================================
+print("\n=== 📊 ANALISI DATASET ===")
+with open("dataset_tokenlevel_balanced.json", "r") as f:
+    data = json.load(f)
+
+all_labels = []
+for record in data:
+    for label in record["labels"]:
+        if label != -100:
+            all_labels.append(label)
+
+label_counts = Counter(all_labels)
+print(f"Totale token: {len(all_labels)}")
+print(f"Etichette uniche: {len(label_counts)}")
+print("\nDistribuzione top 10:")
+for label_id, count in label_counts.most_common(10):
+    label_name = id2label.get(label_id, f"ID_{label_id}")
+    percentage = (count / len(all_labels)) * 100
+    print(f"  {label_name:15s}: {count:6d} ({percentage:5.1f}%)")
+
+# ==========================================================
+# 🔍 ANALISI 2: Rappresentazioni delle etichette
+# ==========================================================
+print("\n=== 🧠 ANALISI RAPPRESENTAZIONI ===")
+with torch.no_grad():
+    label_matrix = compute_label_matrix(label2desc).to(DEVICE)
+    
+    # Similarità tra etichette
+    similarities = torch.matmul(label_matrix, label_matrix.T)
+    
+    print(f"Shape label matrix: {label_matrix.shape}")
+    print(f"Media similarità tra etichette: {similarities.mean():.4f}")
+    print(f"Std similarità: {similarities.std():.4f}")
+    
+    # Etichette più simili
+    similarities.fill_diagonal_(-1)  # Ignora diagonale
+    max_sim_idx = similarities.argmax()
+    i, j = max_sim_idx // len(label_names), max_sim_idx % len(label_names)
+    print(f"Etichette più simili: {label_names[i]} ↔ {label_names[j]} (sim: {similarities[i,j]:.4f})")
+
+# ==========================================================
+# 🔍 ANALISI 3: Predizioni su batch di training
+# ==========================================================
+print("\n=== 🎯 ANALISI PREDIZIONI ===")
+with torch.no_grad():
+    # Prendi un batch dal training
+    sample_batch = next(iter(loader))
+    sample_batch = {k: v.to(DEVICE) for k, v in sample_batch.items()}
+    
+    # Forward pass
+    out_txt = txt_enc(**{k: sample_batch[k] for k in ["input_ids","attention_mask"]})
+    H = F.normalize(out_txt.last_hidden_state, dim=-1)
+    label_matrix = compute_label_matrix(label2desc).to(DEVICE)
+    logits = torch.matmul(H, label_matrix.T)
+    
+    # Analisi logits
+    print(f"Shape logits: {logits.shape}")
+    print(f"Media logits: {logits.mean():.4f}")
+    print(f"Std logits: {logits.std():.4f}")
+    print(f"Min/Max logits: {logits.min():.4f} / {logits.max():.4f}")
+    
+    # Distribuzione predizioni
+    preds = logits.argmax(-1)
+    mask = sample_batch["labels"] != -100
+    pred_counts = Counter(preds[mask].cpu().numpy())
+    
+    print("\nPredizioni nel batch:")
+    for pred_id, count in pred_counts.most_common(5):
+        label_name = id2label.get(pred_id, f"ID_{pred_id}")
+        print(f"  {label_name:15s}: {count:4d}")
+    
+    print("\nGround truth nel batch:")
+    gt_counts = Counter(sample_batch["labels"][mask].cpu().numpy())
+    for gt_id, count in gt_counts.most_common(5):
+        label_name = id2label.get(gt_id, f"ID_{gt_id}")
+        print(f"  {label_name:15s}: {count:4d}")
+
+# ==========================================================
+# 5️⃣ TEST SU FRASE DEL TRAINING
+# ==========================================================
+idx = 5
+example = ds.records[idx]
+tokens_test = [t for t in example["tokens"] if t not in ["[CLS]", "[SEP]"]]
+sentence = " ".join([t.replace("▁", "") for t in tokens_test])
+
+print(f"\n🔍 Test su frase id={idx}:\n{sentence[:200]}...\n")
+
+enc = txt_tok(sentence.split(), is_split_into_words=True,
+              return_tensors="pt", truncation=True, padding=True).to(DEVICE)
+
+with torch.no_grad():
+    H = F.normalize(txt_enc(**enc).last_hidden_state, dim=-1)
+    L = compute_label_matrix(label2desc).to(DEVICE)
+    sims = torch.matmul(H, L.T).squeeze(0)
+    preds = sims.argmax(-1)
+
+tokens = txt_tok.convert_ids_to_tokens(enc["input_ids"][0])
+print("=== 🔬 PREDIZIONI FINALI ===")
+for tok, p in zip(tokens, preds):
+    if tok in ["[CLS]", "[SEP]"]: continue
+    print(f"{tok:15s} → {id2label[p.item()]}")
