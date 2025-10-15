@@ -3,10 +3,6 @@
 Generazione dataset token-level BIO-aware con allineamento subtoken
 per GLiNER-BioMed (bi-encoder token-level training).
 
-✅ Mantiene i tag coerenti anche nei subtokens (non li maschera tutti!)
-✅ Gestisce correttamente i token speciali e padding
-✅ Rende il dataset bilanciato ma realistico
-✅ Esporta SOLO i campi richiesti dal training: tokens, labels
 """
 
 import pandas as pd
@@ -17,6 +13,10 @@ from transformers import AutoTokenizer
 from collections import Counter, defaultdict
 import random
 
+EXAMPLE_NUMBER_FOR_BALANCED = 50
+# This means 200 * 5 classes = 1000 examples in the balanced dataset
+TEST_SAMPLE_SIZE = 1000
+
 # ===============================================================
 # 1️⃣ CONFIGURAZIONE
 # ===============================================================
@@ -25,8 +25,6 @@ with open("../label2id.json") as f:
     label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
 
-# ⚠️ TODO: allinea questo nome al tokenizer del text encoder usato nel training (txt_tok)
-# Esempio: se il text encoder è DeBERTa v3 small, va bene così; altrimenti impostalo al nome giusto.
 TOKENIZER_NAME = "microsoft/deberta-v3-small"
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
@@ -45,7 +43,6 @@ BIO2BASE = {
     "DNA": "dna",
     "PROTEIN": "protein",
     "CELL_TYPE": "cell type",
-    "CELL LINE": "cell line",
     "CELL_LINE": "cell line",
     "RNA": "rna",
 }
@@ -94,7 +91,7 @@ def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
 # ===============================================================
 # 4️⃣ COSTRUZIONE DEL DATASET
 # ===============================================================
-print("\n⚙️  Costruzione dataset token-level allineato...")
+print("\nCostruzione dataset token-level allineato...")
 
 encoded_dataset = []
 for _, row in tqdm(df.iterrows(), total=len(df)):
@@ -110,6 +107,11 @@ print(f"\n✅ Creati {len(encoded_dataset)} esempi token-level.")
 # ===============================================================
 # 5️⃣ BILANCIAMENTO CLASSI
 # ===============================================================
+# raggruppa frasi per classe se contengono almeno
+# un'entità di quella classe. Per ogni classe si estraggono fino a
+# EXAMPLE_NUMBER_FOR_BALANCED esempi casuali. Una stessa frase può
+# comparire in più classi se contiene più entità diverse.
+
 label_counts = Counter()
 for ex in encoded_dataset:
     for l in ex["labels"].tolist():
@@ -119,7 +121,7 @@ for ex in encoded_dataset:
 non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
 if non_o_labels:
     min_count = min(label_counts[lid] for lid in non_o_labels)
-    target_per_class = 200 # scegli qui il numero di esempi per classe
+    target_per_class = EXAMPLE_NUMBER_FOR_BALANCED
 
 balanced_examples = defaultdict(list)
 for ex in encoded_dataset:
@@ -191,9 +193,8 @@ for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding")
 
 print(f"\n✅ Creati {len(test_encoded_dataset)} esempi test token-level.")
 
-test_sample_size = 1000
 random.seed(42)
-test_sampled = random.sample(test_encoded_dataset, min(len(test_encoded_dataset), test_sample_size))
+test_sampled = random.sample(test_encoded_dataset, TEST_SAMPLE_SIZE)
 
 test_records = []
 for ex in test_sampled:

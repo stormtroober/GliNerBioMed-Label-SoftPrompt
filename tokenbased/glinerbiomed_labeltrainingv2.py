@@ -4,12 +4,12 @@ Label set: derivato da label2desc.json / label2id.json
 """
 
 import json, torch, torch.nn.functional as F
+import time
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
-from collections import Counter
 import os
 
 # ==========================================================
@@ -17,16 +17,16 @@ import os
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16
-EPOCHS = 2
+EPOCHS = 15
 LEARNING_RATE = 1e-5
-WEIGHT_DECAY = 1e-4
-TEMPERATURE = 1.0
+WEIGHT_DECAY = 1e-5
+TEMPERATURE = 0.9
 GRAD_CLIP = 1.0
-SCHEDULER_STEP = 2
-SCHEDULER_GAMMA = 0.5
+WARMUP_STEPS = 50
+EARLY_STOPPING_PATIENCE = 3
 RANDOM_SEED = 42
 
-DATASET_PATH = "dataset/dataset_tokenlevel_balanced.json"
+DATASET_PATH = "dataset/dataset_tokenlevel_balanced_3000.json"
 LABEL2DESC_PATH = "../label2desc.json"
 LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
@@ -40,9 +40,9 @@ print("📦 Caricamento modello base GLiNER-BioMed...")
 model = GLiNER.from_pretrained(MODEL_NAME)
 core = model.model
 
-txt_enc = core.token_rep_layer.bert_layer.model       # text encoder (frozen)
-lbl_enc = core.token_rep_layer.labels_encoder.model   # label encoder (trainable)
-proj    = core.token_rep_layer.labels_projection      # projection (trainable)
+txt_enc = core.token_rep_layer.bert_layer.model
+lbl_enc = core.token_rep_layer.labels_encoder.model
+proj = core.token_rep_layer.labels_projection
 
 txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
 lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
@@ -60,14 +60,15 @@ with open(LABEL2ID_PATH) as f: label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
 label_names = list(label2desc.keys())
 
-def compute_label_matrix(label2desc: dict) -> torch.Tensor:
+def compute_label_matrix(label2desc: dict, lbl_enc, lbl_tok, proj) -> torch.Tensor:
     """Embedda le descrizioni con lbl_enc + proj (trainabili)."""
     desc_texts = [label2desc[k] for k in label_names]
     batch = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    out = lbl_enc(**batch).last_hidden_state
-    mask = batch["attention_mask"].unsqueeze(-1).float()
-    pooled = (out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-    vecs = proj(pooled)
+    with torch.set_grad_enabled(lbl_enc.training):
+        out = lbl_enc(**batch).last_hidden_state
+        mask = batch["attention_mask"].unsqueeze(-1).float()
+        pooled = (out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        vecs = proj(pooled)
     return F.normalize(vecs, dim=-1)   # [num_labels, hidden_dim]
 
 # ==========================================================
@@ -119,8 +120,8 @@ def collate_batch(batch, pad_id, ignore_index=-100):
 # ==========================================================
 print("📚 Caricamento dataset...")
 ds = TokenJsonDataset(DATASET_PATH, txt_tok, label2id)
-loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
-                    collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
+
+print(f"📊 Total dataset size: {len(ds)}\n")
 
 def compute_class_weights(data_path, label2id):
     with open(data_path, "r") as f:
@@ -140,215 +141,144 @@ def compute_class_weights(data_path, label2id):
     return weights
 
 class_weights = compute_class_weights(DATASET_PATH, label2id).to(DEVICE)
-ce = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
+ce_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
 
-optimizer = optim.Adam(list(lbl_enc.parameters()) + list(proj.parameters()), 
-                      lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=SCHEDULER_STEP, gamma=SCHEDULER_GAMMA)
+# ✨ Early stopping class
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        
+    def __call__(self, loss):
+        if self.best_loss is None:
+            self.best_loss = loss
+        elif loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            print(f"⚠️  EarlyStopping counter: {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = loss
+            self.counter = 0
 
-txt_enc.eval().to(DEVICE)
-lbl_enc.train().to(DEVICE)
-proj.train().to(DEVICE)
-
-# ==========================================================
-# 4️⃣ TRAINING LOOP
-# ==========================================================
-print("\n🚀 Inizio training (token-level bi-encoder)...\n")
-
-for epoch in range(1, EPOCHS + 1):
-    total_loss, total_acc, n_tokens = 0.0, 0.0, 0
-    class_correct = torch.zeros(len(label_names))
-    class_total = torch.zeros(len(label_names))
+# ✨ Funzione per eseguire un'epoca di training
+def run_epoch(loader, lbl_enc, proj, txt_enc, label2desc, optimizer, scheduler=None):
+    """Esegue un'epoca di training"""
+    lbl_enc.train()
+    proj.train()
     
-    for batch in tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}"):
+    total_loss, total_acc, n_tokens = 0.0, 0.0, 0
+    
+    for batch in loader:
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
+        
         optimizer.zero_grad()
-
-        # Hidden del testo (frozen)
+        
         with torch.no_grad():
             out_txt = txt_enc(**{k: batch[k] for k in ["input_ids","attention_mask"]})
-            H = F.normalize(out_txt.last_hidden_state, dim=-1)  # [B, T, D]
-
-        # Hidden delle descrizioni (trainabili)
-        label_matrix = compute_label_matrix(label2desc).to(DEVICE)  # [num_labels, D]
-
-        # Similarità token-label + Temperature scaling
-        logits = torch.matmul(H, label_matrix.T) / TEMPERATURE  # [B, T, num_labels]
-
-        # Loss
-        loss = ce(logits.view(-1, len(label_names)), batch["labels"].view(-1))
+            H = F.normalize(out_txt.last_hidden_state, dim=-1)
+        
+        label_matrix = compute_label_matrix(label2desc, lbl_enc, lbl_tok, proj)
+        logits = torch.matmul(H, label_matrix.T) / TEMPERATURE
+        loss = ce_loss(logits.view(-1, len(label_names)), batch["labels"].view(-1))
+        
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(lbl_enc.parameters()) + list(proj.parameters()), GRAD_CLIP)
         optimizer.step()
 
-        # Accuracy per classe
+        if scheduler is not None:
+            scheduler.step()
+        
         mask = batch["labels"] != -100
         preds = logits.argmax(-1)
-        acc = (preds[mask] == batch["labels"][mask]).float().sum().item()
-        total_acc += acc; n_tokens += mask.sum().item(); total_loss += loss.item()
-        
-        # Statistiche per classe
-        for i in range(len(label_names)):
-            class_mask = (batch["labels"] == i) & mask
-            if class_mask.sum() > 0:
-                class_correct[i] += (preds[class_mask] == i).sum().item()
-                class_total[i] += class_mask.sum().item()
-
-    scheduler.step()
+        total_acc += (preds[mask] == batch["labels"][mask]).float().sum().item()
+        n_tokens += mask.sum().item()
+        total_loss += loss.item()
     
-    print(f"Epoch {epoch}/{EPOCHS} | loss={total_loss/len(loader):.4f} | acc={(total_acc/n_tokens)*100:.1f}%")
-    
-    # Accuracy per classe
-    print("📊 Accuracy per classe:")
-    for i, label_name in enumerate(label_names):
-        if class_total[i] > 0:
-            acc_class = (class_correct[i] / class_total[i]) * 100
-            print(f"  {label_name:12s}: {acc_class:5.1f}% ({int(class_correct[i])}/{int(class_total[i])})")
+    avg_loss = total_loss / len(loader)
+    avg_acc = (total_acc / n_tokens) * 100
+    return avg_loss, avg_acc
 
-print("\n✅ Fine training.\n")
+# ✨ Timer totale
+total_start_time = time.time()
 
 # ==========================================================
-# 🔍 ANALISI 1: Distribuzione delle etichette nel dataset
+# 4️⃣ TRAINING LOOP
 # ==========================================================
-print("\n=== 📊 ANALISI DATASET ===")
-with open(DATASET_PATH, "r") as f:
-    data = json.load(f)
+print("\n🚀 Inizio training...\n")
 
-all_labels = []
-for record in data:
-    for label in record["labels"]:
-        if label != -100:
-            all_labels.append(label)
+# Carica modelli su device
+txt_enc.eval().to(DEVICE)
+lbl_enc.train().to(DEVICE)
+proj.train().to(DEVICE)
 
-label_counts = Counter(all_labels)
-print(f"Totale token: {len(all_labels)}")
-print(f"Etichette uniche: {len(label_counts)}")
-print("\nDistribuzione top 10:")
-for label_id, count in label_counts.most_common(10):
-    label_name = id2label.get(label_id, f"ID_{label_id}")
-    percentage = (count / len(all_labels)) * 100
-    print(f"  {label_name:15s}: {count:6d} ({percentage:5.1f}%)")
+# ✨ DataLoader per tutto il dataset
+train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
+                          collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
 
-# ==========================================================
-# 🔍 ANALISI 2: Rappresentazioni delle etichette
-# ==========================================================
-print("\n=== 🧠 ANALISI RAPPRESENTAZIONI ===")
-with torch.no_grad():
-    label_matrix = compute_label_matrix(label2desc).to(DEVICE)
+optimizer = optim.Adam(list(lbl_enc.parameters()) + list(proj.parameters()), 
+                      lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+total_steps = len(train_loader) * EPOCHS
+scheduler = get_linear_schedule_with_warmup(
+    optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps
+)
+
+training_start_time = time.time()
+
+# ✨ Inizializza early stopping
+early_stopping = EarlyStopping(patience=EARLY_STOPPING_PATIENCE)
+best_loss = float('inf')
+best_epoch = 0
+
+# Training loop
+for epoch in range(1, EPOCHS + 1):
+    epoch_start_time = time.time()
     
-    # Similarità tra etichette
-    similarities = torch.matmul(label_matrix, label_matrix.T)
+    # Training
+    train_loss, train_acc = run_epoch(
+        tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}"),
+        lbl_enc, proj, txt_enc, label2desc, optimizer, scheduler
+    )
     
-    print(f"Shape label matrix: {label_matrix.shape}")
-    print(f"Media similarità tra etichette: {similarities.mean():.4f}")
-    print(f"Std similarità: {similarities.std():.4f}")
+    epoch_time = time.time() - epoch_start_time
     
-    # Etichette più simili
-    similarities.fill_diagonal_(-1)  # Ignora diagonale
-    max_sim_idx = similarities.argmax()
-    i, j = max_sim_idx // len(label_names), max_sim_idx % len(label_names)
-    print(f"Etichette più simili: {label_names[i]} ↔ {label_names[j]} (sim: {similarities[i,j]:.4f})")
+    # ✨ Traccia miglior epoca
+    if train_loss < best_loss:
+        best_loss = train_loss
+        best_epoch = epoch
+    
+    current_lr = scheduler.get_last_lr()[0]
+    print(f"Epoch {epoch}/{EPOCHS} | loss={train_loss:.4f} acc={train_acc:.1f}% | "
+          f"lr={current_lr:.2e} | time={epoch_time:.1f}s")
+    
+    # ✨ Early stopping check
+    early_stopping(train_loss)
+    if early_stopping.early_stop:
+        print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+        print(f"🏆 Best loss: {best_loss:.4f} (epoch {best_epoch})")
+        break
 
-# ==========================================================
-# 🔍 ANALISI 3: Predizioni su batch di training
-# ==========================================================
-print("\n=== 🎯 ANALISI PREDIZIONI ===")
-with torch.no_grad():
-    # Prendi un batch dal training
-    sample_batch = next(iter(loader))
-    sample_batch = {k: v.to(DEVICE) for k, v in sample_batch.items()}
-    
-    # Forward pass
-    out_txt = txt_enc(**{k: sample_batch[k] for k in ["input_ids","attention_mask"]})
-    H = F.normalize(out_txt.last_hidden_state, dim=-1)
-    label_matrix = compute_label_matrix(label2desc).to(DEVICE)
-    logits = torch.matmul(H, label_matrix.T)
-    
-    # Analisi logits
-    print(f"Shape logits: {logits.shape}")
-    print(f"Media logits: {logits.mean():.4f}")
-    print(f"Std logits: {logits.std():.4f}")
-    print(f"Min/Max logits: {logits.min():.4f} / {logits.max():.4f}")
-    
-    # Distribuzione predizioni
-    preds = logits.argmax(-1)
-    mask = sample_batch["labels"] != -100
-    pred_counts = Counter(preds[mask].cpu().numpy())
-    
-    print("\nPredizioni nel batch:")
-    for pred_id, count in pred_counts.most_common(5):
-        label_name = id2label.get(pred_id, f"ID_{pred_id}")
-        print(f"  {label_name:15s}: {count:4d}")
-    
-    print("\nGround truth nel batch:")
-    gt_counts = Counter(sample_batch["labels"][mask].cpu().numpy())
-    for gt_id, count in gt_counts.most_common(5):
-        label_name = id2label.get(gt_id, f"ID_{gt_id}")
-        print(f"  {label_name:15s}: {count:4d}")
+# ✨ Timer totale
+total_training_time = time.time() - total_start_time
 
-# ==========================================================
-# 5️⃣ TEST SU FRASE DEL TRAINING
-# ==========================================================
-example = ds.records[0]
-tokens_test = [t for t in example["tokens"] if t not in ["[CLS]", "[SEP]"]]
-sentence = " ".join([t.replace("▁", "") for t in tokens_test])
-
-print(f"\n🔍 Test su frase id={0}:\n{sentence[:200]}...\n")
-
-enc = txt_tok(sentence.split(), is_split_into_words=True,
-              return_tensors="pt", truncation=True, padding=True).to(DEVICE)
-
-with torch.no_grad():
-    H = F.normalize(txt_enc(**enc).last_hidden_state, dim=-1)
-    L = compute_label_matrix(label2desc).to(DEVICE)
-    sims = torch.matmul(H, L.T).squeeze(0)
-    preds = sims.argmax(-1)
-
-tokens = txt_tok.convert_ids_to_tokens(enc["input_ids"][0])
-print("=== 🔬 PREDIZIONI FINALI ===")
-for tok, p in zip(tokens, preds):
-    if tok in ["[CLS]", "[SEP]"]: continue
-    print(f"{tok:15s} → {id2label[p.item()]}")
+print(f"\n⏱️  TEMPO TOTALE: {total_training_time:.1f}s ({total_training_time/60:.1f}min)")
+print(f"🏆 Best loss: {best_loss:.4f} (epoch {best_epoch})")
 
 # ==========================================================
 # 💾 SALVATAGGIO MODELLO
 # ==========================================================
-print("\n💾 Salvataggio modello...")
+print(f"\n💾 Salvataggio modello...")
 
-# Crea cartella savings se non esiste
 os.makedirs("savings", exist_ok=True)
+save_path = f"savings/model_bs{BATCH_SIZE}_ep{EPOCHS}_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}_temp{TEMPERATURE}_gc{GRAD_CLIP}_warmup{WARMUP_STEPS}_patience{EARLY_STOPPING_PATIENCE}.pt"
 
-# Calcola lunghezza training set
-train_set_size = len(ds)
-
-# Genera nome file con parametri
-filename = (f"model_trainsize{train_set_size}_"
-           f"bs{BATCH_SIZE}_"
-           f"ep{EPOCHS}_"
-           f"lr{LEARNING_RATE}_"
-           f"wd{WEIGHT_DECAY}_"
-           f"temp{TEMPERATURE}_"
-           f"gc{GRAD_CLIP}_"
-           f"ss{SCHEDULER_STEP}_"
-           f"sg{SCHEDULER_GAMMA}.pt")
-
-save_path = f"savings/{filename}"
-
-# Salva solo i componenti trainabili
-checkpoint = {
+torch.save({
     'label_encoder_state_dict': lbl_enc.state_dict(),
     'projection_state_dict': proj.state_dict(),
-    'model_name': MODEL_NAME,
-    'epoch': EPOCHS,
-    'learning_rate': LEARNING_RATE,
-    'train_set_size': train_set_size,
-    'batch_size': BATCH_SIZE,
-    'weight_decay': WEIGHT_DECAY,
-    'temperature': TEMPERATURE,
-    'grad_clip': GRAD_CLIP,
-    'scheduler_step': SCHEDULER_STEP,
-    'scheduler_gamma': SCHEDULER_GAMMA,
-}
+}, save_path)
 
-torch.save(checkpoint, save_path)
-print(f"✅ Modello salvato in: {save_path}")
+print(f"✅ Modello salvato: {save_path}")
