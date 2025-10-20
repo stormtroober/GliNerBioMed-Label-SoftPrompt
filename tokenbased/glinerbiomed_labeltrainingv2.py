@@ -12,6 +12,7 @@ from gliner import GLiNER
 from tqdm import tqdm
 import os
 
+#layer in più per descrizioni, sblocca encoder input, dopo hard prompting
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================

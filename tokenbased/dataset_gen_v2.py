@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 from collections import Counter, defaultdict
 import random
 
-EXAMPLE_NUMBER_FOR_BALANCED = 50
+EXAMPLE_NUMBER_FOR_BALANCED = 600
 # This means 200 * 5 classes = 1000 examples in the balanced dataset
 TEST_SAMPLE_SIZE = 1000
 
