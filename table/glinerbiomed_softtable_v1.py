@@ -1,268 +1,316 @@
 # -*- coding: utf-8 -*-
-
+"""
+Training token-level con soft embeddings per GLiNER-BioMed.
+Usa il dataset JSON generato con allineamento subtoken BIO-aware.
+"""
 
 import torch
-
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer
 from gliner import GLiNER
+import json
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import random
+
+# ==============================================================
+# 1️⃣ CARICAMENTO MODELLO E CONFIGURAZIONE
+# ==============================================================
+print("📥 Caricamento modello GLiNER-BioMed...")
 model = GLiNER.from_pretrained("Ihor/gliner-biomed-bi-small-v1.0")
+core = model.model
 
-#Debug per vedere le caratteristiche del modello
-# print(type(model))
-# print(getattr(model, "model", None))  # molti checkpoint incapsulano sotto .model
-
-# # ispeziona gli attributi per trovare gli encoder
-# core = getattr(model, "model", model)  # fallback
-# for name in dir(core):
-#     if "encoder" in name.lower() or "label" in name.lower() or "proj" in name.lower():
-#         try:
-#             print(name, getattr(core, name).__class__)
-#         except:
-#             print(name, "<unavailable>")
-
-"""Accesso ai due encoder"""
-
-core = model.model  # SpanModel
-
-# text encoder (DeBERTaV2, 768d)
+# Text encoder (DeBERTaV3)
 txt_enc = core.token_rep_layer.bert_layer.model
-print("Text enc hidden:", txt_enc.config.hidden_size)  # atteso 768
-
-# label encoder (BERT 6-layer, 384d) + proiezione 384→768
+# Label encoder (6-layer BERT, 384d)
 lbl_enc = core.token_rep_layer.labels_encoder.model
-print("Label enc hidden:", lbl_enc.config.hidden_size)  # atteso 384
-print("labels_projection:", core.token_rep_layer.labels_projection)
+proj = core.token_rep_layer.labels_projection
 
-"""Congela il Text-Encoder: non verrà aggiornato in training"""
-
+# Congela text encoder
 for p in txt_enc.parameters():
     p.requires_grad = False
 
-sum(p.requires_grad for p in txt_enc.parameters())  # deve stampare 0
+print("✅ Modello caricato e text encoder congelato")
 
-"""Definisco un set di descrizioni giocattolo e il loro id"""
+# ==============================================================
+# 2️⃣ CARICAMENTO LABEL DEFINITIONS E CREAZIONE SOFT TABLE
+# ==============================================================
+print("\n📥 Caricamento label2id.json...")
+with open("../label2id.json") as f:
+    label2id = json.load(f)
+id2label = {v: k for k, v in label2id.items()}
+num_labels = len(label2id)
 
-labels = [
-    "a drug used as medication",
-    "a disease or medical condition",
-    "an adverse drug event or side effect"
-]
-label2id = {lab: i for i, lab in enumerate(labels)}
-id2label = {i: lab for lab, i in label2id.items()}
-num_labels = len(labels)
+# Leggi le descrizioni delle label dal file
+with open("../label2desc.json") as f:
+    label_descriptions = json.load(f)
 
-"""Tokenizzazione delle descrizioni"""
+# Ordina le descrizioni secondo label2id
+labels = [label_descriptions[id2label[i]] for i in range(num_labels)]
 
-from transformers import AutoTokenizer
+print(f"✅ Caricate {num_labels} label")
+for i, (name, desc) in enumerate(zip([id2label[j] for j in range(num_labels)], labels)):
+    print(f"  [{i}] {name:15s}: {desc}")
 
-lbl_name = lbl_enc.config._name_or_path
-lbl_tok = AutoTokenizer.from_pretrained(lbl_name)
+# ==============================================================
+# 3️⃣ TOKENIZZAZIONE DESCRIZIONI + HARD EMBEDDINGS (384d)
+# ==============================================================
+print("\n⚙️  Generazione hard embeddings dalle descrizioni...")
+lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
 batch = lbl_tok(labels, return_tensors="pt", padding=True, truncation=True)
 
-"""Ottengo embedding iniziali (“hard”)"""
-
-from transformers import AutoTokenizer
-import torch.nn.functional as F
-
 with torch.no_grad():
-    out = lbl_enc(**batch)   # out.last_hidden_state: [B,L,384]
+    out = lbl_enc(**batch)
+    mask = batch["attention_mask"].unsqueeze(-1).float()
+    pooled = (out.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+HE_384 = pooled  # [num_labels, 384]
 
-attn = batch["attention_mask"].float()                  # [B,L]
-mask = attn.unsqueeze(-1)                               # [B,L,1]
-sum_emb = (out.last_hidden_state * mask).sum(dim=1)     # [B,384]
-len_emb = mask.sum(dim=1).clamp(min=1e-9)               # [B,1]
-HE_384 = sum_emb / len_emb                              # [B,384]  <-- come GLiNER
+print(f"✅ Hard embeddings generati: {HE_384.shape}")
 
-"""Creo la tabella "Soft" e la inizializzo"""
-
-import torch.nn as nn
-
-hidden_label = lbl_enc.config.hidden_size  # 384
-soft_table = nn.Embedding(num_labels, hidden_label)
-
+# ==============================================================
+# 4️⃣ CREAZIONE SOFT TABLE
+# ==============================================================
+print("\n⚙️  Creazione soft embedding table...")
+soft_table = nn.Embedding(num_labels, HE_384.size(-1))
 with torch.no_grad():
     soft_table.weight.copy_(HE_384)
 
-"""Registrazione tabella nel modello
-
-"""
-
+# Registra nel modello e disattiva label encoder
 core.token_rep_layer.soft_label_embeddings = soft_table
 for p in core.token_rep_layer.labels_encoder.parameters():
     p.requires_grad = False
 
-"""Verifica che gli embedding soft abbiano forma corretta (384) e che la proiezione li porti a 768, come richiesto dal modello."""
+print("✅ Soft table creata e registrata nel modello")
 
-ids = torch.arange(num_labels)
-soft_HE_384 = core.token_rep_layer.soft_label_embeddings(ids)
-print(soft_HE_384.shape)  # [num_labels, 384]
+# ==============================================================
+# 5️⃣ DATASET CLASS
+# ==============================================================
+class TokenLevelDataset(Dataset):
+    def __init__(self, json_path, tokenizer):
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.data = json.load(f)
+        self.tokenizer = tokenizer
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        tokens = item["tokens"]
+        labels = item["labels"]
+        
+        # Converti tokens in input_ids
+        input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long)
+        }
 
-# opzionale: proietta a 768 con la loro labels_projection (come fa il modello)
-proj = core.token_rep_layer.labels_projection
-soft_HE_768 = proj(soft_HE_384)           # [num_labels, 768]
-print(soft_HE_768.shape)
+# ==============================================================
+# 6️⃣ CARICAMENTO DATASET
+# ==============================================================
+print("\n📥 Caricamento dataset token-level...")
+txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
 
-"""Crea un adapter che sostituisce il label encoder con la tabella soft, aggiungendo anche parametri scalari (logit_scale, bias)."""
+train_dataset = TokenLevelDataset("dataset/dataset_tokenlevel_balanced.json", txt_tok)
+test_dataset = TokenLevelDataset("dataset/test_dataset_tokenlevel.json", txt_tok)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers.modeling_outputs import BaseModelOutputWithPooling
+print(f"✅ Train set: {len(train_dataset)} esempi")
+print(f"✅ Test set: {len(test_dataset)} esempi")
 
-VANILLA_LBL = lbl_enc
+# ==============================================================
+# 7️⃣ DATALOADER CON COLLATE FUNCTION
+# ==============================================================
+def collate_fn(batch):
+    """Padding dinamico per batch"""
+    input_ids = [item["input_ids"] for item in batch]
+    labels = [item["labels"] for item in batch]
+    
+    # Padding
+    max_len = max(len(ids) for ids in input_ids)
+    
+    padded_ids = []
+    padded_labels = []
+    attention_masks = []
+    
+    for ids, labs in zip(input_ids, labels):
+        pad_len = max_len - len(ids)
+        padded_ids.append(torch.cat([ids, torch.zeros(pad_len, dtype=torch.long)]))
+        padded_labels.append(torch.cat([labs, torch.full((pad_len,), -100, dtype=torch.long)]))
+        attention_masks.append(torch.cat([torch.ones(len(ids), dtype=torch.long), 
+                                          torch.zeros(pad_len, dtype=torch.long)]))
+    
+    return {
+        "input_ids": torch.stack(padded_ids),
+        "attention_mask": torch.stack(attention_masks),
+        "labels": torch.stack(padded_labels)
+    }
 
-class _SoftLabelHF(nn.Module):
-    def __init__(self, soft_table: nn.Embedding, init_logit_scale=1.0):
-        super().__init__()
-        self.soft = soft_table
-        self.logit_scale = nn.Parameter(torch.tensor(init_logit_scale))
-        self.bias_384 = nn.Parameter(torch.zeros(soft_table.embedding_dim))
+BATCH_SIZE = 16
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        if attention_mask is not None:
-            B, seq_len = attention_mask.shape
-            device = attention_mask.device
-        else:
-            B = self.soft.num_embeddings; seq_len = 1
-            device = self.soft.weight.device
+# ==============================================================
+# 8️⃣ TRAINING SETUP
+# ==============================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\n🖥️  Device: {device}")
 
-        if B != self.soft.num_embeddings:
-            raise ValueError("Label batch size/order must match soft_table.")
+# Sposta modello su device
+txt_enc.to(device)
+soft_table.to(device)
+proj.to(device)
 
-        base = self.soft.weight.to(device)                         # [B,384]
-        base = base * self.logit_scale + self.bias_384            # scale + bias
-        last = base.unsqueeze(1).expand(B, seq_len, base.size(-1))# [B,seq,384]
-        return BaseModelOutputWithPooling(last_hidden_state=last, pooler_output=base)
-
-
-soft_adapter = _SoftLabelHF(soft_table)
-
-def use_vanilla():
-    core.token_rep_layer.labels_encoder.model = VANILLA_LBL
-    for p in core.token_rep_layer.labels_projection.parameters():
-        p.requires_grad = False  # opzionale: coerenza 100% vanilla
-
-def use_soft(adapter):
-    core.token_rep_layer.labels_encoder.model = adapter
-    for p in core.token_rep_layer.labels_projection.parameters():
-        p.requires_grad = True   # alleniamo la proiezione con la tabella
-
-def compare_soft_vs_vanilla(model, texts, labels, threshold=0.2):
-    # VANILLA
-    use_vanilla()
-    vanilla = [model.predict_entities(t, labels=labels, threshold=threshold) for t in texts]
-    # SOFT
-    use_soft(soft_adapter)
-    soft = [model.predict_entities(t, labels=labels, threshold=threshold) for t in texts]
-    for t, v, s in zip(texts, vanilla, soft):
-        print("\nTEXT:", t)
-        print("VANILLA:", v)
-        print("SOFT   :", s)
-
-texts = [
-    "Aspirin is used to treat headaches.",
-    "Ibuprofen may cause nausea."
-]
-gliner_labels = labels  # IMPORTANTISSIMO: stesso ordine della soft_table
-compare_soft_vs_vanilla(model, texts, gliner_labels, threshold=0.2)
-
-"""Gli score sono i medesimi perchè sto passando degli embedding di descrizioni praticamente uguali a quelli che usa il modello normalmente, dato che non ho fatto nessun training sulla Loss.
-
-In questo blocco alleniamo la tabella di embedding "soft" delle descrizioni.
-
-Procedimento:
-1. Dataset di esempio:
-   Ogni voce è (testo, (start,end), gold_label_id), dove (start,end) sono gli indici
-   token dello span annotato come entità (gold) e gold_label_id è l'etichetta corretta.
-
-2. Estrazione dello span embedding:
-   - Il text encoder (congelato) produce embedding per tutti i token.
-   - Facciamo la media dei token compresi tra start e end per ottenere
-     lo span embedding (768d).
-   - Questo rappresenta "come il modello vede" l'entità nel testo.
-
-3. Embedding delle label:
-   - Ogni label ha un embedding nella soft_table (384d).
-   - Gli embedding vengono proiettati a 768d con labels_projection,
-     per poter essere confrontati con lo span.
-
-4. Calcolo dei logit:
-   - Facciamo il prodotto scalare span_vec @ label_vecs.T → vettore di logit
-     (uno score per ciascuna label).
-
-5. Loss:
-   - Applichiamo CrossEntropyLoss confrontando i logit con la label gold.
-   - In questo modo il modello impara a far crescere lo score della label corretta
-     e a ridurre quelli delle altre.
-
-6. Ottimizzazione:
-   - Aggiorniamo solo i parametri della soft_table e di labels_projection.
-   - Il text encoder rimane congelato.
-
-7. Predizione:
-   - Attiviamo la modalità "soft" e chiamiamo model.predict_entities sui testi.
-   - Le predizioni ora usano gli embedding soft aggiornati.
-"""
-
-train_data = [
-    ("Aspirin is used to treat headaches.", (0, 0), label2id["a drug used as medication"]),
-    ("Aspirin is used to treat headaches.", (5, 5), label2id["a disease or medical condition"]),
-    ("Ibuprofen may cause nausea.", (0, 0), label2id["a drug used as medication"]),
-    ("Ibuprofen may cause nausea.", (3, 3), label2id["an adverse drug event or side effect"]),
-]
-
-
-print(train_data)
-
-criterion = torch.nn.CrossEntropyLoss()
-opt = torch.optim.Adam(
-    core.token_rep_layer.soft_label_embeddings.parameters(),
-    lr=1e-3
+# Loss e optimizer (solo soft_table + projection)
+criterion = nn.CrossEntropyLoss(ignore_index=-100)
+optimizer = torch.optim.AdamW(
+    list(soft_table.parameters()) + list(proj.parameters()),
+    lr=1e-3,
+    weight_decay=0.01
 )
 
-txt_name = txt_enc.config._name_or_path   # txt_enc è il tuo text encoder già estratto
-txt_tok  = AutoTokenizer.from_pretrained(txt_name)
+# ==============================================================
+# 9️⃣ TRAINING LOOP
+# ==============================================================
+NUM_EPOCHS = 2
 
-def get_span_vec(text, span, tokenizer, encoder):
-    """Estrae l'embedding di uno span gold dal text encoder congelato"""
-    enc = tokenizer(text, return_tensors="pt")
-    with torch.no_grad():
-        out = encoder(**{k: enc[k] for k in ["input_ids","attention_mask"]})
-    hidden = out.last_hidden_state.squeeze(0)  # [L,768]
-    s, e = span
-    return hidden[s:e+1].mean(dim=0)  # media token nello span
+print("\n🚀 Inizio training...\n")
+print("=" * 80)
 
-for epoch in range(5):
+for epoch in range(NUM_EPOCHS):
+    # TRAINING
+    soft_table.train()
+    proj.train()
+    txt_enc.eval()
+    
     total_loss = 0
-    for text, span, gold_id in train_data:
-        # 1. Span embedding dal testo
-        span_vec = get_span_vec(text, span, txt_tok, txt_enc)  # [768]
-
-        # 2. Label embeddings soft + proiezione a 768
-        label_vecs = core.token_rep_layer.soft_label_embeddings.weight  # [num_labels,384]
-        label_vecs = core.token_rep_layer.labels_projection(label_vecs) # [num_labels,768]
-
-        # 3. Similarità span–label = dot product
-        logits = span_vec @ label_vecs.T  # [num_labels]
-
-        # 4. Loss cross-entropy
-        target = torch.tensor([gold_id])
-        loss = criterion(logits.unsqueeze(0), target)
-
-        # 5. Backprop
-        opt.zero_grad()
+    correct = 0
+    total_tokens = 0
+    
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+    for batch in pbar:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        
+        # 1. Text embeddings (frozen)
+        with torch.no_grad():
+            txt_out = txt_enc(input_ids=input_ids, attention_mask=attention_mask)
+            H = txt_out.last_hidden_state  # [B, L, 768]
+        
+        # 2. Label embeddings (soft table + projection)
+        label_vecs = proj(soft_table.weight)  # [num_labels, 768]
+        
+        # 3. Similarità normalizzata
+        H_norm = F.normalize(H, dim=-1)
+        label_norm = F.normalize(label_vecs, dim=-1)
+        logits = torch.matmul(H_norm, label_norm.T)  # [B, L, num_labels]
+        
+        # 4. Loss
+        logits_flat = logits.view(-1, num_labels)
+        labels_flat = labels.view(-1)
+        loss = criterion(logits_flat, labels_flat)
+        
+        # 5. Backward
+        optimizer.zero_grad()
         loss.backward()
-        opt.step()
-
+        optimizer.step()
+        
+        # Metriche
         total_loss += loss.item()
+        mask = labels_flat != -100
+        if mask.sum() > 0:
+            preds = logits_flat.argmax(-1)
+            correct += ((preds == labels_flat) & mask).sum().item()
+            total_tokens += mask.sum().item()
+        
+        pbar.set_postfix({"loss": f"{loss.item():.4f}", 
+                          "acc": f"{correct/max(total_tokens,1)*100:.1f}%"})
+    
+    train_loss = total_loss / len(train_loader)
+    train_acc = correct / max(total_tokens, 1) * 100
+    
+    # VALIDATION
+    soft_table.eval()
+    proj.eval()
+    
+    val_loss = 0
+    val_correct = 0
+    val_total = 0
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            
+            txt_out = txt_enc(input_ids=input_ids, attention_mask=attention_mask)
+            H = txt_out.last_hidden_state
+            
+            label_vecs = proj(soft_table.weight)
+            
+            H_norm = F.normalize(H, dim=-1)
+            label_norm = F.normalize(label_vecs, dim=-1)
+            logits = torch.matmul(H_norm, label_norm.T)
+            
+            logits_flat = logits.view(-1, num_labels)
+            labels_flat = labels.view(-1)
+            loss = criterion(logits_flat, labels_flat)
+            
+            val_loss += loss.item()
+            mask = labels_flat != -100
+            if mask.sum() > 0:
+                preds = logits_flat.argmax(-1)
+                val_correct += ((preds == labels_flat) & mask).sum().item()
+                val_total += mask.sum().item()
+    
+    val_loss /= len(test_loader)
+    val_acc = val_correct / max(val_total, 1) * 100
+    
+    print(f"\n📊 Epoch {epoch+1}/{NUM_EPOCHS}")
+    print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+    print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+    print("=" * 80)
 
-    print(f"Epoch {epoch+1}, loss={total_loss:.4f}")
+# ==============================================================
+# 🔟 SALVATAGGIO
+# ==============================================================
+print("\n💾 Salvataggio soft embeddings...")
+torch.save({
+    "soft_embeddings": soft_table.state_dict(),
+    "projection": proj.state_dict(),
+    "label2id": label2id,
+    "id2label": id2label
+}, "soft_embeddings_tokenlevel.pt")
 
-use_soft(soft_adapter)  # attiva la tabella soft
-texts = [
-    "Aspirin is used to treat headaches.",
-    "Ibuprofen may cause nausea."
-]
-preds = [model.predict_entities(t, labels=labels, threshold=0.2) for t in texts]
-for t, p in zip(texts, preds):
-    print("\nTEXT:", t)
-    print("PRED :", p)
+print("✅ Training completato e modello salvato!")
+
+# ==============================================================
+# 1️⃣1️⃣ TEST INFERENCE
+# ==============================================================
+print("\n🧪 TEST INFERENCE")
+print("-" * 80)
+
+test_sentence = "Aspirin inhibits NF-kappa B activation in T cells."
+enc = txt_tok(test_sentence, return_tensors="pt", padding=False, truncation=True)
+
+with torch.no_grad():
+    enc = {k: v.to(device) for k, v in enc.items()}
+    out_txt = txt_enc(**enc)
+    H = F.normalize(out_txt.last_hidden_state, dim=-1)
+    
+    label_vecs_768 = proj(soft_table.weight)
+    label_matrix = F.normalize(label_vecs_768, dim=-1)
+    
+    logits = torch.matmul(H, label_matrix.T).squeeze(0)
+    preds = logits.argmax(-1).cpu().tolist()
+
+tokens = txt_tok.convert_ids_to_tokens(enc["input_ids"][0])
+pred_labels = [id2label[p] for p in preds]
+
+for tok, lab in zip(tokens, pred_labels):
+    print(f"{tok:<25} →  {lab}")
+
+print("\n✅ Fine!")
