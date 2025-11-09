@@ -3,3 +3,5 @@
 *.json
 
 /venv/
+
+/table/test_results/
