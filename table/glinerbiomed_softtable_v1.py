@@ -18,7 +18,7 @@ import os
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16
-EPOCHS = 3
+EPOCHS = 10
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 1.0
@@ -27,7 +27,7 @@ WARMUP_STEPS = 50
 EARLY_STOPPING_PATIENCE = 3
 RANDOM_SEED = 42
 
-DATASET_PATH = "dataset/dataset_tokenlevel_balanced.json"
+DATASET_PATH = "dataset/dataset_tokenlevel_balanced_3000.json"
 LABEL2DESC_PATH = "../label2desc.json"
 LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
