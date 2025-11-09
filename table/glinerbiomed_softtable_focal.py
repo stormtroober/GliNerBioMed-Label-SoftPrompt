@@ -63,7 +63,7 @@ RANDOM_SEED = 42
 FOCAL_ALPHA = 0.25  # peso per bilanciamento classi (None = senza alpha)
 FOCAL_GAMMA = 2.0   # focus su esempi difficili (0 = CrossEntropy standard)
 
-DATASET_PATH = "dataset/dataset_tokenlevel_balanced_3000.json"
+DATASET_PATH = "../dataset/dataset_tokenlevel_balanced.json"
 LABEL2DESC_PATH = "../label2desc.json"
 LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"

@@ -2,7 +2,7 @@
 """
 Generazione dataset token-level BIO-aware con allineamento subtoken
 per GLiNER-BioMed (bi-encoder token-level training).
-
+Include generazione di label2desc.json e label2id.json.
 """
 
 import pandas as pd
@@ -12,17 +12,54 @@ import torch
 from transformers import AutoTokenizer
 from collections import Counter, defaultdict
 import random
+import os
 
 EXAMPLE_NUMBER_FOR_BALANCED = 50
-# This means 200 * 5 classes = 1000 examples in the balanced dataset
 TEST_SAMPLE_SIZE = 1000
 
 # ===============================================================
-# 1️⃣ CONFIGURAZIONE
+# 1️⃣ GENERAZIONE label2desc.json e label2id.json
 # ===============================================================
-print("📥 Caricamento label2id.json e tokenizer...")
-with open("../label2id.json") as f:
-    label2id = json.load(f)
+print("📥 Caricamento Pile-NER descrizioni...")
+df_labels = pd.read_parquet("hf://datasets/disi-unibo-nlp/Pile-NER-biomed-descriptions/data/train-00000-of-00001.parquet")
+print(f"✅ Pile-NER descrizioni caricato — {len(df_labels)} descrizioni totali")
+
+# Etichette di interesse
+target_labels = {"cell line", "cell type", "dna", "protein", "rna"}
+
+# Filtra solo le descrizioni corrispondenti
+df_labels_filtered = df_labels[df_labels["entity_type"].str.lower().isin(target_labels)]
+print(f"✅ Descrizioni filtrate: {len(df_labels_filtered)}")
+
+# Crea dizionari label2desc e label2id
+label2desc = {
+    row["entity_type"].lower(): row["description"]
+    for _, row in df_labels_filtered.iterrows()
+}
+# Aggiungi descrizione per l'etichetta "O" (outside/non-entity)
+label2desc["O"] = "Tokens that do not belong to any named entity. These are regular words, punctuation, or other text elements that are not part of any biological entity such as proteins, DNA, RNA, cell types, or cell lines."
+
+# Crea label2id assicurandosi che "O" abbia ID 5
+label2id = {}
+for i, lab in enumerate(label2desc.keys()):
+    if lab != "O":
+        label2id[lab] = i
+# Aggiungi "O" con ID 5
+label2id["O"] = 5
+
+# Salva su disco
+with open("label2desc.json", "w") as f:
+    json.dump(label2desc, f, indent=2)
+with open("label2id.json", "w") as f:
+    json.dump(label2id, f, indent=2)
+
+print("✅ label2desc.json e label2id.json salvati")
+print(f"📊 Etichette definite: {list(label2id.keys())}")
+
+# ===============================================================
+# 2️⃣ CONFIGURAZIONE TOKENIZER
+# ===============================================================
+print("\n📥 Caricamento tokenizer...")
 id2label = {v: k for k, v in label2id.items()}
 
 TOKENIZER_NAME = "microsoft/deberta-v3-small"
@@ -37,7 +74,7 @@ df = df_data.head(15000).copy()
 print(f"✅ Dataset caricato: {len(df)} righe")
 
 # ===============================================================
-# 2️⃣ MAPPATURA BIO → LABEL BASE
+# 3️⃣ MAPPATURA BIO → LABEL BASE
 # ===============================================================
 BIO2BASE = {
     "DNA": "dna",
@@ -55,7 +92,7 @@ def parse_bio_tag(tag: str):
     return (pref, base or "O")
 
 # ===============================================================
-# 3️⃣ TOKENIZZAZIONE + ALLINEAMENTO (BIO-AWARE)
+# 4️⃣ TOKENIZZAZIONE + ALLINEAMENTO (BIO-AWARE)
 # ===============================================================
 def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
     """
@@ -89,7 +126,7 @@ def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
     return enc
 
 # ===============================================================
-# 4️⃣ COSTRUZIONE DEL DATASET
+# 5️⃣ COSTRUZIONE DEL DATASET
 # ===============================================================
 print("\nCostruzione dataset token-level allineato...")
 
@@ -105,7 +142,7 @@ for _, row in tqdm(df.iterrows(), total=len(df)):
 print(f"\n✅ Creati {len(encoded_dataset)} esempi token-level.")
 
 # ===============================================================
-# 5️⃣ BILANCIAMENTO CLASSI
+# 6️⃣ BILANCIAMENTO CLASSI
 # ===============================================================
 # raggruppa frasi per classe se contengono almeno
 # un'entità di quella classe. Per ogni classe si estraggono fino a
@@ -137,7 +174,7 @@ for lid in non_o_labels:
 print(f"\n✅ Dataset bilanciato con {len(balanced_dataset)} frasi (~{target_per_class} per classe)")
 
 # ===============================================================
-# 6️⃣ ESPORTAZIONE IN JSON (SOLO tokens, labels)
+# 7️⃣ ESPORTAZIONE IN JSON (SOLO tokens, labels)
 # ===============================================================
 records = []
 for ex in balanced_dataset:
@@ -151,13 +188,14 @@ for ex in balanced_dataset:
     })
 
 out_path = "dataset/dataset_tokenlevel_balanced.json"
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(records, f, indent=2, ensure_ascii=False)
 
 print(f"💾 Salvato in: {out_path} ({len(records)} esempi)")
 
 # ===============================================================
-# 7️⃣ VERIFICA
+# 8️⃣ VERIFICA
 # ===============================================================
 def verify_final_dataset(records):
     total, ignored, valid = 0, 0, 0
@@ -174,7 +212,7 @@ verify_final_dataset(records)
 print("\n✅ Fine generazione dataset allineato.")
 
 # ===============================================================
-# 8️⃣ GENERAZIONE TEST SET (SOLO tokens, labels)
+# 9️⃣ GENERAZIONE TEST SET (SOLO tokens, labels)
 # ===============================================================
 print("\n📥 Caricamento test split JNLPBA...")
 df_test_raw = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["test"])
@@ -207,6 +245,7 @@ for ex in test_sampled:
     })
 
 test_out_path = "dataset/test_dataset_tokenlevel.json"
+os.makedirs(os.path.dirname(test_out_path), exist_ok=True)
 with open(test_out_path, "w", encoding="utf-8") as f:
     json.dump(test_records, f, indent=2, ensure_ascii=False)
 
