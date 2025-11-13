@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 import random
 import os
 
-EXAMPLE_NUMBER_FOR_BALANCED = 50
+EXAMPLE_NUMBER_FOR_BALANCED = 600
 TEST_SAMPLE_SIZE = 1000
 
 # ===============================================================
