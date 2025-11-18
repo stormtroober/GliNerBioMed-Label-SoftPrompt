@@ -7,3 +7,5 @@
 /softprompting/test_results/
 
 /dataset/
+
+/embedding_injection/__pycache__/
