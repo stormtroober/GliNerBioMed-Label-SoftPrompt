@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Valutazione modello Bi-GLiNER con Prompt Encoder esterno.
-Ricostruisce la pipeline:
-Descrizioni -> Prompt Encoder (Trained) -> Label Encoder (Frozen) -> Projection (Frozen)
+TEST MLP Prompt Encoder + Custom Projection.
+Carica sia il prompt encoder addestrato SIA la proiezione modificata.
 """
 
 import json
@@ -14,269 +13,261 @@ from transformers import AutoTokenizer
 from sklearn.metrics import precision_recall_fscore_support, classification_report
 from collections import Counter
 import os
-import datetime
 from tqdm import tqdm
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset/test_dataset_tokenlevel.json"
+TEST_PATH = "../dataset/test_dataset_tokenlevel.json" # O il tuo file di test
 LABEL2DESC_PATH = "../label2desc.json"
 LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 SAVINGS_DIR = "savings"
 
 # ==========================================================
-# 1️⃣ DEFINIZIONE PROMPT ENCODER (Deve combaciare col training)
+# 1️⃣ RIDEFINIZIONE CLASSE (Identica al Training)
 # ==========================================================
-class PromptEncoder(nn.Module):
-    """
-    Lo stesso modulo usato nel training per caricare i pesi salvati.
-    """
-    def __init__(self, vocab_size, embed_dim):
+class MLPPromptEncoder(nn.Module):
+    def __init__(self, original_embeddings, vocab_size, embed_dim, hidden_dim=None, dropout=0.1):
         super().__init__()
-        # Qui non serve inizializzare con i pesi originali perché tanto
-        # caricheremo lo state_dict salvato subito dopo.
         self.embedding = nn.Embedding(vocab_size, embed_dim)
+        # Non serve copiare i pesi qui, tanto li sovrascriviamo col load_state_dict
         
+        if hidden_dim is None: hidden_dim = embed_dim * 4  # Changed from * 2 to * 4
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim), nn.Dropout(dropout)
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
     def forward(self, input_ids):
-        return self.embedding(input_ids)
+        x = self.embedding(input_ids)
+        return self.norm(x + self.mlp(x))
 
 # ==========================================================
-# UTILITÀ
+# 2️⃣ SELEZIONE CHECKPOINT
 # ==========================================================
-def select_checkpoint_interactive(savings_dir=SAVINGS_DIR):
-    """Mostra menu interattivo per selezionare checkpoint."""
-    if not os.path.exists(savings_dir):
-        print(f"❌ Directory {savings_dir} non trovata.")
-        exit()
-        
-    checkpoints = [f for f in os.listdir(savings_dir) if f.endswith('.pt')]
+def select_checkpoint_interactive():
+    if not os.path.exists(SAVINGS_DIR): return None
+    ckpts = [f for f in os.listdir(SAVINGS_DIR) if f.endswith('.pt')]
+    if not ckpts: return None
+    ckpts.sort(key=lambda x: os.path.getmtime(os.path.join(SAVINGS_DIR, x)), reverse=True)
     
-    if not checkpoints:
-        raise FileNotFoundError(f"❌ Nessun checkpoint trovato in {savings_dir}/")
-    
-    checkpoints_info = []
-    for ckpt in checkpoints:
-        path = os.path.join(savings_dir, ckpt)
-        mtime = os.path.getmtime(path)
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        checkpoints_info.append({
-            'name': ckpt,
-            'path': path,
-            'mtime': mtime,
-            'size_mb': size_mb
-        })
-    
-    checkpoints_info.sort(key=lambda x: x['mtime'], reverse=True)
-    
-    print("\n" + "="*60)
-    print("📦 SELEZIONE CHECKPOINT (PROMPT ENCODER)")
-    print("="*60)
-    
-    for i, info in enumerate(checkpoints_info, 1):
-        date_str = datetime.datetime.fromtimestamp(info['mtime']).strftime('%Y-%m-%d %H:%M:%S')
-        print(f"{i}. {info['name']}")
-        print(f"   📅 {date_str} | 💾 {info['size_mb']:.1f} MB")
-    
-    while True:
-        try:
-            choice = input(f"\n👉 Seleziona checkpoint (1-{len(checkpoints_info)}) [default: 1]: ").strip()
-            if choice == "": choice = 1
-            else: choice = int(choice)
-            
-            if 1 <= choice <= len(checkpoints_info):
-                selected = checkpoints_info[choice - 1]
-                print(f"✅ Selezionato: {selected['name']}")
-                return selected['path']
-            else: print(f"❌ Numero non valido.")
-        except: print("❌ Input non valido.")
+    print("\n📦 CHECKPOINT DISPONIBILI:")
+    for i, c in enumerate(ckpts[:5]): print(f"{i+1}. {c}")
+    try:
+        sel = int(input("\n👉 Scegli numero [1]: ") or 1) - 1
+        return os.path.join(SAVINGS_DIR, ckpts[sel])
+    except: return os.path.join(SAVINGS_DIR, ckpts[0])
 
-def truncate_tokens_safe(tokens, tokenizer, max_len=None):
-    if max_len is None: max_len = tokenizer.model_max_length
-    if len(tokens) <= max_len: return tokens
-    if tokens[0] == tokenizer.cls_token and tokens[-1] == tokenizer.sep_token and max_len >= 2:
-        return [tokens[0]] + tokens[1:max_len-1] + [tokens[-1]]
-    return tokens[:max_len]
+ckpt_path = select_checkpoint_interactive()
+print(f"Loading: {ckpt_path}")
+checkpoint = torch.load(ckpt_path, map_location=DEVICE)
 
 # ==========================================================
-# 🚀 COSTRUZIONE MATRICE LABEL (CORE LOGIC)
+# 3️⃣ CARICAMENTO MODELLO IBRIDO
 # ==========================================================
-def build_optimized_label_matrix(prompt_enc, lbl_enc, proj, lbl_tok, label_names, label2desc):
-    """
-    Genera la matrice delle label usando la pipeline addestrata:
-    Prompt Encoder -> Label Encoder (Inputs Embeds) -> Pooling -> Projection
-    """
-    print("⚙️  Generazione matrice label ottimizzata...")
-    
-    desc_texts = [label2desc[name] for name in label_names]
-    
-    # 1. Tokenizzazione Descrizioni
-    batch = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    input_ids = batch["input_ids"]
-    attention_mask = batch["attention_mask"]
-    
-    with torch.no_grad():
-        # 2. Prompt Encoder (Soft Embeddings)
-        soft_embeds = prompt_enc(input_ids) # [num_labels, seq, 384]
-        
-        # 3. Injection nel Label Encoder
-        outputs = lbl_enc(inputs_embeds=soft_embeds, attention_mask=attention_mask)
-        
-        # 4. Pooling (Weighted Mean)
-        mask_expanded = attention_mask.unsqueeze(-1).float()
-        sum_embeddings = torch.sum(outputs.last_hidden_state * mask_expanded, 1)
-        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-        pooled = sum_embeddings / sum_mask
-        
-        # 5. Projection
-        projected = proj(pooled)
-        
-        # 6. Normalizzazione
-        label_matrix = F.normalize(projected, dim=-1)
-        
-    return label_matrix
-
-# ==========================================================
-# MAIN FLOW
-# ==========================================================
-
-# 1. Caricamento Dati
-print("📥 Caricamento mappe...")
-with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
-with open(LABEL2ID_PATH) as f: label2id = json.load(f)
-id2label = {v: k for k, v in label2id.items()}
-label_names = [id2label[i] for i in range(len(label2id))]
-num_labels = len(label_names)
-
-print(f"\n📚 Caricamento TEST SET da {TEST_PATH}...")
-with open(TEST_PATH, "r", encoding="utf-8") as f: test_records = json.load(f)
-print(f"✅ Caricati {len(test_records)} esempi di test")
-
-# 2. Caricamento Modello Base (Blackbox)
-print(f"\n📦 Caricamento backbone GLiNER: {MODEL_NAME}")
+print("📦 Ricostruzione Architettura...")
 model = GLiNER.from_pretrained(MODEL_NAME)
 core = model.model
 
-txt_enc = core.token_rep_layer.bert_layer.model
 lbl_enc = core.token_rep_layer.labels_encoder.model
-proj = core.token_rep_layer.labels_projection
+proj = core.token_rep_layer.labels_projection # Questa è quella originale (da sovrascrivere)
+
+# A. Carichiamo la PROIEZIONE ADDESTRATA
+# Se nel training hai salvato: {'prompt_encoder': ..., 'projection': ...}
+if 'projection' in checkpoint:
+    proj.load_state_dict(checkpoint['projection'])
+    print("✅ Proiezione custom caricata.")
+else:
+    print("⚠️ ATTENZIONE: 'projection' non trovata nel checkpoint. Usando quella originale (Risultati potrebbero essere scarsi).")
+
+# B. Carichiamo il PROMPT ENCODER
+vocab_size = lbl_enc.embeddings.word_embeddings.num_embeddings
+embed_dim = lbl_enc.embeddings.word_embeddings.embedding_dim
+
+prompt_encoder = MLPPromptEncoder(lbl_enc.embeddings.word_embeddings, vocab_size, embed_dim).to(DEVICE)
+
+if 'prompt_encoder' in checkpoint:
+    prompt_encoder.load_state_dict(checkpoint['prompt_encoder'])
+    print("✅ Prompt Encoder caricato.")
+elif 'soft_embeddings' in checkpoint: # Retrocompatibilità
+    # Se è un vecchio formato, potrebbe fallire
+    pass
+else:
+    # Se hai salvato direttamente lo state dict del prompt encoder senza chiavi
+    try:
+        prompt_encoder.load_state_dict(checkpoint)
+        print("✅ Prompt Encoder caricato (direct state dict).")
+    except:
+        print("❌ Errore caricamento Prompt Encoder.")
+
+# Setup modalità eval
+txt_enc = core.token_rep_layer.bert_layer.model.to(DEVICE).eval()
+lbl_enc.to(DEVICE).eval()
+proj.to(DEVICE).eval()
+prompt_encoder.eval()
 
 txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
 lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
 
-# Freeze per sicurezza (Inference mode)
-txt_enc.eval().to(DEVICE)
-lbl_enc.eval().to(DEVICE)
-proj.eval().to(DEVICE)
-
-# 3. Caricamento Prompt Encoder (Trained)
-checkpoint_path = select_checkpoint_interactive(SAVINGS_DIR)
-checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-
-# Recuperiamo dimensioni dal backbone
-vocab_size = lbl_enc.embeddings.word_embeddings.num_embeddings
-embed_dim = lbl_enc.embeddings.word_embeddings.embedding_dim
-
-prompt_encoder = PromptEncoder(vocab_size, embed_dim).to(DEVICE)
-prompt_encoder.load_state_dict(checkpoint) # Carica solo i pesi del prompt encoder
-prompt_encoder.eval()
-
-print("✅ Prompt Encoder caricato e collegato.")
-
-# 4. Pre-calcolo Matrice Label
-label_matrix = build_optimized_label_matrix(
-    prompt_encoder, lbl_enc, proj, lbl_tok, label_names, label2desc
-)
-print(f"✅ Matrice Label Pronta: {label_matrix.shape}")
-
 # ==========================================================
-# VALUTAZIONE LOOP
+# 4️⃣ PRE-CALCOLO MATRICE LABEL
 # ==========================================================
-print(f"\n🔍 Valutazione su {len(test_records)} record...")
+print("⚙️  Generazione Matrice Label...")
+with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
+with open(LABEL2ID_PATH) as f: label2id = json.load(f)
+id2label = {v: k for k, v in label2id.items()}
+label_names = [id2label[i] for i in range(len(label2id))]
 
-y_true_all = []
-y_pred_all = []
-n_skipped = 0
+desc_texts = [label2desc[name] for name in label_names]
+batch_desc = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
 
 with torch.no_grad():
-    for idx, record in enumerate(tqdm(test_records)):
-        tokens = record["tokens"]
-        labels = record["labels"]
-        
-        if len(tokens) != len(labels):
-            n_skipped += 1
-            continue
-        
-        # Tokenizzazione Testo
-        input_ids = txt_tok.convert_tokens_to_ids(tokens)
-        
-        # Gestione lunghezza massima
-        max_len = getattr(txt_tok, "model_max_length", 512)
-        if len(input_ids) > max_len:
-            input_ids = truncate_tokens_safe(input_ids, txt_tok, max_len)
-            labels = labels[:len(input_ids)]
-        
-        input_ids_tensor = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
-        attention_mask = torch.ones_like(input_ids_tensor, dtype=torch.long, device=DEVICE)
-        
-        # Encode Testo
-        out_txt = txt_enc(input_ids=input_ids_tensor, attention_mask=attention_mask)
-        H = F.normalize(out_txt.last_hidden_state, dim=-1) # [1, seq, 768]
-        
-        # Calcolo similarità con la Matrice Label ottimizzata
-        logits = torch.matmul(H, label_matrix.T).squeeze(0) # [seq, num_labels]
-        preds = logits.argmax(-1).cpu().numpy()
-        
-        # Raccolta risultati
-        for pred, true_label in zip(preds, labels):
-            if true_label != -100:
-                y_true_all.append(true_label)
-                y_pred_all.append(pred)
+    # 1. MLP Transform
+    soft_embeds = prompt_encoder(batch_desc["input_ids"])
+    # 2. Frozen Label Enc
+    out_lbl = lbl_enc(inputs_embeds=soft_embeds, attention_mask=batch_desc["attention_mask"])
+    # 3. Pooling
+    mask = batch_desc["attention_mask"].unsqueeze(-1).float()
+    pooled = torch.sum(out_lbl.last_hidden_state * mask, 1) / torch.clamp(mask.sum(1), min=1e-9)
+    # 4. CUSTOM Projection
+    label_matrix = F.normalize(proj(pooled), dim=-1)
+
+print(f"✅ Matrice pronta: {label_matrix.shape}")
 
 # ==========================================================
-# REPORTING & EXPORT
+# 5️⃣ TEST LOOP
 # ==========================================================
-all_label_ids = list(range(num_labels))
+with open(TEST_PATH) as f: test_data = json.load(f)
+print(f"\n🔍 Valutazione su {len(test_data)} record...")
 
-prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
-    y_true_all, y_pred_all, average="macro", zero_division=0, labels=all_label_ids
-)
-prec_micro, rec_micro, f1_micro, _ = precision_recall_fscore_support(
-    y_true_all, y_pred_all, average="micro", zero_division=0, labels=all_label_ids
+y_true, y_pred = [], []
+
+def truncate(tokens):
+    if len(tokens) > 512: return tokens[:512]
+    return tokens
+
+with torch.no_grad():
+    for rec in tqdm(test_data):
+        tokens = truncate(rec["tokens"])
+        labels = rec["labels"][:len(tokens)]
+        
+        inp = txt_tok.convert_tokens_to_ids(tokens)
+        inp_tensor = torch.tensor([inp], device=DEVICE)
+        mask_tensor = torch.ones_like(inp_tensor)
+        
+        # Text Enc
+        out_txt = txt_enc(inp_tensor, mask_tensor)
+        H = F.normalize(out_txt.last_hidden_state, dim=-1)
+        
+        # Similarity
+        logits = torch.matmul(H, label_matrix.T).squeeze(0)
+        preds = logits.argmax(-1).cpu().tolist()
+        
+        for p, t in zip(preds, labels):
+            if t != -100:
+                y_true.append(t)
+                y_pred.append(p)
+
+# ==========================================================
+# 6️⃣ RISULTATI
+# ==========================================================
+from sklearn.metrics import confusion_matrix
+import datetime
+
+# Compute all metrics
+all_label_ids = list(range(len(label_names)))
+
+macro_f1 = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)[2]
+micro_f1 = precision_recall_fscore_support(y_true, y_pred, average="micro", zero_division=0)[2]
+
+# Per-class metrics
+per_class_metrics = precision_recall_fscore_support(
+    y_true, y_pred, labels=all_label_ids, zero_division=0
 )
 
 class_report = classification_report(
-    y_true_all, y_pred_all, target_names=label_names, labels=all_label_ids, zero_division=0, digits=4
+    y_true, y_pred, target_names=label_names, labels=all_label_ids, zero_division=0, digits=4
 )
 
-print(f"\n{'='*70}")
-print(f"📊 RISULTATI TEST (PROMPT TUNING)")
-print(f"{'='*70}")
-print(f"Checkpoint: {os.path.basename(checkpoint_path)}")
-print(f"Token valutati: {len(y_true_all):,}")
-print(f"\n🎯 METRICHE:")
-print(f"  Macro F1: {f1_macro:.4f}")
-print(f"  Micro F1: {f1_micro:.4f}")
-print(f"\n📋 REPORT:\n{class_report}")
+# Confusion matrix and counts
+pred_counts = Counter(y_pred)
+true_counts = Counter(y_true)
+conf_matrix = confusion_matrix(y_true, y_pred, labels=all_label_ids)
 
-# Export Markdown
-timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+print(f"\n🏆 MACRO F1: {macro_f1:.4f} | MICRO F1: {micro_f1:.4f}")
+print(classification_report(y_true, y_pred, target_names=label_names, zero_division=0))
+
+# ==========================================================
+# 📊 EXPORT DETTAGLIATO
+# ==========================================================
 os.makedirs("test_results", exist_ok=True)
-filename = f"test_results/eval_prompt_{timestamp}.md"
-
-pred_counts = Counter(y_pred_all)
-true_counts = Counter(y_true_all)
+timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+filename = f"test_results/eval_mlp_prompt_{timestamp}.md"
 
 with open(filename, "w", encoding="utf-8") as f:
-    f.write(f"# Risultati Test - Prompt Tuning\n\n")
-    f.write(f"**Checkpoint:** {os.path.basename(checkpoint_path)}\n")
-    f.write(f"**Dataset:** {TEST_PATH}\n\n")
-    f.write(f"## Metriche\n- **Macro F1:** {f1_macro:.4f}\n- **Micro F1:** {f1_micro:.4f}\n\n")
-    f.write(f"## Report Classi\n```\n{class_report}\n```\n")
-    f.write(f"## Distribuzione\n| Label | Pred | True | Diff |\n|---|---|---|---|\n")
-    for lid in sorted(pred_counts.keys(), key=lambda x: pred_counts[x], reverse=True):
-        f.write(f"| {id2label[lid]} | {pred_counts[lid]} | {true_counts[lid]} | {pred_counts[lid]-true_counts[lid]:+d} |\n")
+    f.write(f"# Risultati Test - MLP Prompt Encoder\n\n")
+    f.write(f"**Checkpoint:** {os.path.basename(ckpt_path)}\n")
+    f.write(f"**Dataset:** {TEST_PATH}\n")
+    f.write(f"**Data:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    
+    # Metriche globali
+    f.write(f"## 📈 Metriche Globali\n\n")
+    f.write(f"| Metric | Score |\n")
+    f.write(f"|--------|-------|\n")
+    f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
+    f.write(f"| **Micro F1** | {micro_f1:.4f} |\n")
+    f.write(f"| **Token Totali** | {len(y_true):,} |\n\n")
+    
+    # Metriche per classe DETTAGLIATE
+    f.write(f"## 📊 Metriche per Classe (Dettagliate)\n\n")
+    f.write(f"| Classe | Precision | Recall | F1-Score | Support | Predicted |\n")
+    f.write(f"|--------|-----------|--------|----------|---------|----------|\n")
+    
+    precisions, recalls, f1s, supports = per_class_metrics
+    for i, label_name in enumerate(label_names):
+        pred_count = pred_counts.get(i, 0)
+        true_count = supports[i]
+        f.write(f"| **{label_name}** | {precisions[i]:.4f} | {recalls[i]:.4f} | "
+                f"{f1s[i]:.4f} | {true_count} | {pred_count} |\n")
+    
+    # Aggiungi riga totale
+    f.write(f"| **TOTAL** | - | - | - | {sum(supports)} | {len(y_pred)} |\n\n")
+    
+    # Report completo
+    f.write(f"## 📋 Classification Report Completo\n\n")
+    f.write(f"```\n{class_report}\n```\n\n")
+    
+    # Distribuzione predizioni vs ground truth
+    f.write(f"## 🔢 Distribuzione Predizioni vs Ground Truth\n\n")
+    f.write(f"| Classe | Predette | Vere | Differenza | % Coverage |\n")
+    f.write(f"|--------|----------|------|------------|------------|\n")
+    
+    for i in sorted(pred_counts.keys(), key=lambda x: true_counts[x], reverse=True):
+        label_name = label_names[i]
+        pred = pred_counts[i]
+        true = true_counts[i]
+        diff = pred - true
+        coverage = (pred / true * 100) if true > 0 else 0
+        f.write(f"| {label_name} | {pred} | {true} | {diff:+d} | {coverage:.1f}% |\n")
+    
+    f.write(f"\n")
+    
+    # Matrice di confusione (top confusions)
+    f.write(f"## 🔀 Top Confusioni (Errori più frequenti)\n\n")
+    f.write(f"| Vera Classe | Predetta Come | Count |\n")
+    f.write(f"|-------------|---------------|-------|\n")
+    
+    confusions = []
+    for i in range(len(label_names)):
+        for j in range(len(label_names)):
+            if i != j and conf_matrix[i][j] > 0:
+                confusions.append((label_names[i], label_names[j], conf_matrix[i][j]))
+    
+    confusions.sort(key=lambda x: x[2], reverse=True)
+    for true_label, pred_label, count in confusions[:20]:  # Top 20
+        f.write(f"| {true_label} | {pred_label} | {count} |\n")
 
-print(f"\n💾 Report salvato: {filename}")
+print(f"\n💾 Report dettagliato salvato: {filename}")

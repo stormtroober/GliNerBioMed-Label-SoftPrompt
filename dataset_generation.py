@@ -14,10 +14,14 @@ from collections import Counter, defaultdict
 import random
 import os
 
-#600 is for a super balanced test.
-#lowering 300 doesnt change too much
-EXAMPLE_NUMBER_FOR_BALANCED = 600
-TEST_SAMPLE_SIZE = 1000
+# Configurazione dataset
+
+SIMPLE_DATASET_SIZE = 10000  # Numero di esempi da usare se USE_BALANCED_DATASET = False
+USE_BALANCED_DATASET = False  # Se False, usa semplicemente i primi N dati
+
+EXAMPLE_NUMBER_FOR_BALANCED = 600  # Usato solo se USE_BALANCED_DATASET = True
+
+TEST_SAMPLE_SIZE = 2000
 
 # ===============================================================
 # 1️⃣ GENERAZIONE label2desc.json e label2id.json
@@ -94,6 +98,58 @@ def parse_bio_tag(tag: str):
     return (pref, base or "O")
 
 # ===============================================================
+# ANALISI COMPOSIZIONE DATASET JNLPBA COMPLETO
+# ===============================================================
+print("\n" + "="*60)
+print("📊 ANALISI COMPOSIZIONE DATASET JNLPBA COMPLETO")
+print("="*60)
+
+bio_tag_counts = Counter()
+base_label_counts = Counter()
+entity_counts = Counter()
+total_tokens = 0
+
+for _, row in df.iterrows():
+    bio_tags = list(row["ner_tags"])
+    total_tokens += len(bio_tags)
+    
+    current_entity = None
+    for tag in bio_tags:
+        bio_tag_counts[tag] += 1
+        pref, base = parse_bio_tag(tag)
+        
+        if base != "O":
+            base_label_counts[base] += 1
+        else:
+            base_label_counts["O"] += 1
+        
+        # Conta entità complete (ogni B- inizia una nuova entità)
+        if pref == "B":
+            entity_counts[base] += 1
+
+print(f"\n📈 Totale token: {total_tokens:,}")
+print(f"📈 Totale frasi: {len(df):,}")
+
+print("\n🏷️  DISTRIBUZIONE ETICHETTE BIO COMPLETE:")
+for tag, count in bio_tag_counts.most_common():
+    percentage = (count / total_tokens) * 100
+    print(f"  {tag:20s}: {count:8,} ({percentage:5.2f}%)")
+
+print("\n🏷️  DISTRIBUZIONE ETICHETTE BASE:")
+for label, count in base_label_counts.most_common():
+    percentage = (count / total_tokens) * 100
+    print(f"  {label:20s}: {count:8,} ({percentage:5.2f}%)")
+
+print("\n🎯 NUMERO DI ENTITÀ PER CLASSE:")
+total_entities = sum(entity_counts.values())
+for label, count in entity_counts.most_common():
+    percentage = (count / total_entities) * 100
+    print(f"  {label:20s}: {count:6,} entità ({percentage:5.2f}%)")
+print(f"  {'TOTALE':20s}: {total_entities:6,} entità")
+
+print("="*60 + "\n")
+
+# ===============================================================
 # 4️⃣ TOKENIZZAZIONE + ALLINEAMENTO (BIO-AWARE)
 # ===============================================================
 def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
@@ -144,42 +200,51 @@ for _, row in tqdm(df.iterrows(), total=len(df)):
 print(f"\n✅ Creati {len(encoded_dataset)} esempi token-level.")
 
 # ===============================================================
-# 6️⃣ BILANCIAMENTO CLASSI
+# 6️⃣ BILANCIAMENTO CLASSI O SELEZIONE SEMPLICE
 # ===============================================================
-# raggruppa frasi per classe se contengono almeno
-# un'entità di quella classe. Per ogni classe si estraggono fino a
-# EXAMPLE_NUMBER_FOR_BALANCED esempi casuali. Una stessa frase può
-# comparire in più classi se contiene più entità diverse.
 
-label_counts = Counter()
-for ex in encoded_dataset:
-    for l in ex["labels"].tolist():
-        if l != -100:
-            label_counts[l] += 1
+if USE_BALANCED_DATASET:
+    print(f"\n⚖️  Modalità BILANCIATA attiva - target ~{EXAMPLE_NUMBER_FOR_BALANCED} esempi per classe")
+    # raggruppa frasi per classe se contengono almeno
+    # un'entità di quella classe. Per ogni classe si estraggono fino a
+    # EXAMPLE_NUMBER_FOR_BALANCED esempi casuali. Una stessa frase può
+    # comparire in più classi se contiene più entità diverse.
 
-non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
-if non_o_labels:
-    min_count = min(label_counts[lid] for lid in non_o_labels)
-    target_per_class = EXAMPLE_NUMBER_FOR_BALANCED
+    label_counts = Counter()
+    for ex in encoded_dataset:
+        for l in ex["labels"].tolist():
+            if l != -100:
+                label_counts[l] += 1
 
-balanced_examples = defaultdict(list)
-for ex in encoded_dataset:
-    present = {l for l in ex["labels"].tolist() if l != -100 and id2label.get(l, "O") != "O"}
-    for lid in present:
-        balanced_examples[lid].append(ex)
+    non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
+    if non_o_labels:
+        min_count = min(label_counts[lid] for lid in non_o_labels)
+        target_per_class = EXAMPLE_NUMBER_FOR_BALANCED
 
-balanced_dataset = []
-for lid in non_o_labels:
-    random.shuffle(balanced_examples[lid])
-    balanced_dataset.extend(balanced_examples[lid][:target_per_class])
+    balanced_examples = defaultdict(list)
+    for ex in encoded_dataset:
+        present = {l for l in ex["labels"].tolist() if l != -100 and id2label.get(l, "O") != "O"}
+        for lid in present:
+            balanced_examples[lid].append(ex)
 
-print(f"\n✅ Dataset bilanciato con {len(balanced_dataset)} frasi (~{target_per_class} per classe)")
+    balanced_dataset = []
+    for lid in non_o_labels:
+        random.shuffle(balanced_examples[lid])
+        balanced_dataset.extend(balanced_examples[lid][:target_per_class])
+
+    final_dataset = balanced_dataset
+    print(f"✅ Dataset bilanciato con {len(final_dataset)} frasi (~{target_per_class} per classe)")
+
+else:
+    print(f"\n📊 Modalità SEMPLICE attiva - primi {SIMPLE_DATASET_SIZE} esempi")
+    final_dataset = encoded_dataset[:SIMPLE_DATASET_SIZE]
+    print(f"✅ Dataset semplice con {len(final_dataset)} frasi (primi {SIMPLE_DATASET_SIZE} esempi)")
 
 # ===============================================================
 # 7️⃣ ESPORTAZIONE IN JSON (SOLO tokens, labels)
 # ===============================================================
 records = []
-for ex in balanced_dataset:
+for ex in final_dataset:
     input_ids = ex["input_ids"].tolist()
     labels = ex["labels"].tolist()
     # Esportiamo SOLO i campi necessari al training:
@@ -189,7 +254,9 @@ for ex in balanced_dataset:
         "labels": labels
     })
 
-out_path = "dataset/dataset_tokenlevel_balanced.json"
+# Modifica il nome del file in base alla modalità
+filename = "dataset_tokenlevel_balanced.json" if USE_BALANCED_DATASET else "dataset_tokenlevel_simple.json"
+out_path = f"dataset/{filename}"
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(records, f, indent=2, ensure_ascii=False)
