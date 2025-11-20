@@ -217,7 +217,9 @@ class EarlyStopping:
 print("\n📚 Caricamento dataset...")
 ds = TokenJsonDataset(DATASET_PATH, txt_tok, label2id)
 class_weights = compute_class_weights(DATASET_PATH, label2id).to(DEVICE)
+print(f"🔧 Class weights computed: {class_weights}")
 ce_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
+print(f"✅ CrossEntropyLoss with class balancing initialized")
 
 train_loader = DataLoader(
     ds, batch_size=BATCH_SIZE, shuffle=True,
