@@ -20,17 +20,17 @@ from tqdm import tqdm
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 # --- SWITCH PRINCIPALE ---
-TRAIN_PROJECTION = True  # Consigliato TRUE per dataset complessi/sbilanciati
+TRAIN_PROJECTION = True
 # -------------------------
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
-EPOCHS = 15           # ⬆️ Aumentato: il dataset full ha bisogno di più tempo
-LEARNING_RATE = 5e-4  # ⬆️ Aumentato: spinta più forte per l'MLP
+EPOCHS = 15
+LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.1     # ⬇️ Abbassato: penalizza duramente i falsi positivi sulle classi rare
+TEMPERATURE = 0.1
 GRAD_CLIP = 1.0
-WARMUP_STEPS = 200    
+WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
