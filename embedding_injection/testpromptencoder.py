@@ -14,6 +14,7 @@ from sklearn.metrics import precision_recall_fscore_support, classification_repo
 from collections import Counter
 import os
 from tqdm import tqdm
+import subprocess
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
@@ -271,3 +272,23 @@ with open(filename, "w", encoding="utf-8") as f:
         f.write(f"| {true_label} | {pred_label} | {count} |\n")
 
 print(f"\n💾 Report dettagliato salvato: {filename}")
+
+SHELL_SCRIPT_NAME = "orderTests.sh"
+
+print(f"\n🚀 Esecuzione script shell: {SHELL_SCRIPT_NAME}...")
+
+# Controllo esistenza file
+if not os.path.isfile(SHELL_SCRIPT_NAME):
+    print(f"❌ ERRORE: Il file '{SHELL_SCRIPT_NAME}' non esiste nella directory corrente.")
+else:
+    try:
+        # Usa 'bash' esplicitamente per evitare problemi di permessi +x
+        # check=True fa crashare il python se lo script sh ritorna errore (exit code != 0)
+        # stdout=None, stderr=None lasciano che l'output dello script vada sulla console attuale
+        subprocess.run(["bash", SHELL_SCRIPT_NAME], check=True)
+        print("\n✅ Script shell completato con successo.")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"\n❌ ERRORE CRITICO: Lo script shell è terminato con codice {e.returncode}.")
+    except Exception as e:
+        print(f"\n❌ ERRORE IMPREVISTO: {e}")
