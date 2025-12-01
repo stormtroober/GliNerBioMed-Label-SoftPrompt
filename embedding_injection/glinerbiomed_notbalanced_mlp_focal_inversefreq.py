@@ -28,8 +28,8 @@ BATCH_SIZE = 32
 EPOCHS = 10
 
 # LEARNING RATES SEPARATI
-LR_MLP = 5e-4       # Solitamente più alto (è un modulo nuovo)
-LR_PROJ = 5e-4      # Solitamente più basso (è pre-addestrato, va solo raffinato)
+LR_MLP = 5e-4
+LR_PROJ = 5e-4
 
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.1
@@ -38,6 +38,7 @@ WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 GAMMA_FOCAL_LOSS = 3.0
+WEIGHT_STRATEGY = "InvFreq"
 
 DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
 LABEL2DESC_PATH = "../label2desc.json"
@@ -322,8 +323,15 @@ print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 if best_model_state is not None:
     os.makedirs("savings", exist_ok=True)
     proj_tag = "PROJ-TRUE" if TRAIN_PROJECTION else "PROJ-FALSE"
-    # Nome file include entrambi i LR
-    filename = f"mlp_FULL_{proj_tag}DATA{dataset_size}_lrMLP{LR_MLP}_lrPROJ{LR_PROJ}_ep{EPOCHS}_focal.pt"
+    filename = (
+        f"mlp_FULL_{proj_tag}_"
+        f"DATA{dataset_size}_"
+        f"W-{WEIGHT_STRATEGY}_"
+        f"lrMLP{LR_MLP}_"
+        f"lrPROJ{LR_PROJ}_"
+        f"ep{EPOCHS}_"
+        f"GAMMA{GAMMA_FOCAL_LOSS}-focal.pt"
+    )
     save_path = os.path.join("savings", filename)
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")
