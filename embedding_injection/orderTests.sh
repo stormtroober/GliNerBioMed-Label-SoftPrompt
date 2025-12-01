@@ -1,72 +1,100 @@
 #!/bin/bash
-# filepath: /home/aless/Desktop/GliNerBioMed-Label-SoftPrompt/embedding_injection/rank_test_results.sh
 
-# Script to rank test results by Macro F1 (primary) and Micro F1 (secondary)
+# ==========================================
+# CONFIGURAZIONE
+# ==========================================
+# Directory contenente i risultati dei test.
+# Presuppone che lo script venga lanciato dalla root del progetto.
+TARGET_DIR="./test_results"
 
-TEST_DIR="test_results"
-OUTPUT_DIR="ranked_results"
+# File temporaneo per memorizzare i punteggi
+TEMP_FILE="scores_temp.txt"
 
-# Create output directory if it doesn't exist
-mkdir -p "$OUTPUT_DIR"
+# Controlla se la directory esiste
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Errore: La directory $TARGET_DIR non esiste."
+    echo "Assicurati di lanciare lo script dalla root del progetto o modifica TARGET_DIR."
+    exit 1
+fi
 
-# Temporary file to store results
-TEMP_FILE=$(mktemp)
+echo "=== Inizio elaborazione in: $TARGET_DIR ==="
+echo "=== Criterio: Media Armonica (Harmonic Mean) tra Macro e Micro F1 ==="
 
-echo "Extracting metrics from test results..."
+# ==========================================
+# 1. PULIZIA NOMI PRECEDENTI
+# ==========================================
+echo "1. Ripristino nomi originali (rimozione prefissi vecchi)..."
+cd "$TARGET_DIR" || exit
 
-# Extract Macro F1 and Micro F1 from each file
-for file in "$TEST_DIR"/eval_mlp_prompt_*.md; do
-    if [ -f "$file" ]; then
-        filename=$(basename "$file")
-        
-        # Extract Macro F1 and Micro F1 using grep and awk
-        macro_f1=$(grep "Macro F1" "$file" | head -1 | awk -F'|' '{print $3}' | tr -d ' ')
-        micro_f1=$(grep "Micro F1" "$file" | head -1 | awk -F'|' '{print $3}' | tr -d ' ')
-        
-        # Write to temp file: macro_f1 micro_f1 filename
-        echo "$macro_f1 $micro_f1 $filename" >> "$TEMP_FILE"
-    fi
+# Rimuove prefissi numerici esistenti (es. "1-eval..." torna "eval...")
+for file in [0-9]*-*.md; do
+    [ -e "$file" ] || continue
+    new_name="${file#*-}" # Rimuove tutto fino al primo trattino
+    mv "$file" "$new_name"
 done
 
-echo "Ranking results..."
+# ==========================================
+# 2. ESTRAZIONE E CALCOLO PUNTEGGIO
+# ==========================================
+echo "2. Calcolo punteggi combinati..."
 
-# Sort by Macro F1 (descending), then Micro F1 (descending)
-sort -k1,1nr -k2,2nr "$TEMP_FILE" > "${TEMP_FILE}_sorted"
+# Pulisce il file temporaneo (che si trova nella cartella superiore rispetto a test_results)
+> "../$TEMP_FILE"
 
-# Create ranked copies with numbers, overwriting existing files
+for file in *.md; do
+    [ -e "$file" ] || continue
+
+    # Estrae Macro F1
+    macro_f1=$(grep "**Macro F1**" "$file" | awk -F'|' '{print $3}' | tr -d ' ')
+    
+    # Estrae Micro F1
+    micro_f1=$(grep "**Micro F1**" "$file" | awk -F'|' '{print $3}' | tr -d ' ')
+
+    # Gestione errori se i valori mancano
+    if [ -z "$macro_f1" ]; then macro_f1="0"; fi
+    if [ -z "$micro_f1" ]; then micro_f1="0"; fi
+
+    # --- CALCOLO CRITERIO AVANZATO (MEDIA ARMONICA) ---
+    # Formula: 2 * (Macro * Micro) / (Macro + Micro)
+    # Premia i modelli bilanciati, penalizza se uno dei due valori è basso.
+    score=$(awk -v ma="$macro_f1" -v mi="$micro_f1" 'BEGIN { 
+        sum = ma + mi;
+        if (sum > 0) printf "%.5f", (2 * ma * mi) / sum; 
+        else print "0" 
+    }')
+
+    # Salva nel formato: SCORE MACRO MICRO NOMEFILE
+    echo "$score $macro_f1 $micro_f1 $file" >> "../$TEMP_FILE"
+done
+
+# ==========================================
+# 3. ORDINAMENTO E RINOMINA
+# ==========================================
+echo "3. Classifica e rinomina file..."
+
+# Ordina in base allo SCORE (colonna 1) in ordine decrescente numerico (-nr)
 rank=1
-while read -r macro_f1 micro_f1 filename; do
-    # Use rank number as prefix for the filename
-    new_filename="${rank}_${filename}"
+sort -k1,1nr "../$TEMP_FILE" | while read -r score macro micro filename; do
     
-    # Overwrite the existing file in the ranked directory
-    cp "$TEST_DIR/$filename" "$OUTPUT_DIR/$new_filename"
+    # Se lo score è 0, probabilmente il file era vuoto o corrotto
+    if [ "$score" == "0" ] || [ "$score" == "0.00000" ]; then
+        echo "Skip (Score 0): $filename"
+        continue
+    fi
+
+    # Costruisce il nuovo nome: CLASSIFICA-NomeOriginale
+    new_filename="${rank}-${filename}"
     
-    echo "Rank $rank: $filename (Macro F1: $macro_f1, Micro F1: $micro_f1)"
+    # Rinomina il file
+    mv "$filename" "$new_filename"
+    
+    echo "[$rank] H-Mean: $score (Mac: $macro | Mic: $micro) -> $new_filename"
     
     ((rank++))
-done < "${TEMP_FILE}_sorted"
+done
 
-# Create a summary report
-SUMMARY_FILE="$OUTPUT_DIR/00_ranking_summary.md"
-echo "# Test Results Ranking" > "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Ranked by Macro F1 (primary) and Micro F1 (secondary)" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "| Rank | Filename | Macro F1 | Micro F1 |" >> "$SUMMARY_FILE"
-echo "|------|----------|----------|----------|" >> "$SUMMARY_FILE"
-
-rank=1
-while read -r macro_f1 micro_f1 filename; do
-    padded_rank=$(printf "%02d" $rank)
-    echo "| $padded_rank | $filename | $macro_f1 | $micro_f1 |" >> "$SUMMARY_FILE"
-    ((rank++))
-done < "${TEMP_FILE}_sorted"
-
-# Cleanup
-rm "$TEMP_FILE" "${TEMP_FILE}_sorted"
-
-echo ""
-echo "✅ Ranking complete!"
-echo "📁 Ranked files saved in: $OUTPUT_DIR/"
-echo "📊 Summary report: $SUMMARY_FILE"
+# ==========================================
+# PULIZIA FINALE
+# ==========================================
+rm "../$TEMP_FILE"
+echo "=== Completato! File ordinati per Media Armonica decrescente. ==="
