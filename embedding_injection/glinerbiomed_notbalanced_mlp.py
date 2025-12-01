@@ -110,7 +110,7 @@ prompt_encoder = MLPPromptEncoder(
 print(f"✨ MLP Prompt Encoder creato.")
 
 # ==========================================================
-# 3️⃣ DATASET & CALCOLO PESI (LOGICA NUOVA)
+# 3️⃣ DATASET & CALCOLO PESI
 # ==========================================================
 with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
 with open(LABEL2ID_PATH) as f: label2id = json.load(f)

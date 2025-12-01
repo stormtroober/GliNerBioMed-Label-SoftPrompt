@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Training MLP Prompt Encoder on FULL Imbalanced Dataset.
-Strategy: Inverse Frequency Class Weights + Unfrozen Projection.
+Strategy: Inverse Frequency Class Weights + Unfrozen Projection + Differential Learning Rates.
 """
 
 import json
@@ -26,7 +26,11 @@ TRAIN_PROJECTION = True
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
 EPOCHS = 10
-LEARNING_RATE = 5e-4
+
+# 🔥 LEARNING RATES SEPARATI
+LR_MLP = 5e-4       # Solitamente più alto (è un modulo nuovo)
+LR_PROJ = 5e-4      # Solitamente più basso (è pre-addestrato, va solo raffinato)
+
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.1
 GRAD_CLIP = 1.0
@@ -78,15 +82,12 @@ class FocalLoss(nn.Module):
         self.alpha = alpha 
 
     def forward(self, input, target):
-        # input: (N, C), target: (N)
         ce_loss = F.cross_entropy(input, target, reduction='none', ignore_index=self.ignore_index)
-        pt = torch.exp(-ce_loss) # probabilità della classe corretta
+        pt = torch.exp(-ce_loss) 
         
-        # Maschera per escludere ignore_index
         mask = target != self.ignore_index
         
         if self.alpha is not None:
-            # Applica alpha solo sui target validi
             alpha_t = self.alpha[target[mask]]
             focal_loss = alpha_t * (1 - pt[mask]) ** self.gamma * ce_loss[mask]
         else:
@@ -140,7 +141,7 @@ prompt_encoder = MLPPromptEncoder(
 print(f"✨ MLP Prompt Encoder creato.")
 
 # ==========================================================
-# 3️⃣ DATASET & CALCOLO PESI (LOGICA NUOVA)
+# 3️⃣ DATASET & CALCOLO PESI
 # ==========================================================
 with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
 with open(LABEL2ID_PATH) as f: label2id = json.load(f)
@@ -182,9 +183,6 @@ def collate_batch(batch, pad_id):
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
 def get_weighted_loss_params(dataset_path, label2id, device):
-    """
-    Calcola i pesi inversi per bilanciare le classi rare (es. RNA vs Protein)
-    """
     with open(dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     
@@ -201,18 +199,13 @@ def get_weighted_loss_params(dataset_path, label2id, device):
     weights = torch.ones(num_classes).to(device)
     
     print("\n⚖️  CALCOLO PESI CLASSI (Inverse Frequency):")
-    print(f"   (Totale Tag Validi: {total_tags})")
-    
     for label_name, label_id in label2id.items():
         count = label_counts.get(label_id, 0)
         if count > 0:
-            # Formula: Total / (Num_Classes * Count)
             w = total_tags / (num_classes * count)
         else:
             w = 1.0
-            
         weights[label_id] = w
-        # Visualizzazione formattata
         print(f"   🔹 {label_name.ljust(15)}: {str(count).rjust(6)} occorrenze -> Peso Loss: {w:.4f}")
         
     return weights
@@ -222,24 +215,36 @@ ds = TokenJsonDataset(DATASET_PATH, txt_tok)
 dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
 
-# Calcolo Pesi
 class_weights = get_weighted_loss_params(DATASET_PATH, label2id, DEVICE)
-# Focal Loss con pesi (gamma=2.0 standard, usa 3.0 per focus maggiore su esempi difficili)
 ce_loss = FocalLoss(alpha=class_weights, gamma=2.0, ignore_index=-100)
 
 train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
 # ==========================================================
-# 4️⃣ TRAINING LOOP
+# 4️⃣ TRAINING LOOP (DIFFERENTIAL LEARNING RATES)
 # ==========================================================
 
-params_to_optimize = list(prompt_encoder.parameters())
-if TRAIN_PROJECTION:
-    params_to_optimize += list(proj.parameters())
+# 1. Gruppo parametri MLP (LR specifico)
+optimizer_grouped_parameters = [
+    {
+        "params": prompt_encoder.parameters(),
+        "lr": LR_MLP,
+    }
+]
 
+# 2. Gruppo parametri Projection (LR specifico)
+if TRAIN_PROJECTION:
+    print(f"🔗 Aggiunta Projection Layer all'optimizer con LR={LR_PROJ}")
+    optimizer_grouped_parameters.append({
+        "params": proj.parameters(),
+        "lr": LR_PROJ,
+    })
+else:
+    print("🔒 Projection Layer esclusa dall'optimizer (Frozen)")
+
+# Creazione Optimizer unico con gruppi separati
 optimizer = optim.AdamW(
-    params_to_optimize, 
-    lr=LEARNING_RATE, 
+    optimizer_grouped_parameters, 
     weight_decay=WEIGHT_DECAY
 )
 
@@ -255,7 +260,7 @@ else: proj.eval()
 best_loss = float('inf')
 best_model_state = None
 
-print(f"\n🚀 Inizio Training FULL DATASET | Weights Active | Proj: {TRAIN_PROJECTION}")
+print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP} | PROJ LR: {LR_PROJ if TRAIN_PROJECTION else 'N/A'}")
 
 for epoch in range(1, EPOCHS + 1):
     total_loss = 0
@@ -280,7 +285,7 @@ for epoch in range(1, EPOCHS + 1):
         loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params_to_optimize, GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP) # Clip gradients generically
         optimizer.step()
         scheduler.step()
         
@@ -288,7 +293,7 @@ for epoch in range(1, EPOCHS + 1):
         pbar.set_postfix({"loss": loss.item()})
         
     avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch} | Loss (Weighted): {avg_loss:.4f}")
+    print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
     
     if avg_loss < best_loss:
         best_loss = avg_loss
@@ -296,14 +301,15 @@ for epoch in range(1, EPOCHS + 1):
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
                 'train_projection': TRAIN_PROJECTION, 
-                'dataset': 'FULL_IMBALANCED',
-                'dataset_size': dataset_size
+                'dataset_size': dataset_size,
+                'lr_mlp': LR_MLP,
+                'lr_proj': LR_PROJ
             }
         }
         if TRAIN_PROJECTION:
             best_model_state['projection'] = proj.state_dict()
         
-        # Spostamento su CPU per salvataggio sicuro
+        # Spostamento su CPU
         for key in best_model_state:
             if isinstance(best_model_state[key], dict):
                 best_model_state[key] = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in best_model_state[key].items()}
@@ -315,7 +321,8 @@ print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 if best_model_state is not None:
     os.makedirs("savings", exist_ok=True)
     proj_tag = "PROJ-TRUE" if TRAIN_PROJECTION else "PROJ-FALSE"
-    filename = f"mlp_prompt_FULL_{proj_tag}_size{dataset_size}_lr{LEARNING_RATE}_ep{EPOCHS}_temp{TEMPERATURE}_best_focal.pt"
+    # Nome file include entrambi i LR
+    filename = f"mlp_FULL_{proj_tag}DATA{dataset_size}_lrMLP{LR_MLP}_lrPROJ{LR_PROJ}_ep{EPOCHS}_focal.pt"
     save_path = os.path.join("savings", filename)
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")
