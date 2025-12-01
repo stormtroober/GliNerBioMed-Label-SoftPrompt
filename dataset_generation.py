@@ -76,8 +76,9 @@ splits = {
     "test": "data/test-00000-of-00001.parquet"
 }
 df_data = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["train"])
-df = df_data.head(15000).copy()
-print(f"✅ Dataset caricato: {len(df)} righe")
+df = df_data.copy()
+#df = df_data.head(15000).copy()
+#print(f"✅ Dataset caricato: {len(df)} righe")
 
 # ===============================================================
 # 3️⃣ MAPPATURA BIO → LABEL BASE
