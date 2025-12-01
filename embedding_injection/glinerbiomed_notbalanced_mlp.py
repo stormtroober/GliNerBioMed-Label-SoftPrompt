@@ -25,7 +25,7 @@ TRAIN_PROJECTION = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
-EPOCHS = 15
+EPOCHS = 10
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.1
@@ -34,9 +34,9 @@ WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
-DATASET_PATH = "dataset_tokenlevel_simple.json" 
-LABEL2DESC_PATH = "label2desc.json"
-LABEL2ID_PATH = "label2id.json"
+DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
+LABEL2DESC_PATH = "../label2desc.json"
+LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
@@ -189,6 +189,9 @@ def get_weighted_loss_params(dataset_path, label2id, device):
 
 # --- LOAD ---
 ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+dataset_size = len(ds)
+print(f"📊 Dimensione dataset: {dataset_size} esempi")
+
 # Calcolo Pesi
 class_weights = get_weighted_loss_params(DATASET_PATH, label2id, DEVICE)
 # Loss Pesata
@@ -261,7 +264,11 @@ for epoch in range(1, EPOCHS + 1):
         best_loss = avg_loss
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
-            'config': {'train_projection': TRAIN_PROJECTION, 'dataset': 'FULL_IMBALANCED'}
+            'config': {
+                'train_projection': TRAIN_PROJECTION, 
+                'dataset': 'FULL_IMBALANCED',
+                'dataset_size': dataset_size
+            }
         }
         if TRAIN_PROJECTION:
             best_model_state['projection'] = proj.state_dict()
@@ -278,7 +285,7 @@ print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 if best_model_state is not None:
     os.makedirs("savings", exist_ok=True)
     proj_tag = "PROJ-TRUE" if TRAIN_PROJECTION else "PROJ-FALSE"
-    filename = f"mlp_prompt_FULL_{proj_tag}_lr{LEARNING_RATE}_ep{EPOCHS}_temp{TEMPERATURE}_best.pt"
+    filename = f"mlp_prompt_FULL_{proj_tag}_size{dataset_size}_lr{LEARNING_RATE}_ep{EPOCHS}_temp{TEMPERATURE}_best.pt"
     save_path = os.path.join("savings", filename)
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")
