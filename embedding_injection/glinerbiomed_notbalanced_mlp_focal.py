@@ -27,7 +27,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
 EPOCHS = 10
 
-# 🔥 LEARNING RATES SEPARATI
+# LEARNING RATES SEPARATI
 LR_MLP = 5e-4       # Solitamente più alto (è un modulo nuovo)
 LR_PROJ = 5e-4      # Solitamente più basso (è pre-addestrato, va solo raffinato)
 
@@ -37,6 +37,7 @@ GRAD_CLIP = 1.0
 WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
+GAMMA_FOCAL_LOSS = 3.0
 
 DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
 LABEL2DESC_PATH = "../label2desc.json"
@@ -216,7 +217,7 @@ dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
 
 class_weights = get_weighted_loss_params(DATASET_PATH, label2id, DEVICE)
-ce_loss = FocalLoss(alpha=class_weights, gamma=2.0, ignore_index=-100)
+ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
 
 train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
