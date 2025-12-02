@@ -16,6 +16,7 @@ import os
 
 # Configurazione dataset
 #10000 is LONG
+#5000 gave the best result
 #1000 gives almost same results 
 
 SIMPLE_DATASET_SIZE = 5000  # Numero di esempi da usare se USE_BALANCED_DATASET = False
