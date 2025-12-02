@@ -23,7 +23,7 @@ BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.1
+TEMPERATURE = 0.05
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 200
 RANDOM_SEED = 42
@@ -284,10 +284,25 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 
+try:
+    import google.colab # type: ignore
+    IN_COLAB = True
+except:
+    IN_COLAB = False
+
+from datetime import datetime, timedelta
+
 if best_model_state is not None:
     os.makedirs("savings", exist_ok=True)
-    proj_tag = "PROJ-TRUE" if TRAIN_PROJECTION else "PROJ-FALSE"
-    filename = f"mlp_prompt_FULL_{proj_tag}_size{dataset_size}_lr{LEARNING_RATE}_ep{EPOCHS}_temp{TEMPERATURE}_best.pt"
+    now = datetime.now()
+
+    # Se sei in Colab, aggiungi un'ora
+    if IN_COLAB:
+        now = now + timedelta(hours=1)
+
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    
+    filename = f"mlp_crossentropy_inversefreq-{timestamp}.pt"
     save_path = os.path.join("savings", filename)
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")

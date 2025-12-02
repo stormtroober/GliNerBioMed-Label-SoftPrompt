@@ -353,20 +353,32 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 
-from datetime import datetime
+try:
+    import google.colab # type: ignore
+    IN_COLAB = True
+except:
+    IN_COLAB = False
+
+
+from datetime import datetime, timedelta
 
 if best_model_state is not None:
-    os.makedirs("savings", exist_ok=True)
-    
-    now = datetime.now()
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    
-    filename = f"mlp_focal_cbclass-{timestamp}.pt"
-    
-    save_path = os.path.join("savings", filename)
-    
-    torch.save(best_model_state, save_path)
-    print(f"💾 Modello salvato in {save_path}")
-    
+        os.makedirs("savings", exist_ok=True)
+        
+        now = datetime.now()
+        
+        # Se sei in Colab, aggiungi un'ora
+        if IN_COLAB:
+            now = now + timedelta(hours=1)
+        
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        
+        filename = f"mlp_focal_cbclass-{timestamp}.pt"
+        
+        save_path = os.path.join("savings", filename)
+        
+        torch.save(best_model_state, save_path)
+        print(f"💾 Modello salvato in {save_path}")
+        
 else:
-    print("⚠️ Nessun modello salvato.")
+        print("⚠️ Nessun modello salvato.")
