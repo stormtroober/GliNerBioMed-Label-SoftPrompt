@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Training MLP Prompt Encoder on FULL Imbalanced Dataset.
-Strategy: Inverse Frequency Class Weights + Unfrozen Projection.
-"""
 
 import json
 import torch

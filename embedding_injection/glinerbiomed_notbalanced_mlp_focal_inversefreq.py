@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Training MLP Prompt Encoder on FULL Imbalanced Dataset.
-Strategy: Inverse Frequency Class Weights + Unfrozen Projection + Differential Learning Rates.
-"""
 
 import json
 import torch
@@ -200,7 +196,7 @@ def get_weighted_loss_params(dataset_path, label2id, device):
     num_classes = len(label2id)
     weights = torch.ones(num_classes).to(device)
     
-    print("\n⚖️  CALCOLO PESI CLASSI (Inverse Frequency):")
+    print("\n CALCOLO PESI CLASSI (Inverse Frequency):")
     for label_name, label_id in label2id.items():
         count = label_counts.get(label_id, 0)
         if count > 0:
@@ -223,7 +219,7 @@ ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-1
 train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
 # ==========================================================
-# 4️⃣ TRAINING LOOP (DIFFERENTIAL LEARNING RATES)
+# 4️⃣ TRAINING LOOP
 # ==========================================================
 
 # 1. Gruppo parametri MLP (LR specifico)

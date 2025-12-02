@@ -1,15 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-Training MLP Prompt Encoder on FULL Imbalanced Dataset.
-Strategy: CLASS BALANCED WEIGHTS + Gamma 4.0 + Unfrozen Projection.
-"""
 
 import json
 import torch
 import torch.nn.functional as F
-import time
 import os
-import numpy as np  # Necessario per il calcolo della potenza nei pesi
+import numpy as np
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
@@ -39,9 +34,8 @@ WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
-# PARAMETRI DI BILANCIAMENTO AGGIORNATI
 GAMMA_FOCAL_LOSS = 4.0
-CB_BETA = 0.9999
+CB_BETA = 0.999
 WEIGHT_STRATEGY = "ClassBalanced"
 
 DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
@@ -188,7 +182,7 @@ def collate_batch(batch, pad_id):
         labels[i, :L] = ex["labels"]
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
-# --- NUOVA FUNZIONE: CLASS BALANCED WEIGHTS ---
+# --- CLASS BALANCED WEIGHTS ---
 def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
     """
     Calcola i pesi usando il metodo 'Class Balanced Loss' (Cui et al., CVPR 2019).
@@ -209,8 +203,7 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
     num_classes = len(label2id)
     weights = torch.ones(num_classes).to(device)
     
-    print(f"\n⚖️  CALCOLO PESI (Class Balanced - Beta {beta}):")
-    print(f"   (Strategia: Ridurre l'impatto dei campioni ridondanti)")
+    print(f"\n  CALCOLO PESI (Class Balanced - Beta {beta}):")
     
     for label_name, label_id in label2id.items():
         count = label_counts.get(label_id, 0)
@@ -238,7 +231,6 @@ ds = TokenJsonDataset(DATASET_PATH, txt_tok)
 dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
 
-# APPLICAZIONE NUOVA STRATEGIA
 class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
 
 ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
@@ -259,7 +251,7 @@ optimizer_grouped_parameters = [
 
 # 2. Gruppo parametri Projection (LR specifico)
 if TRAIN_PROJECTION:
-    print(f"🔗 Aggiunta Projection Layer all'optimizer con LR={LR_PROJ}")
+    print(f" Aggiunta Projection Layer all'optimizer con LR={LR_PROJ}")
     optimizer_grouped_parameters.append({
         "params": proj.parameters(),
         "lr": LR_PROJ,

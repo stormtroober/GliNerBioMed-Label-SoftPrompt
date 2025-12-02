@@ -11,3 +11,5 @@
 /embedding_injection/__pycache__/
 
 /embedding_injection/test_results/
+
+.directory

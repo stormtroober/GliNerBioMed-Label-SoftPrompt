@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Training MLP Prompt Encoder.
-Configurable Projection Training (Frozen vs Unfrozen).
-"""
 
 import json
 import torch
@@ -19,7 +15,7 @@ from tqdm import tqdm
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 # --- SWITCH PRINCIPALE ---
-TRAIN_PROJECTION = True  # ⚠️ True = Proiezione sbloccata / False = Proiezione congelata (Blackbox pura)
+TRAIN_PROJECTION = True
 # -------------------------
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
