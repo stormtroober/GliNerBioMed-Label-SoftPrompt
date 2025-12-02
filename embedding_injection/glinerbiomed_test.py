@@ -162,9 +162,9 @@ def truncate(tokens):
 
 # Calcola checkpoint ogni 10%
 total_records = len(test_data)
-checkpoint_interval = max(1, total_records // 10)
+checkpoint_interval = max(1, total_records // 5)
 
-print(f"\n📊 Mostro metriche ogni {checkpoint_interval} record (~10%)\n")
+print(f"\n📊 Mostro metriche ogni {checkpoint_interval} record (~20%)\n")
 
 with torch.no_grad():
     for idx, rec in enumerate(tqdm(test_data), 1):
