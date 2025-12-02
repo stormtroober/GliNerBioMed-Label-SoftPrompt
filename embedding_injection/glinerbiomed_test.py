@@ -20,7 +20,7 @@ import subprocess
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset/test_dataset_tokenlevel.json" # O il tuo file di test
+TEST_PATH = "../dataset/test_dataset_tokenlevel.json"
 LABEL2DESC_PATH = "../label2desc.json"
 LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
@@ -66,6 +66,16 @@ ckpt_path = select_checkpoint_interactive()
 print(f"Loading: {ckpt_path}")
 checkpoint = torch.load(ckpt_path, map_location=DEVICE)
 
+train_config = checkpoint.get('config', {})
+if train_config:
+    print("✅ Configurazione training trovata.")
+else:
+    print("⚠️ Nessuna configurazione trovata nel checkpoint.")
+
+# Deduzione presenza projection addestrata
+projection_trained = 'projection' in checkpoint
+print(f"{'✅' if projection_trained else '⚠️'} Proiezione custom {'presente' if projection_trained else 'NON presente'}")
+
 # ==========================================================
 # 3️⃣ CARICAMENTO MODELLO IBRIDO
 # ==========================================================
@@ -97,7 +107,7 @@ elif 'soft_embeddings' in checkpoint: # Retrocompatibilità
     # Se è un vecchio formato, potrebbe fallire
     pass
 else:
-    # Se hai salvato direttamente lo state dict del prompt encoder senza chiavi
+    # Se ho salvato direttamente lo state dict del prompt encoder senza chiavi
     try:
         prompt_encoder.load_state_dict(checkpoint)
         print("✅ Prompt Encoder caricato (direct state dict).")
@@ -150,8 +160,14 @@ def truncate(tokens):
     if len(tokens) > 512: return tokens[:512]
     return tokens
 
+# Calcola checkpoint ogni 10%
+total_records = len(test_data)
+checkpoint_interval = max(1, total_records // 10)
+
+print(f"\n📊 Mostro metriche ogni {checkpoint_interval} record (~10%)\n")
+
 with torch.no_grad():
-    for rec in tqdm(test_data):
+    for idx, rec in enumerate(tqdm(test_data), 1):
         tokens = truncate(rec["tokens"])
         labels = rec["labels"][:len(tokens)]
         
@@ -171,6 +187,18 @@ with torch.no_grad():
             if t != -100:
                 y_true.append(t)
                 y_pred.append(p)
+        
+        # Checkpoint ogni 10%
+        if idx % checkpoint_interval == 0 or idx == total_records:
+            if len(y_true) > 0:
+                progress = (idx / total_records) * 100
+                current_macro_f1 = precision_recall_fscore_support(
+                    y_true, y_pred, average="macro", zero_division=0
+                )[2]
+                current_micro_f1 = precision_recall_fscore_support(
+                    y_true, y_pred, average="micro", zero_division=0
+                )[2]
+                print(f"\n [{progress:5.1f}%] Macro F1: {current_macro_f1:.4f} | Micro F1: {current_micro_f1:.4f} | Tokens: {len(y_true):,}")
 
 # ==========================================================
 # 6️⃣ RISULTATI
@@ -210,10 +238,29 @@ filename = f"test_results/eval_mlp_prompt_{timestamp}.md"
 
 with open(filename, "w", encoding="utf-8") as f:
     f.write(f"# Risultati Test - MLP Prompt Encoder\n\n")
-    f.write(f"**Checkpoint:** {os.path.basename(ckpt_path)}\n")
-    f.write(f"**Dataset:** {TEST_PATH}\n")
-    f.write(f"**Data:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    f.write(f"\n**Checkpoint:** {os.path.basename(ckpt_path)}\n")
+    f.write(f"\n**Dataset:** {TEST_PATH}\n")
+    f.write(f"\n**Data:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
     
+    if train_config:
+        f.write(f"## ⚙️ Parametri di Training Salvati\n\n")
+        f.write(f"| Parametro | Valore |\n")
+        f.write(f"|-----------|--------|\n")
+        # Aggiungi informazione sulla projection PRIMA degli altri parametri
+        f.write(f"| **projection_trained** | {'✅ Yes' if projection_trained else '❌ No (usando originale)'} |\n")
+        # Ordiniamo le chiavi per lettura più facile
+        for key in sorted(train_config.keys()):
+            val = train_config[key]
+            # Formattazione per float molto piccoli (es. learning rate)
+            if isinstance(val, float) and val < 0.001:
+                val_str = f"{val:.1e}"
+            else:
+                val_str = str(val)
+            f.write(f"| {key} | {val_str} |\n")
+        f.write("\n")
+    else:
+        f.write("> ⚠️ Configurazione di training non presente in questo checkpoint.\n\n")
+
     # Metriche globali
     f.write(f"## 📈 Metriche Globali\n\n")
     f.write(f"| Metric | Score |\n")

@@ -16,14 +16,12 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
 
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
-# --- SWITCH PRINCIPALE ---
 TRAIN_PROJECTION = True
-# -------------------------
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
 EPOCHS = 10
 
@@ -42,9 +40,9 @@ GAMMA_FOCAL_LOSS = 4.5
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
-DATASET_PATH = "dataset_tokenlevel_simple.json" 
-LABEL2DESC_PATH = "label2desc.json"
-LABEL2ID_PATH = "label2id.json"
+DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
+LABEL2DESC_PATH = "../label2desc.json"
+LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
@@ -307,7 +305,7 @@ for epoch in range(1, EPOCHS + 1):
         loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP) # Clip gradients generically
+        torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP)
         optimizer.step()
         scheduler.step()
         
@@ -322,12 +320,24 @@ for epoch in range(1, EPOCHS + 1):
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
-                'train_projection': TRAIN_PROJECTION, 
+                # Parametri generali di training
+                'batch_size': BATCH_SIZE,
+                'epochs': EPOCHS,
                 'dataset_size': dataset_size,
+                'random_seed': RANDOM_SEED,
+                
+                # Learning Rates e Ottimizzazione
                 'lr_mlp': LR_MLP,
                 'lr_proj': LR_PROJ,
+                'weight_decay': WEIGHT_DECAY,
+                'grad_clip': GRAD_CLIP,
+                'warmup_steps': WARMUP_STEPS,
+                
+                # Parametri Modello / Loss
+                'temperature': TEMPERATURE,
+                'dropout_rate': DROPOUT_RATE,
                 'weight_strategy': WEIGHT_STRATEGY,
-                'gamma': GAMMA_FOCAL_LOSS,
+                'gamma_focal_loss': GAMMA_FOCAL_LOSS,
                 'cb_beta': CB_BETA
             }
         }
@@ -343,20 +353,20 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 
+from datetime import datetime
+
 if best_model_state is not None:
     os.makedirs("savings", exist_ok=True)
-    proj_tag = "PROJ-TRUE" if TRAIN_PROJECTION else "PROJ-FALSE"
-    filename = (
-        f"mlp_FULL_{proj_tag}_"
-        f"DATA{dataset_size}_"
-        f"CB-Beta{CB_BETA}_"
-        f"lrMLP{LR_MLP}_"
-        f"lrPROJ{LR_PROJ}_"
-        f"ep{EPOCHS}_"
-        f"GAMMA{GAMMA_FOCAL_LOSS}.pt"
-    )
+    
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    
+    filename = f"mlp_focal_cbclass-{timestamp}.pt"
+    
     save_path = os.path.join("savings", filename)
+    
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")
+    
 else:
     print("⚠️ Nessun modello salvato.")

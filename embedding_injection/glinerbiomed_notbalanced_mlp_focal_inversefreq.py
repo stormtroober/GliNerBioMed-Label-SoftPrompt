@@ -12,14 +12,11 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
-# --- SWITCH PRINCIPALE ---
 TRAIN_PROJECTION = True
-# -------------------------
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
 EPOCHS = 10
 
@@ -28,12 +25,12 @@ LR_MLP = 5e-4
 LR_PROJ = 5e-4
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.1
+TEMPERATURE = 0.05
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
-GAMMA_FOCAL_LOSS = 3.0
+GAMMA_FOCAL_LOSS = 4.5
 WEIGHT_STRATEGY = "InvFreq"
 
 DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
@@ -298,10 +295,19 @@ for epoch in range(1, EPOCHS + 1):
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
-                'train_projection': TRAIN_PROJECTION, 
                 'dataset_size': dataset_size,
+                'batch_size': BATCH_SIZE,
+                'epochs': EPOCHS,
                 'lr_mlp': LR_MLP,
-                'lr_proj': LR_PROJ
+                'lr_proj': LR_PROJ,
+                'weight_decay': WEIGHT_DECAY,
+                'temperature': TEMPERATURE,
+                'grad_clip': GRAD_CLIP,
+                'warmup_steps': WARMUP_STEPS,
+                'random_seed': RANDOM_SEED,
+                'dropout_rate': DROPOUT_RATE,
+                'gamma_focal_loss': GAMMA_FOCAL_LOSS,
+                'weight_strategy': WEIGHT_STRATEGY
             }
         }
         if TRAIN_PROJECTION:
@@ -316,18 +322,14 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 
+from datetime import datetime
+
 if best_model_state is not None:
     os.makedirs("savings", exist_ok=True)
-    proj_tag = "PROJ-TRUE" if TRAIN_PROJECTION else "PROJ-FALSE"
-    filename = (
-        f"mlp_FULL_{proj_tag}_"
-        f"DATA{dataset_size}_"
-        f"W-{WEIGHT_STRATEGY}_"
-        f"lrMLP{LR_MLP}_"
-        f"lrPROJ{LR_PROJ}_"
-        f"ep{EPOCHS}_"
-        f"GAMMA{GAMMA_FOCAL_LOSS}-focal.pt"
-    )
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    
+    filename = f"mlp_focal_inversefreq-{timestamp}.pt"
     save_path = os.path.join("savings", filename)
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")

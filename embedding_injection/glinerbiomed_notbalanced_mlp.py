@@ -12,14 +12,13 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
-# --- SWITCH PRINCIPALE ---
 TRAIN_PROJECTION = True
-# -------------------------
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
 EPOCHS = 10
 LEARNING_RATE = 5e-4
@@ -261,9 +260,16 @@ for epoch in range(1, EPOCHS + 1):
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
-                'train_projection': TRAIN_PROJECTION, 
-                'dataset': 'FULL_IMBALANCED',
-                'dataset_size': dataset_size
+                'dataset_size': dataset_size,
+                'batch_size': BATCH_SIZE,
+                'epochs': EPOCHS,
+                'learning_rate': LEARNING_RATE,
+                'weight_decay': WEIGHT_DECAY,
+                'temperature': TEMPERATURE,
+                'grad_clip': GRAD_CLIP,
+                'warmup_steps': WARMUP_STEPS,
+                'random_seed': RANDOM_SEED,
+                'dropout_rate': DROPOUT_RATE,
             }
         }
         if TRAIN_PROJECTION:
