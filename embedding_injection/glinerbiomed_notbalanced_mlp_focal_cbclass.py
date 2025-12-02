@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 
+"""
+5000 for now is the best dataset size. But probably is just a matter of parameter tuning.
+"""
+
 import json
 import torch
 import torch.nn.functional as F
@@ -21,26 +25,26 @@ TRAIN_PROJECTION = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
-EPOCHS = 10
+EPOCHS = 5
 
 # LEARNING RATES SEPARATI
 LR_MLP = 5e-4
 LR_PROJ = 5e-4
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.1
+TEMPERATURE = 0.05
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
-GAMMA_FOCAL_LOSS = 4.0
-CB_BETA = 0.999
+GAMMA_FOCAL_LOSS = 4.5
+CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
-DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
+DATASET_PATH = "dataset_tokenlevel_simple.json" 
+LABEL2DESC_PATH = "label2desc.json"
+LABEL2ID_PATH = "label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
