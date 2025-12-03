@@ -35,7 +35,7 @@ LR_PROJ = 1e-3
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.05
 GRAD_CLIP = 1.0
-WARMUP_STEPS = 200
+WARMUP_PERCENTAGE = 0.15
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
@@ -241,6 +241,8 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
 ds = TokenJsonDataset(DATASET_PATH, txt_tok)
 dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
+import math
+WARMUP_STEPS = round(math.ceil(dataset_size / BATCH_SIZE) * EPOCHS * WARMUP_PERCENTAGE)
 
 class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
 
@@ -341,6 +343,7 @@ for epoch in range(1, EPOCHS + 1):
                 'weight_decay': WEIGHT_DECAY,
                 'grad_clip': GRAD_CLIP,
                 'warmup_steps': WARMUP_STEPS,
+                'warmup_percentage': WARMUP_PERCENTAGE,
                 
                 # Parametri Modello / Loss
                 'temperature': TEMPERATURE,
