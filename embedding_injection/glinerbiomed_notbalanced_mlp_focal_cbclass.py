@@ -16,18 +16,21 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
 
+def is_running_on_kaggle():
+    # Kaggle monta i dataset in questa directory
+    return os.path.exists('/kaggle/input')
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 TRAIN_PROJECTION = True
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 EPOCHS = 10
 
 # LEARNING RATES SEPARATI
-LR_MLP = 5e-4
-LR_PROJ = 5e-4
+LR_MLP = 1e-3
+LR_PROJ = 1e-3
 
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.05
@@ -40,10 +43,16 @@ GAMMA_FOCAL_LOSS = 4.5
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
-DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
-MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else ""
+
+DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
+
+if is_running_on_kaggle():
+    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
+else:
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -367,8 +376,8 @@ if best_model_state is not None:
         
         now = datetime.now()
         
-        # Se sei in Colab, aggiungi un'ora
-        if IN_COLAB:
+        # Se sei in Colab o Kaggle, aggiungi un'ora
+        if IN_COLAB or is_running_on_kaggle():
             now = now + timedelta(hours=1)
         
         timestamp = now.strftime("%Y%m%d_%H%M%S")
