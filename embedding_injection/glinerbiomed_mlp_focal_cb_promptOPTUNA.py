@@ -57,7 +57,7 @@ torch.manual_seed(RANDOM_SEED)
 # 1️⃣ CLASSE MLP PROMPT ENCODER & POOLER
 # ==========================================================
 class PromptPooler(nn.Module):
-    def __init__(self, embed_dim, prompt_len, mode="adaptive_avg"):
+    def __init__(self, embed_dim, prompt_len, mode="adaptive_avg", max_seq_len=512):
         super().__init__()
         self.prompt_len = prompt_len
         self.mode = mode
@@ -70,13 +70,35 @@ class PromptPooler(nn.Module):
             self.queries = nn.Parameter(torch.randn(1, prompt_len, embed_dim) * 0.02)
             self.attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
             self.norm = nn.LayerNorm(embed_dim)
+        elif mode == "conv1d":
+            # Conv1D downsampling: apprende come comprimere la sequenza
+            # Usiamo kernel_size e stride calcolati dinamicamente nel forward,
+            # ma qui definiamo i layer convoluzionali
+            self.conv_layers = nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            )
+            self.adaptive_pool = nn.AdaptiveAvgPool1d(prompt_len)
+            self.norm = nn.LayerNorm(embed_dim)
+        elif mode == "conv1d_strided":
+            # Versione più aggressiva con stride learnable
+            # Usa una singola convoluzione con kernel grande per catturare contesto
+            self.conv = nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2)
+            self.adaptive_pool = nn.AdaptiveAvgPool1d(prompt_len)
+            self.norm = nn.LayerNorm(embed_dim)
+            self.gate = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.Sigmoid()
+            )
         else:
             raise ValueError(f"Unknown pooling mode: {mode}")
     
     def forward(self, x, attention_mask=None):
         B, seq_len, dim = x.shape
+        
         if self.mode in ["adaptive_avg", "adaptive_max"]:
-            x_t = x.transpose(1, 2)
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(1).float()
                 if self.mode == "adaptive_avg":
@@ -84,7 +106,8 @@ class PromptPooler(nn.Module):
                 else:
                     x_t = x_t.masked_fill(mask_expanded == 0, float('-inf'))
             pooled = self.pooler(x_t)
-            return pooled.transpose(1, 2)
+            return pooled.transpose(1, 2)  # (B, prompt_len, dim)
+        
         elif self.mode == "attention":
             queries = self.queries.expand(B, -1, -1)
             key_padding_mask = None
@@ -92,10 +115,40 @@ class PromptPooler(nn.Module):
                 key_padding_mask = (attention_mask == 0)
             attn_out, _ = self.attn(queries, x, x, key_padding_mask=key_padding_mask)
             return self.norm(attn_out + queries)
+        
+        elif self.mode == "conv1d":
+            # Applica mask prima della convoluzione
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = x * mask_expanded
+            
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
+            conv_out = self.conv_layers(x_t)  # (B, dim, seq_len)
+            pooled = self.adaptive_pool(conv_out)  # (B, dim, prompt_len)
+            pooled = pooled.transpose(1, 2)  # (B, prompt_len, dim)
+            return self.norm(pooled)
+        
+        elif self.mode == "conv1d_strided":
+            # Versione con gating mechanism
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = x * mask_expanded
+            
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
+            conv_out = self.conv(x_t)  # (B, dim, seq_len)
+            pooled = self.adaptive_pool(conv_out)  # (B, dim, prompt_len)
+            pooled = pooled.transpose(1, 2)  # (B, prompt_len, dim)
+            
+            # Gating: permette al modello di decidere quanto "fidarsi" della convoluzione
+            gate = self.gate(pooled)
+            pooled = pooled * gate
+            
+            return self.norm(pooled)
 
 class MLPPromptEncoder(nn.Module):
     def __init__(self, original_embeddings, vocab_size, embed_dim, 
-                 hidden_dim=None, dropout=0.1, prompt_len=None, pooling_mode="adaptive_avg"):
+                 hidden_dim=None, dropout=0.1, prompt_len=None, pooling_mode="adaptive_avg",
+                 max_seq_len=512):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         with torch.no_grad():
@@ -114,7 +167,7 @@ class MLPPromptEncoder(nn.Module):
         
         self.pooler = None
         if prompt_len is not None:
-            self.pooler = PromptPooler(embed_dim, prompt_len, mode=pooling_mode)
+            self.pooler = PromptPooler(embed_dim, prompt_len, mode=pooling_mode, max_seq_len=max_seq_len)
 
     def forward(self, input_ids, attention_mask=None):
         x = self.embedding(input_ids)
@@ -249,8 +302,14 @@ def objective(trial):
     p_len_candidate = trial.suggest_categorical("prompt_len", [8, 16, 32, 64, 128])
     current_prompt_len = None if p_len_candidate == 0 else p_len_candidate
     
-    # Ottimizza anche il pooling mode
-    current_pooling_mode = trial.suggest_categorical("pooling_mode", ["adaptive_avg", "attention"])
+    # Ottimizza anche il pooling mode - ora include conv1d e conv1d_strided
+    current_pooling_mode = trial.suggest_categorical("pooling_mode", [
+        "adaptive_avg", 
+        # "adaptive_max",
+        "attention", 
+        "conv1d",
+        "conv1d_strided"
+    ])
     
     print(f"\n🧪 TRIAL {trial.number} | Prompt Len: {current_prompt_len if current_prompt_len else 'ORIGINAL'} | Pooling: {current_pooling_mode}")
 
@@ -270,7 +329,8 @@ def objective(trial):
         embed_dim, 
         dropout=DROPOUT_RATE,
         prompt_len=current_prompt_len, 
-        pooling_mode=current_pooling_mode
+        pooling_mode=current_pooling_mode,
+        max_seq_len=desc_input_ids.shape[1]  # Passa la lunghezza massima delle descrizioni
     ).to(DEVICE)
     model_encoder.train()
 
