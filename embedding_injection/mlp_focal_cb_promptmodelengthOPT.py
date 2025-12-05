@@ -434,5 +434,247 @@ if __name__ == "__main__":
     print(f"   - Pooling Mode = {best_pooling}")
     print("Ora puoi modificare le variabili PROMPT_LEN e POOLING_MODE in alto nel file con questi valori e rieseguire un training lungo per salvare il modello.")
 
-#     = 128
-#    - Pooling Mode = adaptive_avg
+# 🔍 Avvio ottimizzazione Optuna per PROMPT LENGTH e POOLING MODE...
+
+# 🧪 TRIAL 0 | Prompt Len: 8 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1306
+#    Epoch 2/8 -> Loss: 0.0541
+#    Epoch 3/8 -> Loss: 0.0466
+#    Epoch 4/8 -> Loss: 0.0445
+#    Epoch 5/8 -> Loss: 0.0431
+#    Epoch 6/8 -> Loss: 0.0415
+#    Epoch 7/8 -> Loss: 0.0410
+# [I 2025-12-03 21:16:09,220] Trial 0 finished with value: 0.03988437229602397 and parameters: {'prompt_len': 8, 'pooling_mode': 'attention'}. Best is trial 0 with value: 0.03988437229602397.
+#    Epoch 8/8 -> Loss: 0.0399
+
+# 🧪 TRIAL 1 | Prompt Len: 128 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1163
+#    Epoch 2/8 -> Loss: 0.0524
+#    Epoch 3/8 -> Loss: 0.0457
+#    Epoch 4/8 -> Loss: 0.0439
+#    Epoch 5/8 -> Loss: 0.0426
+#    Epoch 6/8 -> Loss: 0.0414
+#    Epoch 7/8 -> Loss: 0.0404
+# [I 2025-12-03 21:18:52,666] Trial 1 finished with value: 0.03951852502230602 and parameters: {'prompt_len': 128, 'pooling_mode': 'attention'}. Best is trial 1 with value: 0.03951852502230602.
+#    Epoch 8/8 -> Loss: 0.0395
+
+# 🧪 TRIAL 2 | Prompt Len: 32 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1149
+#    Epoch 2/8 -> Loss: 0.0499
+#    Epoch 3/8 -> Loss: 0.0446
+#    Epoch 4/8 -> Loss: 0.0436
+#    Epoch 5/8 -> Loss: 0.0423
+#    Epoch 6/8 -> Loss: 0.0414
+#    Epoch 7/8 -> Loss: 0.0406
+# [I 2025-12-03 21:21:32,252] Trial 2 pruned. 
+# ✂️ Trial Pruned at Epoch 8 (Loss: 0.0397)
+
+# 🧪 TRIAL 3 | Prompt Len: 8 | Pooling: conv1d_strided
+#    Epoch 1/8 -> Loss: 0.1171
+# [I 2025-12-03 21:22:11,789] Trial 3 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0561)
+
+# 🧪 TRIAL 4 | Prompt Len: 64 | Pooling: adaptive_avg
+#    Epoch 1/8 -> Loss: 0.1685
+#    Epoch 2/8 -> Loss: 0.0521
+#    Epoch 3/8 -> Loss: 0.0458
+#    Epoch 4/8 -> Loss: 0.0439
+#    Epoch 5/8 -> Loss: 0.0422
+# [I 2025-12-03 21:24:10,418] Trial 4 pruned. 
+# ✂️ Trial Pruned at Epoch 6 (Loss: 0.0418)
+
+# 🧪 TRIAL 5 | Prompt Len: 8 | Pooling: conv1d_strided
+#    Epoch 1/8 -> Loss: 0.1299
+# [I 2025-12-03 21:24:49,888] Trial 5 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0543)
+
+# 🧪 TRIAL 6 | Prompt Len: 32 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1092
+#    Epoch 2/8 -> Loss: 0.0507
+#    Epoch 3/8 -> Loss: 0.0456
+#    Epoch 4/8 -> Loss: 0.0424
+#    Epoch 5/8 -> Loss: 0.0414
+#    Epoch 6/8 -> Loss: 0.0407
+#    Epoch 7/8 -> Loss: 0.0403
+# [I 2025-12-03 21:27:28,939] Trial 6 finished with value: 0.039370189904223515 and parameters: {'prompt_len': 32, 'pooling_mode': 'conv1d'}. Best is trial 6 with value: 0.039370189904223515.
+#    Epoch 8/8 -> Loss: 0.0394
+
+# 🧪 TRIAL 7 | Prompt Len: 64 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1202
+# [I 2025-12-03 21:28:08,548] Trial 7 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0558)
+
+# 🧪 TRIAL 8 | Prompt Len: 64 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1025
+#    Epoch 2/8 -> Loss: 0.0520
+#    Epoch 3/8 -> Loss: 0.0449
+#    Epoch 4/8 -> Loss: 0.0437
+#    Epoch 5/8 -> Loss: 0.0420
+# [I 2025-12-03 21:30:07,438] Trial 8 pruned. 
+# ✂️ Trial Pruned at Epoch 6 (Loss: 0.0421)
+
+# 🧪 TRIAL 9 | Prompt Len: 32 | Pooling: conv1d_strided
+#    Epoch 1/8 -> Loss: 0.1097
+#    Epoch 2/8 -> Loss: 0.0510
+#    Epoch 3/8 -> Loss: 0.0445
+#    Epoch 4/8 -> Loss: 0.0429
+#    Epoch 5/8 -> Loss: 0.0418
+# [I 2025-12-03 21:32:07,350] Trial 9 pruned. 
+# ✂️ Trial Pruned at Epoch 6 (Loss: 0.0421)
+
+# 🧪 TRIAL 10 | Prompt Len: 16 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1075
+#    Epoch 2/8 -> Loss: 0.0510
+#    Epoch 3/8 -> Loss: 0.0446
+#    Epoch 4/8 -> Loss: 0.0436
+#    Epoch 5/8 -> Loss: 0.0426
+#    Epoch 6/8 -> Loss: 0.0407
+# [I 2025-12-03 21:34:26,014] Trial 10 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0405)
+
+# 🧪 TRIAL 11 | Prompt Len: 128 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1359
+# [I 2025-12-03 21:35:07,649] Trial 11 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0546)
+
+# 🧪 TRIAL 12 | Prompt Len: 128 | Pooling: adaptive_avg
+#    Epoch 1/8 -> Loss: 0.1363
+# [I 2025-12-03 21:35:48,457] Trial 12 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0532)
+
+# 🧪 TRIAL 13 | Prompt Len: 128 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1165
+# [I 2025-12-03 21:36:29,946] Trial 13 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0524)
+
+# 🧪 TRIAL 14 | Prompt Len: 32 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1126
+#    Epoch 2/8 -> Loss: 0.0506
+#    Epoch 3/8 -> Loss: 0.0453
+#    Epoch 4/8 -> Loss: 0.0432
+#    Epoch 5/8 -> Loss: 0.0422
+# [I 2025-12-03 21:38:29,731] Trial 14 pruned. 
+# ✂️ Trial Pruned at Epoch 6 (Loss: 0.0414)
+
+# 🧪 TRIAL 15 | Prompt Len: 16 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1174
+# [I 2025-12-03 21:39:09,006] Trial 15 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0527)
+
+# 🧪 TRIAL 16 | Prompt Len: 32 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1227
+#    Epoch 2/8 -> Loss: 0.0510
+#    Epoch 3/8 -> Loss: 0.0453
+#    Epoch 4/8 -> Loss: 0.0428
+#    Epoch 5/8 -> Loss: 0.0422
+#    Epoch 6/8 -> Loss: 0.0411
+# [I 2025-12-03 21:41:27,699] Trial 16 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0404)
+
+# 🧪 TRIAL 17 | Prompt Len: 128 | Pooling: adaptive_avg
+#    Epoch 1/8 -> Loss: 0.1316
+#    Epoch 2/8 -> Loss: 0.0505
+#    Epoch 3/8 -> Loss: 0.0456
+#    Epoch 4/8 -> Loss: 0.0431
+#    Epoch 5/8 -> Loss: 0.0423
+#    Epoch 6/8 -> Loss: 0.0412
+# [I 2025-12-03 21:43:50,980] Trial 17 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0407)
+
+# 🧪 TRIAL 18 | Prompt Len: 32 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1136
+#    Epoch 2/8 -> Loss: 0.0503
+# [I 2025-12-03 21:44:50,144] Trial 18 pruned. 
+# ✂️ Trial Pruned at Epoch 3 (Loss: 0.0464)
+
+# 🧪 TRIAL 19 | Prompt Len: 128 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1147
+# [I 2025-12-03 21:45:31,678] Trial 19 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0539)
+
+# 🧪 TRIAL 20 | Prompt Len: 16 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1232
+#    Epoch 2/8 -> Loss: 0.0509
+#    Epoch 3/8 -> Loss: 0.0453
+#    Epoch 4/8 -> Loss: 0.0430
+# [I 2025-12-03 21:47:10,719] Trial 20 pruned. 
+# ✂️ Trial Pruned at Epoch 5 (Loss: 0.0427)
+
+# 🧪 TRIAL 21 | Prompt Len: 8 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1215
+#    Epoch 2/8 -> Loss: 0.0519
+#    Epoch 3/8 -> Loss: 0.0455
+#    Epoch 4/8 -> Loss: 0.0437
+#    Epoch 5/8 -> Loss: 0.0422
+# [I 2025-12-03 21:49:09,248] Trial 21 pruned. 
+# ✂️ Trial Pruned at Epoch 6 (Loss: 0.0414)
+
+# 🧪 TRIAL 22 | Prompt Len: 8 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1341
+# [I 2025-12-03 21:49:48,631] Trial 22 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0563)
+
+# 🧪 TRIAL 23 | Prompt Len: 8 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1125
+#    Epoch 2/8 -> Loss: 0.0515
+#    Epoch 3/8 -> Loss: 0.0454
+#    Epoch 4/8 -> Loss: 0.0436
+#    Epoch 5/8 -> Loss: 0.0423
+#    Epoch 6/8 -> Loss: 0.0410
+# [I 2025-12-03 21:52:08,094] Trial 23 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0405)
+
+# 🧪 TRIAL 24 | Prompt Len: 8 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.3148
+# [I 2025-12-03 21:52:46,643] Trial 24 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.1749)
+
+# 🧪 TRIAL 25 | Prompt Len: 128 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1119
+# [I 2025-12-03 21:53:28,245] Trial 25 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0532)
+
+# 🧪 TRIAL 26 | Prompt Len: 32 | Pooling: conv1d_strided
+#    Epoch 1/8 -> Loss: 0.1028
+#    Epoch 2/8 -> Loss: 0.0486
+#    Epoch 3/8 -> Loss: 0.0447
+#    Epoch 4/8 -> Loss: 0.0423
+#    Epoch 5/8 -> Loss: 0.0416
+#    Epoch 6/8 -> Loss: 0.0411
+# [I 2025-12-03 21:55:47,628] Trial 26 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0404)
+
+# 🧪 TRIAL 27 | Prompt Len: 8 | Pooling: adaptive_avg
+#    Epoch 1/8 -> Loss: 0.1293
+# [I 2025-12-03 21:56:27,087] Trial 27 pruned. 
+# ✂️ Trial Pruned at Epoch 2 (Loss: 0.0530)
+
+# 🧪 TRIAL 28 | Prompt Len: 32 | Pooling: attention
+#    Epoch 1/8 -> Loss: 0.1041
+#    Epoch 2/8 -> Loss: 0.0520
+#    Epoch 3/8 -> Loss: 0.0447
+#    Epoch 4/8 -> Loss: 0.0435
+#    Epoch 5/8 -> Loss: 0.0419
+#    Epoch 6/8 -> Loss: 0.0410
+# [I 2025-12-03 21:58:45,471] Trial 28 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0408)
+
+# 🧪 TRIAL 29 | Prompt Len: 128 | Pooling: conv1d
+#    Epoch 1/8 -> Loss: 0.1054
+#    Epoch 2/8 -> Loss: 0.0516
+#    Epoch 3/8 -> Loss: 0.0446
+#    Epoch 4/8 -> Loss: 0.0428
+#    Epoch 5/8 -> Loss: 0.0421
+#    Epoch 6/8 -> Loss: 0.0410
+# [I 2025-12-03 22:01:09,918] Trial 29 pruned. 
+# ✂️ Trial Pruned at Epoch 7 (Loss: 0.0404)
+
+# ========================================
+# 🏆 RISULTATI OPTUNA
+# ========================================
+# Best Loss: 0.0394
+# Best Params: {'prompt_len': 32, 'pooling_mode': 'conv1d'}
+
+# ✅ I vincitori sono:
+#    - Prompt Length = 32
+#    - Pooling Mode = conv1d

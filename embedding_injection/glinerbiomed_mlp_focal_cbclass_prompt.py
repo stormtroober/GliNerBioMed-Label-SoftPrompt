@@ -33,7 +33,7 @@ LR_MLP = 1e-3
 LR_PROJ = 1e-3
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.05
+TEMPERATURE = 0.011641058260782156
 GRAD_CLIP = 1.0
 WARMUP_PERCENTAGE = 0.15
 RANDOM_SEED = 42
@@ -42,7 +42,7 @@ DROPOUT_RATE = 0.1
 PROMPT_LEN = 32
 POOLING_MODE = "conv1d"  # "adaptive_avg", "adaptive_max", "attention", "conv1d", "conv1d_strided"
 
-GAMMA_FOCAL_LOSS = 4.5
+GAMMA_FOCAL_LOSS = 5.0
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
