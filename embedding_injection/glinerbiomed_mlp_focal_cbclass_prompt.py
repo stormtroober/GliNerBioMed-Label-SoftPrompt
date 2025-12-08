@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
 
-"""
-5000 for now is the best dataset size. But probably is just a matter of parameter tuning.
-"""
-
 import json
 import torch
 import torch.nn.functional as F
@@ -35,7 +31,7 @@ LR_PROJ = 0.002
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.011641058260782156
 GRAD_CLIP = 1.0
-WARMUP_PERCENTAGE = 0.1
+WARMUP_RATIO = 0.10603059187238079
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
@@ -46,7 +42,7 @@ GAMMA_FOCAL_LOSS = 5.0
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else ""
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
 
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
@@ -372,7 +368,8 @@ ds = TokenJsonDataset(DATASET_PATH, txt_tok)
 dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
 import math
-WARMUP_STEPS = round(math.ceil(dataset_size / BATCH_SIZE) * EPOCHS * WARMUP_PERCENTAGE)
+# WARMUP_STEPS calculation moved to scheduler initialization per request
+# WARMUP_STEPS = round(math.ceil(dataset_size / BATCH_SIZE) * EPOCHS * WARMUP_PERCENTAGE)
 
 class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
 
@@ -408,7 +405,10 @@ optimizer = optim.AdamW(
     weight_decay=WEIGHT_DECAY
 )
 
-scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=len(train_loader)*EPOCHS)
+# Calcolo Steps corretti
+num_training_steps = len(train_loader) * EPOCHS
+num_warmup_steps = int(num_training_steps * WARMUP_RATIO)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
 txt_enc.eval() 
 lbl_enc.eval()
@@ -482,8 +482,8 @@ for epoch in range(1, EPOCHS + 1):
                 'lr_proj': LR_PROJ,
                 'weight_decay': WEIGHT_DECAY,
                 'grad_clip': GRAD_CLIP,
-                'warmup_steps': WARMUP_STEPS,
-                'warmup_percentage': WARMUP_PERCENTAGE,
+                'warmup_steps': num_warmup_steps,
+                'warmup_ratio': WARMUP_RATIO,
                 
                 # Parametri Modello / Loss
                 'temperature': TEMPERATURE,
