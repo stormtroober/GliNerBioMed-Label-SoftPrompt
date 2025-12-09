@@ -22,7 +22,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================================
 TRAIN_PROJECTION = True
 BATCH_SIZE = 128
-EPOCHS = 20
+EPOCHS = 30
 
 # LEARNING RATES SEPARATI
 LR_MLP = 0.002

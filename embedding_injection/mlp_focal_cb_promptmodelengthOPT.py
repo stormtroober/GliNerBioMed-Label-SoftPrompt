@@ -305,7 +305,6 @@ def objective(trial):
     # Ottimizza anche il pooling mode - ora include conv1d e conv1d_strided
     current_pooling_mode = trial.suggest_categorical("pooling_mode", [
         "adaptive_avg", 
-        # "adaptive_max",
         "attention", 
         "conv1d",
         "conv1d_strided"
