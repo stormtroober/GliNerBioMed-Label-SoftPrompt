@@ -58,6 +58,24 @@ with open(LABEL2ID_PATH) as f: label2id = json.load(f)
 id2label = {v: k for k, v in label2id.items()}
 label_names = [id2label[i] for i in range(len(label2id))]
 
+# IDENTIFICAZIONE CLASSE 'O' E FILTRO
+ignore_index = -1
+for idx, name in enumerate(label_names):
+    if name == 'O':
+        ignore_index = idx
+        break
+
+all_label_ids = list(range(len(label_names)))
+
+if ignore_index != -1:
+    relevant_label_ids = [i for i in all_label_ids if i != ignore_index]
+    relevant_label_names = [label_names[i] for i in relevant_label_ids]
+    print(f"ℹ️  Esclusione classe 'O' (ID: {ignore_index}) dalle metriche aggregate.")
+else:
+    relevant_label_ids = all_label_ids
+    relevant_label_names = label_names
+    print("⚠️  Classe 'O' non trovata. Calcolo standard su tutte le classi.")
+
 # Tokenizza i NOMI delle label (non descrizioni)
 # Standard GLiNER usa [CLS] o Mean Pooling sui nomi. Qui replichiamo la logica base.
 batch_lbl = lbl_tok(label_names, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
@@ -119,27 +137,49 @@ with torch.no_grad():
             if len(y_true) > 0:
                 progress = (idx / total_records) * 100
                 current_macro_f1 = precision_recall_fscore_support(
-                    y_true, y_pred, average="macro", zero_division=0
+                    y_true, y_pred, labels=relevant_label_ids, average="macro", zero_division=0
                 )[2]
                 current_micro_f1 = precision_recall_fscore_support(
-                    y_true, y_pred, average="micro", zero_division=0
+                    y_true, y_pred, labels=relevant_label_ids, average="micro", zero_division=0
                 )[2]
-                print(f" [{progress:5.1f}%] Macro F1: {current_macro_f1:.4f} | Micro F1: {current_micro_f1:.4f} | Tokens: {len(y_true):,}")
+                print(f" [{progress:5.1f}%] Macro F1 (No O): {current_macro_f1:.4f} | Micro F1 (No O): {current_micro_f1:.4f} | Tokens: {len(y_true):,}")
 
 # ==========================================================
 # 4️⃣ RISULTATI & REPORT
 # ==========================================================
-all_label_ids = list(range(len(label_names)))
+# --- Metriche Globali (ESCLUDENDO O) ---
+# Macro Average
+macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+    y_true, y_pred, labels=relevant_label_ids, average="macro", zero_division=0
+)
 
-macro_f1 = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)[2]
-micro_f1 = precision_recall_fscore_support(y_true, y_pred, average="micro", zero_division=0)[2]
+# Micro Average
+micro_p, micro_r, micro_f1, _ = precision_recall_fscore_support(
+    y_true, y_pred, labels=relevant_label_ids, average="micro", zero_division=0
+)
+
+# Weighted Average (opzionale, ma utile)
+weighted_p, weighted_r, weighted_f1, _ = precision_recall_fscore_support(
+    y_true, y_pred, labels=relevant_label_ids, average="weighted", zero_division=0
+)
+
+# Metriche per classe (TUTTE LE CLASSI, INCLUSA O, per dettaglio)
+per_class_metrics = precision_recall_fscore_support(
+    y_true, y_pred, labels=all_label_ids, zero_division=0
+)
+
+# Report di classificazione (ESCLUDENDO O)
 class_report = classification_report(
-    y_true, y_pred, target_names=label_names, labels=all_label_ids, zero_division=0, digits=4
+    y_true, y_pred, target_names=relevant_label_names, labels=relevant_label_ids, zero_division=0, digits=4
 )
 pred_counts = Counter(y_pred)
 true_counts = Counter(y_true)
+from sklearn.metrics import confusion_matrix
+conf_matrix = confusion_matrix(y_true, y_pred, labels=all_label_ids)
 
-print(f"\n🏆 BASELINE RESULTS - MACRO F1: {macro_f1:.4f} | MICRO F1: {micro_f1:.4f}")
+print(f"\n🏆 BASELINE RESULTS (No O Class):")
+print(f"   • MACRO:    Precision={macro_p:.4f} | Recall={macro_r:.4f} | F1={macro_f1:.4f}")
+print(f"   • MICRO:    Precision={micro_p:.4f} | Recall={micro_r:.4f} | F1={micro_f1:.4f}")
 print(class_report)
 
 # Export Report
@@ -149,19 +189,40 @@ filename = f"{OUTPUT_DIR}/eval_baseline_{timestamp}.md"
 
 with open(filename, "w", encoding="utf-8") as f:
     f.write(f"# Risultati Test BASELINE (No Fine-tuning)\n\n")
+    f.write(f"> ℹ️ **NOTA**: Le metriche Globali e il Report di Classificazione ESCLUDONO la classe 'O' (Non-classe).\n\n")
     f.write(f"**Modello:** `{MODEL_NAME}`\n\n")
     f.write(f"**Dataset:** `{TEST_PATH}`\n\n")
     f.write(f"**Label Encoding:** Nomi Label (Standard Mean Pooling)\n\n")
     f.write(f"**Data:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
     
-    f.write(f"## 📈 Metriche Globali\n\n")
-    f.write(f"| Metric | Score |\n")
-    f.write(f"|:-------|------:|\n")
-    f.write(f"| **Macro F1** | **{macro_f1:.4f}** |\n")
-    f.write(f"| **Micro F1** | **{micro_f1:.4f}** |\n")
-    f.write(f"| Token Totali | {len(y_true):,} |\n\n")
+    f.write(f"## 📈 Metriche Globali (ESCLUSO 'O')\n\n")
+    f.write(f"### Riassunto Performance\n")
+    f.write(f"| Average Type | Precision | Recall | F1-Score |\n")
+    f.write(f"|:-------------|----------:|-------:|---------:|\n")
+    f.write(f"| **Macro**    | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |\n")
+    f.write(f"| **Micro**    | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |\n")
+    f.write(f"| Weighted     | {weighted_p:.4f} | {weighted_r:.4f} | {weighted_f1:.4f} |\n\n")
+    f.write(f"**Token Totali Valutati**: {len(y_true):,}\n\n")
     
-    f.write(f"## 📋 Classification Report\n\n")
+    f.write(f"## 📊 Metriche per Classe (Tutte incluse)\n\n")
+    f.write(f"| Classe | Precision | Recall | F1-Score | Support | Predicted |\n")
+    f.write(f"|:-------|----------:|-------:|---------:|--------:|----------:|\n")
+    
+    precisions, recalls, f1s, supports = per_class_metrics
+    for i, label_name in enumerate(label_names):
+        pred_count = pred_counts.get(i, 0)
+        true_count = supports[i]
+        
+        # Evidenzia se è la classe 'O'
+        prefix = "**" if i == ignore_index else ""
+        suffix = "** (Esclusa dal Macro/Micro)" if i == ignore_index else ""
+        
+        f.write(f"| {prefix}{label_name}{suffix} | {precisions[i]:.4f} | {recalls[i]:.4f} | "
+                f"{f1s[i]:.4f} | {true_count} | {pred_count} |\n")
+    
+    f.write(f"| **TOTAL** | - | - | - | {sum(supports)} | {len(y_pred)} |\n\n")
+
+    f.write(f"## 📋 Classification Report (No 'O')\n\n")
     f.write(f"```\n{class_report}\n```\n\n")
     
     # Distribuzione veloce
