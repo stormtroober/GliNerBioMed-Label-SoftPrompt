@@ -6,29 +6,30 @@ import os
 import numpy as np
 import optuna
 from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from collections import Counter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score
 from gliner import GLiNER
-
 # ==========================================
 # 🔧 PARAMETRI FISSI (Dalle ricerche precedenti)
 # ==========================================
-PROMPT_LEN = 32         # <--- INSERISCI VINCITORE
-POOLING_MODE = "conv1d" # <--- INSERISCI VINCITORE
-FIXED_LR_MLP = 1e-3     # <--- INSERISCI RISULTATO FILE 1
-FIXED_LR_PROJ = 1e-3    # <--- INSERISCI RISULTATO FILE 1
+PROMPT_LEN = 32
+POOLING_MODE = "conv1d"
+FIXED_LR_MLP = 0.002
+FIXED_LR_PROJ = 0.002
 
 BATCH_SIZE = 64
 EPOCHS = 6
 WEIGHT_DECAY = 0.01
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VALIDATION_RATIO = 0.1
 
 def is_running_on_kaggle(): return os.path.exists('/kaggle/input')
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else ""
-DATASET_PATH = input_dir + "../dataset/dataset_tokenlevel_simple.json"
-LABEL2DESC_PATH = input_dir + "../label2desc.json"
-LABEL2ID_PATH = input_dir + "../label2id.json"
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
 MODEL_NAME = '/kaggle/input/glinerbismall2/' if is_running_on_kaggle() else "Ihor/gliner-biomed-bi-small-v1.0"
 
 # ==========================================================
@@ -158,6 +159,7 @@ class FocalLoss(nn.Module):
         self.alpha = alpha 
 
     def forward(self, input, target):
+        
         ce_loss = F.cross_entropy(input, target, reduction='none', ignore_index=self.ignore_index)
         pt = torch.exp(-ce_loss) 
         mask = target != self.ignore_index
@@ -229,12 +231,27 @@ desc_inputs = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=
 desc_input_ids = desc_inputs["input_ids"].to(DEVICE)
 desc_attn_mask = desc_inputs["attention_mask"].to(DEVICE)
 
-# Load dataset
-ds = TokenJsonDataset(DATASET_PATH, txt_tok)
-train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, 
-                          collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+# Load FULL dataset
+full_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+dataset_size = len(full_ds)
 
-# Pre-calcoliamo i count una volta sola per velocità
+# SPLIT TRAIN/VALIDATION
+val_size = int(dataset_size * VALIDATION_RATIO)
+train_size = dataset_size - val_size
+
+# Si usa un generator con seed fisso per riproducibilità dello split
+generator = torch.Generator().manual_seed(42)
+train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=generator)
+
+# LOADERS
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
+                          collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                        collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+
+print(f"🔪 Dataset Split: {len(train_ds)} Train | {len(val_ds)} Val")
+
+# Pre-calcoliamo i count una volta sola per velocità (su tutto il dataset o solo train? Meglio train per rigore, ma tutto è ok per i pesi classi)
 with open(DATASET_PATH) as f: raw_data = json.load(f)
 global_counts = Counter([l for r in raw_data for l in r["labels"] if l != -100])
 
@@ -250,18 +267,18 @@ def get_weights_dynamic(label_counts, num_classes, beta, device):
     return weights / weights.sum() * num_classes
 
 # ==========================================
-# 🎯 OPTUNA OBJECTIVE: LOSS & TEMP
+# 🎯 OPTUNA OBJECTIVE: F1 SCORE (MAXIMIZE)
 # ==========================================
 def objective(trial):
     # 1. SUGGEST PARAMETERS
     
     # Class Balanced Beta: valori tipici [0.9, 0.99, 0.999, 0.9999]
     # Usiamo una selezione categorica perché beta è molto sensibile
-    beta_str = trial.suggest_categorical("cb_beta", ["0.9", "0.99", "0.999", "0.9999"])
+    beta_str = trial.suggest_categorical("cb_beta", ["0.999", "0.9999", "0.99999"])
     beta = float(beta_str)
     
     # Focal Loss Gamma: [0.0 = CrossEntropy standard, 5.0 = Focus estremo su hard examples]
-    gamma = trial.suggest_float("focal_gamma", 3.5, 5.0, step=0.5)
+    gamma = trial.suggest_float("focal_gamma", 4.5, 6.0, step=0.5)
     
     # Temperature: [0.01 molto "sharp", 0.1 più "smooth"]
     temperature = trial.suggest_float("temperature", 0.01, 0.15)
@@ -274,9 +291,10 @@ def objective(trial):
     loss_fn = FocalLoss(alpha=current_weights, gamma=gamma)
 
     # 3. SETUP MODEL & OPTIMIZER (Usa gli LR fissi)
+    # Reset proj weights
     proj.load_state_dict(initial_proj_state)
-    proj.train()
     
+    # Re-init Model Wrapper
     model_encoder = MLPPromptEncoder(
         lbl_enc.embeddings.word_embeddings, 
         vocab_size=lbl_enc.embeddings.word_embeddings.num_embeddings,
@@ -285,20 +303,27 @@ def objective(trial):
         pooling_mode=POOLING_MODE,
         max_seq_len=desc_input_ids.shape[1]
     ).to(DEVICE)
-    model_encoder.train()
     
     optimizer = optim.AdamW([
         {"params": model_encoder.parameters(), "lr": FIXED_LR_MLP},
         {"params": proj.parameters(), "lr": FIXED_LR_PROJ}
     ], weight_decay=0.01)
     
+    # Scheduler solo per le epoch previste
+    total_steps = len(train_loader) * EPOCHS
     scheduler = get_linear_schedule_with_warmup(optimizer, 
-                                                num_warmup_steps=int(len(train_loader)*EPOCHS*0.1), 
-                                                num_training_steps=len(train_loader)*EPOCHS)
+                                                num_warmup_steps=int(total_steps*0.1), 
+                                                num_training_steps=total_steps)
 
     # 4. TRAINING LOOP
+    best_val_f1 = 0.0
+    
     for epoch in range(EPOCHS):
-        total_loss = 0
+        
+        # --- TRAIN ---
+        model_encoder.train()
+        proj.train()
+        
         for batch in train_loader:
             optimizer.zero_grad()
             batch = {k: v.to(DEVICE) for k,v in batch.items()}
@@ -324,107 +349,56 @@ def objective(trial):
             torch.nn.utils.clip_grad_norm_(model_encoder.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(train_loader)
-        trial.report(avg_loss, epoch)
-        if trial.should_prune(): raise optuna.TrialPruned()
+            
+        # --- VALIDATION (End of Epoch) ---
+        model_encoder.eval()
+        proj.eval()
         
-    return avg_loss
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(DEVICE) for k,v in batch.items()}
+                
+                H_text = F.normalize(txt_enc(batch["input_ids"], batch["attention_mask"]).last_hidden_state, dim=-1)
+                
+                desc_embeds = model_encoder(desc_input_ids, desc_attn_mask)
+                pooled_mask = torch.ones(desc_embeds.shape[:2], device=DEVICE).long() if PROMPT_LEN else desc_attn_mask
+                
+                lbl_out = lbl_enc(inputs_embeds=desc_embeds, attention_mask=pooled_mask).last_hidden_state
+                mask_exp = pooled_mask.unsqueeze(-1).float()
+                pooled = (lbl_out * mask_exp).sum(1) / mask_exp.sum(1).clamp(min=1e-9)
+                H_label = F.normalize(proj(pooled), dim=-1)
+                
+                logits = torch.matmul(H_text, H_label.T) / temperature
+                
+                # PREDICTIONS
+                preds = torch.argmax(logits, dim=-1)
+                
+                # Masking pad/ignore (-100)
+                active_loss = batch["labels"].view(-1) != -100
+                active_labels = batch["labels"].view(-1)[active_loss]
+                active_preds = preds.view(-1)[active_loss]
+                
+                all_preds.extend(active_preds.cpu().numpy())
+                all_labels.extend(active_labels.cpu().numpy())
+        
+        # CALCOLO MICRO F1 (Più sensibile per ranking generale)
+        # O Macro F1 se preferisci bilanciamento classi
+        val_f1 = f1_score(all_labels, all_preds, average='macro')
+        
+        # Report & Pruning su F1 (Maximize)
+        trial.report(val_f1, epoch)
+        if trial.should_prune(): 
+            raise optuna.TrialPruned()
+            
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            
+    return best_val_f1
 
 if __name__ == "__main__":
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=30)
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
     print(f"🏆 BEST PARAMS: {study.best_params}")
-# 🧪 TRIAL 0 | Beta: 0.99 | Gamma: 5.0 | Temp: 0.079
-# [I 2025-12-04 12:01:06,223] Trial 0 finished with value: 0.07043681477632703 and parameters: {'cb_beta': '0.99', 'focal_gamma': 5.0, 'temperature': 0.07856556223683704}. Best is trial 0 with value: 0.07043681477632703.
-
-# 🧪 TRIAL 1 | Beta: 0.9999 | Gamma: 4.0 | Temp: 0.088
-# [I 2025-12-04 12:02:09,563] Trial 1 finished with value: 0.06231805833080147 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 4.0, 'temperature': 0.08786710672514386}. Best is trial 1 with value: 0.06231805833080147.
-
-# 🧪 TRIAL 2 | Beta: 0.9 | Gamma: 3.5 | Temp: 0.144
-# [I 2025-12-04 12:03:12,753] Trial 2 finished with value: 0.1532605242314218 and parameters: {'cb_beta': '0.9', 'focal_gamma': 3.5, 'temperature': 0.1438606076102245}. Best is trial 1 with value: 0.06231805833080147.
-
-# 🧪 TRIAL 3 | Beta: 0.9 | Gamma: 4.0 | Temp: 0.078
-# [I 2025-12-04 12:04:15,913] Trial 3 finished with value: 0.0952897264704674 and parameters: {'cb_beta': '0.9', 'focal_gamma': 4.0, 'temperature': 0.07812430930879452}. Best is trial 1 with value: 0.06231805833080147.
-
-# 🧪 TRIAL 4 | Beta: 0.9 | Gamma: 4.0 | Temp: 0.074
-# [I 2025-12-04 12:05:19,215] Trial 4 finished with value: 0.09541733619533008 and parameters: {'cb_beta': '0.9', 'focal_gamma': 4.0, 'temperature': 0.07442774600387471}. Best is trial 1 with value: 0.06231805833080147.
-
-# 🧪 TRIAL 5 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.105
-# [I 2025-12-04 12:06:22,668] Trial 5 finished with value: 0.0691346173422246 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.10482822676080684}. Best is trial 1 with value: 0.06231805833080147.
-
-# 🧪 TRIAL 6 | Beta: 0.999 | Gamma: 4.0 | Temp: 0.111
-# [I 2025-12-04 12:06:33,486] Trial 6 pruned. 
-
-# 🧪 TRIAL 7 | Beta: 0.9 | Gamma: 4.5 | Temp: 0.047
-# [I 2025-12-04 12:07:37,587] Trial 7 finished with value: 0.06734734052155592 and parameters: {'cb_beta': '0.9', 'focal_gamma': 4.5, 'temperature': 0.04685052911229522}. Best is trial 1 with value: 0.06231805833080147.
-
-# 🧪 TRIAL 8 | Beta: 0.9 | Gamma: 4.5 | Temp: 0.132
-# [I 2025-12-04 12:07:48,102] Trial 8 pruned. 
-
-# 🧪 TRIAL 9 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.023
-# [I 2025-12-04 12:08:51,871] Trial 9 finished with value: 0.032737455672667 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 4.5, 'temperature': 0.022544333482883407}. Best is trial 9 with value: 0.032737455672667.
-
-# 🧪 TRIAL 10 | Beta: 0.9999 | Gamma: 3.5 | Temp: 0.011
-# [I 2025-12-04 12:09:02,518] Trial 10 pruned. 
-
-# 🧪 TRIAL 11 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.042
-# [I 2025-12-04 12:10:05,279] Trial 11 finished with value: 0.03787350216055218 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 4.5, 'temperature': 0.042203718068175015}. Best is trial 9 with value: 0.032737455672667.
-
-# 🧪 TRIAL 12 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.024
-# [I 2025-12-04 12:11:09,093] Trial 12 finished with value: 0.0326535582919664 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 4.5, 'temperature': 0.024139518430248082}. Best is trial 12 with value: 0.0326535582919664.
-
-# 🧪 TRIAL 13 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.013
-# [I 2025-12-04 12:12:12,528] Trial 13 finished with value: 0.027257606670071807 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.013119440021081487}. Best is trial 13 with value: 0.027257606670071807.
-
-# 🧪 TRIAL 14 | Beta: 0.99 | Gamma: 5.0 | Temp: 0.040
-# [I 2025-12-04 12:12:23,309] Trial 14 pruned. 
-
-# 🧪 TRIAL 15 | Beta: 0.999 | Gamma: 5.0 | Temp: 0.023
-# [I 2025-12-04 12:12:34,056] Trial 15 pruned. 
-
-# 🧪 TRIAL 16 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.059
-# [I 2025-12-04 12:13:37,027] Trial 16 finished with value: 0.03762096218481849 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.05850769929829392}. Best is trial 13 with value: 0.027257606670071807.
-
-# 🧪 TRIAL 17 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.014
-# [I 2025-12-04 12:14:39,805] Trial 17 finished with value: 0.031112853225462044 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 4.5, 'temperature': 0.014344536038260304}. Best is trial 13 with value: 0.027257606670071807.
-
-# 🧪 TRIAL 18 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.012
-# [I 2025-12-04 12:15:43,236] Trial 18 finished with value: 0.026334033147255076 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.011641058260782156}. Best is trial 18 with value: 0.026334033147255076.
-
-# 🧪 TRIAL 19 | Beta: 0.99 | Gamma: 5.0 | Temp: 0.059
-# [I 2025-12-04 12:15:54,070] Trial 19 pruned. 
-
-# 🧪 TRIAL 20 | Beta: 0.999 | Gamma: 5.0 | Temp: 0.033
-# [I 2025-12-04 12:16:04,701] Trial 20 pruned. 
-
-# 🧪 TRIAL 21 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.013
-# [I 2025-12-04 12:16:15,350] Trial 21 pruned. 
-
-# 🧪 TRIAL 22 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.010
-# [I 2025-12-04 12:16:25,941] Trial 22 pruned. 
-
-# 🧪 TRIAL 23 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.029
-# [I 2025-12-04 12:17:29,032] Trial 23 finished with value: 0.033680394504077824 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 4.5, 'temperature': 0.029364482540967726}. Best is trial 18 with value: 0.026334033147255076.
-
-# 🧪 TRIAL 24 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.057
-# [I 2025-12-04 12:18:32,059] Trial 24 finished with value: 0.03720436271138584 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.05724880758215375}. Best is trial 18 with value: 0.026334033147255076.
-
-# 🧪 TRIAL 25 | Beta: 0.9999 | Gamma: 4.5 | Temp: 0.049
-# [I 2025-12-04 12:18:53,418] Trial 25 pruned. 
-
-# 🧪 TRIAL 26 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.019
-# [I 2025-12-04 12:19:56,759] Trial 26 finished with value: 0.027465461482164225 and parameters: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.018557537702155236}. Best is trial 18 with value: 0.026334033147255076.
-
-# 🧪 TRIAL 27 | Beta: 0.9999 | Gamma: 5.0 | Temp: 0.032
-# [I 2025-12-04 12:20:07,494] Trial 27 pruned. 
-
-# 🧪 TRIAL 28 | Beta: 0.99 | Gamma: 5.0 | Temp: 0.038
-# [I 2025-12-04 12:20:18,124] Trial 28 pruned. 
-
-# 🧪 TRIAL 29 | Beta: 0.999 | Gamma: 5.0 | Temp: 0.022
-# [I 2025-12-04 12:20:28,840] Trial 29 pruned. 
-# 🏆 BEST PARAMS: {'cb_beta': '0.9999', 'focal_gamma': 5.0, 'temperature': 0.011641058260782156}
-
-#TEST CON DATASET 15K

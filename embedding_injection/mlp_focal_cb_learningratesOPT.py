@@ -6,9 +6,10 @@ import os
 import numpy as np
 import optuna
 from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from collections import Counter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score
 from gliner import GLiNER
 
 # ==========================================
@@ -20,16 +21,17 @@ POOLING_MODE = "conv1d"  # <--- INSERISCI QUI IL VINCITORE DELLA RICERCA PRECEDE
 BATCH_SIZE = 64
 EPOCHS = 6 # Bastano poche epoche per vedere se l'LR converge
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.05       # Valore fisso per ora
-GAMMA_FOCAL = 4.5        # Valore fisso per ora
-CB_BETA = 0.9999         # Valore fisso per ora
+TEMPERATURE = 0.011641058260782156       # Valore fisso da ottimizzazione precedente
+GAMMA_FOCAL = 5.0        # Valore fisso da ottimizzazione precedente
+CB_BETA = 0.9999         # Valore fisso da ottimizzazione precedente
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VALIDATION_RATIO = 0.1
 
 def is_running_on_kaggle(): return os.path.exists('/kaggle/input')
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else ""
-DATASET_PATH = input_dir + "../dataset/dataset_tokenlevel_simple.json"
-LABEL2DESC_PATH = input_dir + "../label2desc.json"
-LABEL2ID_PATH = input_dir + "../label2id.json"
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
 MODEL_NAME = '/kaggle/input/glinerbismall2/' if is_running_on_kaggle() else "Ihor/gliner-biomed-bi-small-v1.0"
 
 # ==========================================================
@@ -245,8 +247,26 @@ def get_cb_weights_simple(path, l2id, dev, beta):
     return weights / weights.sum() * len(l2id)
 
 class_weights = get_cb_weights_simple(DATASET_PATH, label2id, DEVICE, CB_BETA)
-ds = TokenJsonDataset(DATASET_PATH, txt_tok)
-train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+
+# Load FULL dataset
+full_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+dataset_size = len(full_ds)
+
+# SPLIT TRAIN/VALIDATION
+val_size = int(dataset_size * VALIDATION_RATIO)
+train_size = dataset_size - val_size
+
+# Si usa un generator con seed fisso per riproducibilità dello split
+generator = torch.Generator().manual_seed(42)
+train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=generator)
+
+# LOADERS
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
+                          collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                        collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+
+print(f"🔪 Dataset Split: {len(train_ds)} Train | {len(val_ds)} Val")
 
 # ==========================================
 # 🎯 OPTUNA OBJECTIVE: LEARNING RATES
@@ -296,8 +316,14 @@ def objective(trial):
     loss_fn = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL)
 
     # 4. TRAINING LOOP
+    best_val_f1 = 0.0
+    
     for epoch in range(EPOCHS):
+        # --- TRAIN ---
+        model_encoder.train()
+        proj.train()
         total_loss = 0
+        
         for batch in train_loader:
             optimizer.zero_grad()
             batch = {k: v.to(DEVICE) for k,v in batch.items()}
@@ -325,13 +351,55 @@ def objective(trial):
             scheduler.step()
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        trial.report(avg_loss, epoch)
-        if trial.should_prune(): raise optuna.TrialPruned()
+        # --- VALIDATION (End of Epoch) ---
+        model_encoder.eval()
+        proj.eval()
         
-    return avg_loss
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(DEVICE) for k,v in batch.items()}
+                
+                H_text = F.normalize(txt_enc(batch["input_ids"], batch["attention_mask"]).last_hidden_state, dim=-1)
+                
+                desc_embeds = model_encoder(desc_input_ids, desc_attn_mask)
+                pooled_mask = torch.ones(desc_embeds.shape[:2], device=DEVICE).long() if PROMPT_LEN else desc_attn_mask
+                
+                lbl_out = lbl_enc(inputs_embeds=desc_embeds, attention_mask=pooled_mask).last_hidden_state
+                mask_exp = pooled_mask.unsqueeze(-1).float()
+                pooled = (lbl_out * mask_exp).sum(1) / mask_exp.sum(1).clamp(min=1e-9)
+                H_label = F.normalize(proj(pooled), dim=-1)
+                
+                logits = torch.matmul(H_text, H_label.T) / TEMPERATURE
+                
+                # PREDICTIONS
+                preds = torch.argmax(logits, dim=-1)
+                
+                # Masking pad/ignore (-100)
+                active_loss = batch["labels"].view(-1) != -100
+                active_labels = batch["labels"].view(-1)[active_loss]
+                active_preds = preds.view(-1)[active_loss]
+                
+                all_preds.extend(active_preds.cpu().numpy())
+                all_labels.extend(active_labels.cpu().numpy())
+        
+        # CALCOLO MICRO F1 (Più sensibile per ranking generale)
+        # O Macro F1 se preferisci bilanciamento classi
+        val_f1 = f1_score(all_labels, all_preds, average='macro')
+        
+        # Report & Pruning su F1 (Maximize)
+        trial.report(val_f1, epoch)
+        if trial.should_prune(): 
+            raise optuna.TrialPruned()
+            
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            
+    return best_val_f1
 
 if __name__ == "__main__":
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=20)
     print(f"🏆 BEST PARAMS: {study.best_params}")
