@@ -13,3 +13,6 @@
 /embedding_injection/test_results/
 
 .directory
+
+*.zip
+
