@@ -19,12 +19,12 @@ import os
 #5000 gave the best result
 #1000 gives almost same results 
 
-SIMPLE_DATASET_SIZE = 2000 # Numero di esempi da usare se USE_BALANCED_DATASET = False
+SIMPLE_DATASET_SIZE = 500 # Numero di esempi da usare se USE_BALANCED_DATASET = False
 USE_BALANCED_DATASET = False  # Se False, usa semplicemente i primi N dati
 
 EXAMPLE_NUMBER_FOR_BALANCED = 600  # Usato solo se USE_BALANCED_DATASET = True
 
-TEST_SAMPLE_SIZE = 2000
+TEST_SAMPLE_SIZE = 100
 
 # ===============================================================
 # 1️⃣ GENERAZIONE label2desc.json e label2id.json
