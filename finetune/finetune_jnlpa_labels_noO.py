@@ -28,8 +28,8 @@ label2id_path = path + "label2id.json"
 
 # Training Configuration
 target_steps = None       # Se impostato, il training si fermerà esattamente a questi step
-target_epochs = 3         # Usato solo se target_steps è None
-batch_size = 16
+target_epochs = 5         # Usato solo se target_steps è None
+batch_size = 32
 
 # ==========================================
 # METRICS FUNCTION
@@ -250,11 +250,13 @@ print(f'Total Steps: {total_steps}')
 
 max_steps = -1 
 num_train_epochs = target_epochs
-save_steps = min(50, total_steps) if total_steps > 0 else 100
 
 use_cuda = torch.cuda.is_available()
 use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
 use_fp16 = use_cuda and not use_bf16
+
+save_steps = 100
+logging_steps = save_steps
 
 trainer = model.train_model(
     train_dataset=train_dataset,
@@ -273,6 +275,7 @@ trainer = model.train_model(
     num_train_epochs=num_train_epochs,
     max_steps=max_steps,
     save_steps=save_steps,
+    logging_steps=logging_steps,
     save_total_limit=2,
     eval_strategy="steps",
     load_best_model_at_end=True,
