@@ -12,7 +12,10 @@
 
 /embedding_injection/test_results/
 
+embedding_injection_monoenc/test_results/
+
 .directory
 
 *.zip
 
+*.pyc
