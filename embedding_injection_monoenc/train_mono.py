@@ -250,6 +250,18 @@ class TokenJsonDataset(Dataset):
         input_ids = self.tok.convert_tokens_to_ids(rec["tokens"])
         labels = rec["labels"]
         
+        # CLEANUP SPECIAL TOKENS
+        # Il dataset contiene [CLS] ... [SEP] perché generato con add_special_tokens=True.
+        # Il training loop costruisce manualmente: [CLS] [PROTPT] [SEP] [TEXT] [SEP].
+        # Rimuoviamo i token speciali dal testo caricato per evitare duplicati.
+        if len(input_ids) > 0 and input_ids[0] == self.tok.cls_token_id:
+            input_ids = input_ids[1:]
+            labels = labels[1:]
+        
+        if len(input_ids) > 0 and input_ids[-1] == self.tok.sep_token_id:
+            input_ids = input_ids[:-1]
+            labels = labels[:-1]
+        
         # TRUNCATION
         if len(input_ids) > self.max_len:
             input_ids = input_ids[:self.max_len]
@@ -320,7 +332,7 @@ num_warmup_steps = int(num_training_steps * WARMUP_RATIO)
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
 backbone.to(DEVICE)
-backbone.eval() # Backbone always frozen/eval
+backbone.eval() # Backbone Frozen
 
 best_loss = float('inf')
 best_model_state = None
