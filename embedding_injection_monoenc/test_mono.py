@@ -325,10 +325,20 @@ filename = f"{TEST_RESULTS_DIR}/eval_mono_{timestamp}.md"
 
 # Format Output for Shell Script Parser (**Macro F1** etc)
 with open(filename, "w", encoding="utf-8") as f:
-    f.write(f"# Risultati Test Mono (NO 'O')\n\n")
-    f.write(f"**Checkpoint:** `{os.path.basename(ckpt_path)}`\n")
-    f.write(f"**Prompt Len:** {PROMPT_LEN} | **Pooling:** {POOLING_MODE}\n\n")
     
+    # Extract config
+    config = checkpoint.get('config', {})
+    
+    # Format Config Table
+    config_table = "| Parameter | Value |\n|---|---|\n"
+    sorted_keys = sorted(config.keys())
+    for k in sorted_keys:
+        val = config[k]
+        config_table += f"| **{k}** | `{val}` |\n"
+
+    f.write(f"## 🔧 Training Configuration\n")
+    f.write(f"{config_table}\n\n")
+
     f.write(f" ## Metriche Chiave\n")
     f.write(f"| Metric | Value |\n|---|---|\n")
     f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
