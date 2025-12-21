@@ -30,10 +30,20 @@ WARMUP_STEPS = 50
 EARLY_STOPPING_PATIENCE = 3
 RANDOM_SEED = 42
 
-DATASET_PATH = "../dataset/dataset_tokenlevel_balanced.json"
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
-MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+def is_running_on_kaggle():
+    # Kaggle monta i dataset in questa directory
+    return os.path.exists('/kaggle/input')
+
+if is_running_on_kaggle():
+    input_dir = "/kaggle/input/standard15000/"
+    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
+else:
+    input_dir = "../dataset/"
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+
+DATASET_PATH = input_dir + "dataset_tokenlevel_balanced.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
 
 torch.manual_seed(RANDOM_SEED)
 

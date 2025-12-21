@@ -21,9 +21,11 @@ import subprocess
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset/test_dataset_tokenlevel.json"
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
+
+prefix = "../dataset/"
+TEST_PATH = prefix + "test_dataset_tokenlevel.json"
+LABEL2DESC_PATH = prefix + "label2desc.json"
+LABEL2ID_PATH = prefix + "label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 SAVINGS_DIR = "savings"
 

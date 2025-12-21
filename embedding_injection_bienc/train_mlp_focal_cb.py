@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import os
 import numpy as np
 from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader, random_split, Subset
+from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
@@ -41,19 +41,17 @@ POOLING_MODE = "conv1d"  # "adaptive_avg", "adaptive_max", "attention", "conv1d"
 GAMMA_FOCAL_LOSS = 5.0
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
-VALIDATION_RATIO = 0.1
-EARLY_STOPPING_PATIENCE = 5
 
-input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+if is_running_on_kaggle():
+    input_dir = "/kaggle/input/standard15000/"
+    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
+else:
+    input_dir = "../dataset/"
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"
-
-if is_running_on_kaggle():
-    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
-else:
-    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -366,20 +364,10 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
     return weights
 
 # --- LOAD ---
-full_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
-dataset_size = len(full_ds)
-print(f"📊 Dimensione dataset totale: {dataset_size} esempi")
-
-# SPLIT TRAIN/VALIDATION
-val_size = int(dataset_size * VALIDATION_RATIO)
-train_size = dataset_size - val_size
-
-# Si usa un generator con seed fisso per riproducibilità dello split
-generator = torch.Generator().manual_seed(RANDOM_SEED)
-train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=generator)
-
-print(f"🔪 Split Dataset: Train={len(train_ds)} | Valid={len(val_ds)}")
-
+ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+dataset_size = len(ds)
+print(f"📊 Dimensione dataset: {dataset_size} esempi")
+import math
 # WARMUP_STEPS calculation moved to scheduler initialization per request
 # WARMUP_STEPS = round(math.ceil(dataset_size / BATCH_SIZE) * EPOCHS * WARMUP_PERCENTAGE)
 
@@ -387,8 +375,7 @@ class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
 
 ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
 # ==========================================================
 # 4️⃣ TRAINING LOOP (DIFFERENTIAL LEARNING RATES)
@@ -418,37 +405,27 @@ optimizer = optim.AdamW(
     weight_decay=WEIGHT_DECAY
 )
 
-# Calcolo Steps corretti usando len(train_loader)
+# Calcolo Steps corretti
 num_training_steps = len(train_loader) * EPOCHS
 num_warmup_steps = int(num_training_steps * WARMUP_RATIO)
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
 txt_enc.eval() 
 lbl_enc.eval()
-
-# Spostiamo il model in mode train dopo.
-# (Ricorda che prompt_encoder e proj vanno messi in train())
+prompt_encoder.train()
 
 if TRAIN_PROJECTION: proj.train()
 else: proj.eval()
 
-
-best_loss = float('inf') # Questa diventerà 'best_val_loss'
+best_loss = float('inf')
 best_model_state = None
-patience_counter = 0
 
 print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP} | PROJ LR: {LR_PROJ if TRAIN_PROJECTION else 'N/A'}")
 print(f"🎯 Configurazione Loss: Class Balanced (Beta={CB_BETA}) + Focal (Gamma={GAMMA_FOCAL_LOSS})")
-print(f"🧐 Validazione attiva al {int(VALIDATION_RATIO*100)}%")
 
 for epoch in range(1, EPOCHS + 1):
-    
-    # --- TRAINING PHASE ---
-    prompt_encoder.train()
-    if TRAIN_PROJECTION: proj.train()
-    
-    total_train_loss = 0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [Train]")
+    total_loss = 0
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
     
     for batch in pbar:
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
@@ -483,48 +460,14 @@ for epoch in range(1, EPOCHS + 1):
         optimizer.step()
         scheduler.step()
         
-        total_train_loss += loss.item()
-        pbar.set_postfix({"t_loss": loss.item()})
+        total_loss += loss.item()
+        pbar.set_postfix({"loss": loss.item()})
         
-    avg_train_loss = total_train_loss / len(train_loader)
+    avg_loss = total_loss / len(train_loader)
+    print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
     
-    # --- VALIDATION PHASE ---
-    prompt_encoder.eval()
-    if TRAIN_PROJECTION: proj.eval()
-    
-    total_val_loss = 0
-    with torch.no_grad():
-        for batch in val_loader:
-            batch = {k: v.to(DEVICE) for k, v in batch.items()}
-            
-            out_txt = txt_enc(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-            H_text = F.normalize(out_txt.last_hidden_state, dim=-1)
-            
-            soft_embeds = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
-            
-            if PROMPT_LEN is not None:
-                pooled_attn_mask = torch.ones(soft_embeds.shape[0], soft_embeds.shape[1], 
-                                            dtype=torch.long, device=DEVICE)
-            else:
-                pooled_attn_mask = desc_attn_mask
-            
-            outputs = lbl_enc(inputs_embeds=soft_embeds, attention_mask=pooled_attn_mask)
-            
-            mask_exp = pooled_attn_mask.unsqueeze(-1).float()
-            pooled = torch.sum(outputs.last_hidden_state * mask_exp, 1) / torch.clamp(mask_exp.sum(1), min=1e-9)
-            label_matrix = F.normalize(proj(pooled), dim=-1)
-            
-            logits = torch.matmul(H_text, label_matrix.T) / TEMPERATURE
-            v_loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
-            total_val_loss += v_loss.item()
-            
-    avg_val_loss = total_val_loss / len(val_loader)
-    
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-    
-    # Salva se migliora la VALIDATION loss (Early Stopping proxy)
-    if avg_val_loss < best_loss:
-        best_loss = avg_val_loss
+    if avg_loss < best_loss:
+        best_loss = avg_loss
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
@@ -532,8 +475,6 @@ for epoch in range(1, EPOCHS + 1):
                 'batch_size': BATCH_SIZE,
                 'epochs': EPOCHS,
                 'dataset_size': dataset_size,
-                'train_size': len(train_ds),
-                'val_size': len(val_ds),
                 'random_seed': RANDOM_SEED,
                 
                 # Learning Rates e Ottimizzazione
@@ -551,16 +492,9 @@ for epoch in range(1, EPOCHS + 1):
                 'gamma_focal_loss': GAMMA_FOCAL_LOSS,
                 'cb_beta': CB_BETA,
 
-                # Parametri Validation
-                'validation_split': True,
-                'validation_ratio': VALIDATION_RATIO,
-
                 #Parametri Prompt Pooling
                 'prompt_len': PROMPT_LEN,
                 'pooling_mode': POOLING_MODE,
-
-                # Parametri Early Stopping
-                'early_stopping_patience': EARLY_STOPPING_PATIENCE,
             }
         }
         if TRAIN_PROJECTION:
@@ -571,17 +505,9 @@ for epoch in range(1, EPOCHS + 1):
             if isinstance(best_model_state[key], dict):
                 best_model_state[key] = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in best_model_state[key].items()}
         
-        print(f"  → Nuovo best model (Val Loss: {best_loss:.4f})")
-        patience_counter = 0
-    else:
-        patience_counter += 1
-        print(f"  ⏳ Nessun miglioramento. Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
-        
-    if patience_counter >= EARLY_STOPPING_PATIENCE:
-        print(f"\n🛑 Early Stopping attivo! Nessun miglioramento per {EARLY_STOPPING_PATIENCE} epoche.")
-        break
+        print(f"  → Nuovo best loss: {best_loss:.4f}")
 
-print(f"\n✅ Training completato. Best Validation Loss: {best_loss:.4f}")
+print(f"\n✅ Training completato. Best Loss: {best_loss:.4f}")
 
 try:
     import google.colab # type: ignore
@@ -603,7 +529,7 @@ if best_model_state is not None:
         
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         
-        filename = f"mlp_focal_cbclass_val-{timestamp}.pt"
+        filename = f"mlp_focal_cbclass-{timestamp}.pt"
         
         save_path = os.path.join("savings", filename)
         

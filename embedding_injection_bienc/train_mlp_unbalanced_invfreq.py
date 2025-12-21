@@ -13,26 +13,40 @@ from gliner import GLiNER
 from tqdm import tqdm
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 TRAIN_PROJECTION = True
-
 BATCH_SIZE = 32
 EPOCHS = 10
-LEARNING_RATE = 5e-4
+
+# LEARNING RATES SEPARATI
+LR_MLP = 5e-4
+LR_PROJ = 5e-4
+
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.05
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
+GAMMA_FOCAL_LOSS = 4.5
+WEIGHT_STRATEGY = "InvFreq"
 
-DATASET_PATH = "../dataset/dataset_tokenlevel_simple.json" 
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
-MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+def is_running_on_kaggle():
+    # Kaggle monta i dataset in questa directory
+    return os.path.exists('/kaggle/input')
+
+if is_running_on_kaggle():
+    input_dir = "/kaggle/input/standard15000/"
+    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
+else:
+    input_dir = "../dataset/"
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+
+DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -62,7 +76,34 @@ class MLPPromptEncoder(nn.Module):
         return self.norm(x + self.mlp(x))
 
 # ==========================================================
-# 2️⃣ PREPARAZIONE MODELLO
+# 2️⃣ FOCAL LOSS
+# ==========================================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, ignore_index=-100, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.alpha = alpha 
+
+    def forward(self, input, target):
+        ce_loss = F.cross_entropy(input, target, reduction='none', ignore_index=self.ignore_index)
+        pt = torch.exp(-ce_loss) 
+        
+        mask = target != self.ignore_index
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[target[mask]]
+            focal_loss = alpha_t * (1 - pt[mask]) ** self.gamma * ce_loss[mask]
+        else:
+            focal_loss = (1 - pt[mask]) ** self.gamma * ce_loss[mask]
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        return focal_loss.sum()
+
+# ==========================================================
+# 3️⃣ PREPARAZIONE MODELLO
 # ==========================================================
 print("📦 Caricamento modello...")
 model = GLiNER.from_pretrained(MODEL_NAME)
@@ -147,9 +188,6 @@ def collate_batch(batch, pad_id):
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
 def get_weighted_loss_params(dataset_path, label2id, device):
-    """
-    Calcola i pesi inversi per bilanciare le classi rare (es. RNA vs Protein)
-    """
     with open(dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     
@@ -165,19 +203,14 @@ def get_weighted_loss_params(dataset_path, label2id, device):
     num_classes = len(label2id)
     weights = torch.ones(num_classes).to(device)
     
-    print("\n⚖️  CALCOLO PESI CLASSI (Inverse Frequency):")
-    print(f"   (Totale Tag Validi: {total_tags})")
-    
+    print("\n CALCOLO PESI CLASSI (Inverse Frequency):")
     for label_name, label_id in label2id.items():
         count = label_counts.get(label_id, 0)
         if count > 0:
-            # Formula: Total / (Num_Classes * Count)
             w = total_tags / (num_classes * count)
         else:
             w = 1.0
-            
         weights[label_id] = w
-        # Visualizzazione formattata
         print(f"   🔹 {label_name.ljust(15)}: {str(count).rjust(6)} occorrenze -> Peso Loss: {w:.4f}")
         
     return weights
@@ -187,10 +220,8 @@ ds = TokenJsonDataset(DATASET_PATH, txt_tok)
 dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
 
-# Calcolo Pesi
 class_weights = get_weighted_loss_params(DATASET_PATH, label2id, DEVICE)
-# Loss Pesata
-ce_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
+ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
 
 train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
@@ -198,13 +229,27 @@ train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=la
 # 4️⃣ TRAINING LOOP
 # ==========================================================
 
-params_to_optimize = list(prompt_encoder.parameters())
-if TRAIN_PROJECTION:
-    params_to_optimize += list(proj.parameters())
+# 1. Gruppo parametri MLP (LR specifico)
+optimizer_grouped_parameters = [
+    {
+        "params": prompt_encoder.parameters(),
+        "lr": LR_MLP,
+    }
+]
 
+# 2. Gruppo parametri Projection (LR specifico)
+if TRAIN_PROJECTION:
+    print(f"🔗 Aggiunta Projection Layer all'optimizer con LR={LR_PROJ}")
+    optimizer_grouped_parameters.append({
+        "params": proj.parameters(),
+        "lr": LR_PROJ,
+    })
+else:
+    print("🔒 Projection Layer esclusa dall'optimizer (Frozen)")
+
+# Creazione Optimizer unico con gruppi separati
 optimizer = optim.AdamW(
-    params_to_optimize, 
-    lr=LEARNING_RATE, 
+    optimizer_grouped_parameters, 
     weight_decay=WEIGHT_DECAY
 )
 
@@ -220,7 +265,7 @@ else: proj.eval()
 best_loss = float('inf')
 best_model_state = None
 
-print(f"\n🚀 Inizio Training FULL DATASET | Weights Active | Proj: {TRAIN_PROJECTION}")
+print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP} | PROJ LR: {LR_PROJ if TRAIN_PROJECTION else 'N/A'}")
 
 for epoch in range(1, EPOCHS + 1):
     total_loss = 0
@@ -245,7 +290,7 @@ for epoch in range(1, EPOCHS + 1):
         loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params_to_optimize, GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP) # Clip gradients generically
         optimizer.step()
         scheduler.step()
         
@@ -253,7 +298,7 @@ for epoch in range(1, EPOCHS + 1):
         pbar.set_postfix({"loss": loss.item()})
         
     avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch} | Loss (Weighted): {avg_loss:.4f}")
+    print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
     
     if avg_loss < best_loss:
         best_loss = avg_loss
@@ -263,19 +308,22 @@ for epoch in range(1, EPOCHS + 1):
                 'dataset_size': dataset_size,
                 'batch_size': BATCH_SIZE,
                 'epochs': EPOCHS,
-                'learning_rate': LEARNING_RATE,
+                'lr_mlp': LR_MLP,
+                'lr_proj': LR_PROJ,
                 'weight_decay': WEIGHT_DECAY,
                 'temperature': TEMPERATURE,
                 'grad_clip': GRAD_CLIP,
                 'warmup_steps': WARMUP_STEPS,
                 'random_seed': RANDOM_SEED,
                 'dropout_rate': DROPOUT_RATE,
+                'gamma_focal_loss': GAMMA_FOCAL_LOSS,
+                'weight_strategy': WEIGHT_STRATEGY
             }
         }
         if TRAIN_PROJECTION:
             best_model_state['projection'] = proj.state_dict()
         
-        # Spostamento su CPU per salvataggio sicuro
+        # Spostamento su CPU
         for key in best_model_state:
             if isinstance(best_model_state[key], dict):
                 best_model_state[key] = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in best_model_state[key].items()}
@@ -302,7 +350,7 @@ if best_model_state is not None:
 
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     
-    filename = f"mlp_crossentropy_inversefreq-{timestamp}.pt"
+    filename = f"mlp_focal_inversefreq-{timestamp}.pt"
     save_path = os.path.join("savings", filename)
     torch.save(best_model_state, save_path)
     print(f"💾 Modello salvato in {save_path}")

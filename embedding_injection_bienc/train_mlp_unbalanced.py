@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 
-"""
-5000 for now is the best dataset size. But probably is just a matter of parameter tuning.
-"""
-
 import json
 import torch
 import torch.nn.functional as F
+import time
 import os
-import numpy as np
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
@@ -16,43 +12,37 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
 
-def is_running_on_kaggle():
-    # Kaggle monta i dataset in questa directory
-    return os.path.exists('/kaggle/input')
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 TRAIN_PROJECTION = True
-BATCH_SIZE = 64
+
+BATCH_SIZE = 32
 EPOCHS = 10
-
-# LEARNING RATES SEPARATI
-LR_MLP = 1e-3
-LR_PROJ = 1e-3
-
+LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.05
 GRAD_CLIP = 1.0
-WARMUP_PERCENTAGE = 0.15
+WARMUP_STEPS = 200
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
-GAMMA_FOCAL_LOSS = 4.5
-CB_BETA = 0.9999
-WEIGHT_STRATEGY = "ClassBalanced"
+def is_running_on_kaggle():
+    # Kaggle monta i dataset in questa directory
+    return os.path.exists('/kaggle/input')
 
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else ""
+if is_running_on_kaggle():
+    input_dir = "/kaggle/input/standard15000/"
+    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
+else:
+    input_dir = "../dataset/"
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"
-
-if is_running_on_kaggle():
-    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
-else:
-    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -82,34 +72,7 @@ class MLPPromptEncoder(nn.Module):
         return self.norm(x + self.mlp(x))
 
 # ==========================================================
-# 2️⃣ FOCAL LOSS
-# ==========================================================
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, ignore_index=-100, reduction='mean'):
-        super().__init__()
-        self.gamma = gamma
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-        self.alpha = alpha 
-
-    def forward(self, input, target):
-        ce_loss = F.cross_entropy(input, target, reduction='none', ignore_index=self.ignore_index)
-        pt = torch.exp(-ce_loss) 
-        
-        mask = target != self.ignore_index
-        
-        if self.alpha is not None:
-            alpha_t = self.alpha[target[mask]]
-            focal_loss = alpha_t * (1 - pt[mask]) ** self.gamma * ce_loss[mask]
-        else:
-            focal_loss = (1 - pt[mask]) ** self.gamma * ce_loss[mask]
-
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        return focal_loss.sum()
-
-# ==========================================================
-# 3️⃣ PREPARAZIONE MODELLO
+# 2️⃣ PREPARAZIONE MODELLO
 # ==========================================================
 print("📦 Caricamento modello...")
 model = GLiNER.from_pretrained(MODEL_NAME)
@@ -152,7 +115,7 @@ prompt_encoder = MLPPromptEncoder(
 print(f"✨ MLP Prompt Encoder creato.")
 
 # ==========================================================
-# 3️⃣ DATASET & CALCOLO PESI (CLASS BALANCED)
+# 3️⃣ DATASET & CALCOLO PESI
 # ==========================================================
 with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
 with open(LABEL2ID_PATH) as f: label2id = json.load(f)
@@ -193,11 +156,9 @@ def collate_batch(batch, pad_id):
         labels[i, :L] = ex["labels"]
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
-# --- CLASS BALANCED WEIGHTS ---
-def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
+def get_weighted_loss_params(dataset_path, label2id, device):
     """
-    Calcola i pesi usando il metodo 'Class Balanced Loss' (Cui et al., CVPR 2019).
-    Formula: Weight = (1 - beta) / (1 - beta^N)
+    Calcola i pesi inversi per bilanciare le classi rare (es. RNA vs Protein)
     """
     with open(dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -214,26 +175,20 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
     num_classes = len(label2id)
     weights = torch.ones(num_classes).to(device)
     
-    print(f"\n  CALCOLO PESI (Class Balanced - Beta {beta}):")
+    print("\n⚖️  CALCOLO PESI CLASSI (Inverse Frequency):")
+    print(f"   (Totale Tag Validi: {total_tags})")
     
     for label_name, label_id in label2id.items():
         count = label_counts.get(label_id, 0)
         if count > 0:
-            # Calcolo Effective Number: (1 - beta^n) / (1 - beta)
-            effective_num = (1.0 - np.power(beta, count)) / (1.0 - beta)
-            weights[label_id] = 1.0 / effective_num
+            # Formula: Total / (Num_Classes * Count)
+            w = total_tags / (num_classes * count)
         else:
-            # Fallback per classi non presenti nel train (raro)
-            weights[label_id] = 0.0 
-        
-    # Normalizzazione Cruciale: 
-    # La somma dei pesi deve essere uguale al numero di classi.
-    # Questo previene che la loss diventi gigante o minuscola globalmente.
-    weights = weights / weights.sum() * num_classes
-    
-    for label_name, label_id in label2id.items():
-        count = label_counts.get(label_id, 0)
-        print(f"   🔹 {label_name.ljust(15)}: {str(count).rjust(6)} occorrenze -> Peso CB: {weights[label_id].item():.4f}")
+            w = 1.0
+            
+        weights[label_id] = w
+        # Visualizzazione formattata
+        print(f"   🔹 {label_name.ljust(15)}: {str(count).rjust(6)} occorrenze -> Peso Loss: {w:.4f}")
         
     return weights
 
@@ -241,40 +196,25 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
 ds = TokenJsonDataset(DATASET_PATH, txt_tok)
 dataset_size = len(ds)
 print(f"📊 Dimensione dataset: {dataset_size} esempi")
-import math
-WARMUP_STEPS = round(math.ceil(dataset_size / BATCH_SIZE) * EPOCHS * WARMUP_PERCENTAGE)
 
-class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
-
-ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
+# Calcolo Pesi
+class_weights = get_weighted_loss_params(DATASET_PATH, label2id, DEVICE)
+# Loss Pesata
+ce_loss = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights)
 
 train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
 # ==========================================================
-# 4️⃣ TRAINING LOOP (DIFFERENTIAL LEARNING RATES)
+# 4️⃣ TRAINING LOOP
 # ==========================================================
 
-# 1. Gruppo parametri MLP (LR specifico)
-optimizer_grouped_parameters = [
-    {
-        "params": prompt_encoder.parameters(),
-        "lr": LR_MLP,
-    }
-]
-
-# 2. Gruppo parametri Projection (LR specifico)
+params_to_optimize = list(prompt_encoder.parameters())
 if TRAIN_PROJECTION:
-    print(f" Aggiunta Projection Layer all'optimizer con LR={LR_PROJ}")
-    optimizer_grouped_parameters.append({
-        "params": proj.parameters(),
-        "lr": LR_PROJ,
-    })
-else:
-    print("🔒 Projection Layer esclusa dall'optimizer (Frozen)")
+    params_to_optimize += list(proj.parameters())
 
-# Creazione Optimizer unico con gruppi separati
 optimizer = optim.AdamW(
-    optimizer_grouped_parameters, 
+    params_to_optimize, 
+    lr=LEARNING_RATE, 
     weight_decay=WEIGHT_DECAY
 )
 
@@ -290,8 +230,7 @@ else: proj.eval()
 best_loss = float('inf')
 best_model_state = None
 
-print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP} | PROJ LR: {LR_PROJ if TRAIN_PROJECTION else 'N/A'}")
-print(f"🎯 Configurazione Loss: Class Balanced (Beta={CB_BETA}) + Focal (Gamma={GAMMA_FOCAL_LOSS})")
+print(f"\n🚀 Inizio Training FULL DATASET | Weights Active | Proj: {TRAIN_PROJECTION}")
 
 for epoch in range(1, EPOCHS + 1):
     total_loss = 0
@@ -316,7 +255,7 @@ for epoch in range(1, EPOCHS + 1):
         loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(params_to_optimize, GRAD_CLIP)
         optimizer.step()
         scheduler.step()
         
@@ -324,39 +263,29 @@ for epoch in range(1, EPOCHS + 1):
         pbar.set_postfix({"loss": loss.item()})
         
     avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
+    print(f"Epoch {epoch} | Loss (Weighted): {avg_loss:.4f}")
     
     if avg_loss < best_loss:
         best_loss = avg_loss
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
-                # Parametri generali di training
+                'dataset_size': dataset_size,
                 'batch_size': BATCH_SIZE,
                 'epochs': EPOCHS,
-                'dataset_size': dataset_size,
-                'random_seed': RANDOM_SEED,
-                
-                # Learning Rates e Ottimizzazione
-                'lr_mlp': LR_MLP,
-                'lr_proj': LR_PROJ,
+                'learning_rate': LEARNING_RATE,
                 'weight_decay': WEIGHT_DECAY,
+                'temperature': TEMPERATURE,
                 'grad_clip': GRAD_CLIP,
                 'warmup_steps': WARMUP_STEPS,
-                'warmup_percentage': WARMUP_PERCENTAGE,
-                
-                # Parametri Modello / Loss
-                'temperature': TEMPERATURE,
+                'random_seed': RANDOM_SEED,
                 'dropout_rate': DROPOUT_RATE,
-                'weight_strategy': WEIGHT_STRATEGY,
-                'gamma_focal_loss': GAMMA_FOCAL_LOSS,
-                'cb_beta': CB_BETA
             }
         }
         if TRAIN_PROJECTION:
             best_model_state['projection'] = proj.state_dict()
         
-        # Spostamento su CPU
+        # Spostamento su CPU per salvataggio sicuro
         for key in best_model_state:
             if isinstance(best_model_state[key], dict):
                 best_model_state[key] = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in best_model_state[key].items()}
@@ -371,26 +300,21 @@ try:
 except:
     IN_COLAB = False
 
-
 from datetime import datetime, timedelta
 
 if best_model_state is not None:
-        os.makedirs("savings", exist_ok=True)
-        
-        now = datetime.now()
-        
-        # Se sei in Colab o Kaggle, aggiungi un'ora
-        if IN_COLAB or is_running_on_kaggle():
-            now = now + timedelta(hours=1)
-        
-        timestamp = now.strftime("%Y%m%d_%H%M%S")
-        
-        filename = f"mlp_focal_cbclass-{timestamp}.pt"
-        
-        save_path = os.path.join("savings", filename)
-        
-        torch.save(best_model_state, save_path)
-        print(f"💾 Modello salvato in {save_path}")
-        
+    os.makedirs("savings", exist_ok=True)
+    now = datetime.now()
+
+    # Se sei in Colab, aggiungi un'ora
+    if IN_COLAB:
+        now = now + timedelta(hours=1)
+
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    
+    filename = f"mlp_crossentropy_inversefreq-{timestamp}.pt"
+    save_path = os.path.join("savings", filename)
+    torch.save(best_model_state, save_path)
+    print(f"💾 Modello salvato in {save_path}")
 else:
-        print("⚠️ Nessun modello salvato.")
+    print("⚠️ Nessun modello salvato.")
