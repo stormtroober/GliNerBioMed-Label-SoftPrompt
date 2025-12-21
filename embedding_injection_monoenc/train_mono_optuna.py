@@ -6,6 +6,7 @@ import os
 import numpy as np
 import math
 import gc
+import optuna
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from collections import Counter
@@ -22,16 +23,12 @@ if torch.cuda.is_available():
     gc.collect()
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# ==========================================================
-# 🔧 CONFIGURAZIONE
-# ==========================================================
-BATCH_SIZE = 8 
-EPOCHS = 2
 
-# LEARNING RATES
-LR_MLP = 8.355496242968421e-05 
-LR_BACKBONE = 0.0 # Frozen by default
-
+# ==========================================================
+# 🔧 CONFIGURAZIONE FISSA
+# ==========================================================
+BATCH_SIZE = 8
+EPOCHS = 10 
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.05 
 GRAD_CLIP = 1.0
@@ -46,11 +43,10 @@ GAMMA_FOCAL_LOSS = 5.0
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 VALIDATION_RATIO = 0.1
-EARLY_STOPPING_PATIENCE = 5
 
 # Paths
 if is_running_on_kaggle():
-    input_dir = "/kaggle/input/standard16600/"
+    input_dir = "/kaggle/input/standard10000/"
     DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
     LABEL2DESC_PATH = input_dir + "label2desc.json"
     LABEL2ID_PATH = input_dir + "label2id.json"
@@ -184,9 +180,9 @@ class FocalLoss(nn.Module):
         return focal_loss.sum()
 
 # ==========================================================
-# 3️⃣ PREPARAZIONE MODELLO
+# 3️⃣ PREPARAZIONE MODELLO (BACKBONE FROZEN)
 # ==========================================================
-print("📦 Caricamento modello...")
+print("📦 Caricamento modello base...")
 model_wrapper = GLiNER.from_pretrained(MODEL_NAME)
 model = model_wrapper.model
 tokenizer = model_wrapper.data_processor.transformer_tokenizer
@@ -200,10 +196,12 @@ embed_dim = original_word_embeddings.embedding_dim
 # 🔒 FREEZE BACKBONE
 for p in backbone.parameters():
     p.requires_grad = False
+backbone.to(DEVICE)
+backbone.eval()
 print(f"✅ Backbone Configurato (Frozen). Dim: {embed_dim}")
 
 # ==========================================================
-# 4️⃣ DATASET & CALCOLO PESI
+# 4️⃣ DATASET & DATALOADERS GLOBALI
 # ==========================================================
 with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
 with open(LABEL2ID_PATH) as f: label2id = json.load(f)
@@ -211,11 +209,10 @@ id2label = {v: k for k, v in label2id.items()}
 label_names = [id2label[i] for i in range(len(label2id))]
 num_labels = len(label2id)
 
-# Calculate Max Text Length allowed
-# Model Max Len (512) - (NumLabels * PromptLen) - SpecialTokens(3: CLS, SEP, SEP)
+# Calculate Max Text Length
 MAX_MODEL_LEN = 512
 TOTAL_PROMPT_TOKENS = num_labels * PROMPT_LEN
-MAX_TEXT_LEN = MAX_MODEL_LEN - TOTAL_PROMPT_TOKENS - 5 # Safety buffer
+MAX_TEXT_LEN = MAX_MODEL_LEN - TOTAL_PROMPT_TOKENS - 5 
 print(f"📏 Max Text Length imposto a: {MAX_TEXT_LEN} (Prompt Tokens: {TOTAL_PROMPT_TOKENS})")
 
 # Tokenize Descriptions
@@ -223,19 +220,6 @@ desc_texts = [label2desc[name] for name in label_names]
 desc_inputs = tokenizer(desc_texts, return_tensors="pt", padding=True, truncation=True)
 desc_input_ids = desc_inputs["input_ids"].to(DEVICE)
 desc_attn_mask = desc_inputs["attention_mask"].to(DEVICE)
-
-# Create/Load Prompt Encoder
-prompt_encoder = MLPPromptEncoder(
-    original_word_embeddings, 
-    vocab_size, 
-    embed_dim, 
-    dropout=DROPOUT_RATE,
-    prompt_len=PROMPT_LEN,
-    pooling_mode=POOLING_MODE,
-    max_seq_len=desc_input_ids.shape[1]
-).to(DEVICE)
-
-print(f"✨ MLP Prompt Encoder creato. Prompt Length: {PROMPT_LEN}, Mode: {POOLING_MODE}")
 
 class TokenJsonDataset(Dataset):
     def __init__(self, path_json, tokenizer, max_len=512):
@@ -283,7 +267,6 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
                 
     num_classes = len(label2id)
     weights = torch.ones(num_classes).to(device)
-    print(f"\n  CALCOLO PESI (Class Balanced - Beta {beta}):")
     for label_name, label_id in label2id.items():
         count = label_counts.get(label_id, 0)
         if count > 0:
@@ -291,8 +274,6 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
             weights[label_id] = 1.0 / effective_num
         else: weights[label_id] = 0.0 
     weights = weights / weights.sum() * num_classes
-    for label_name, label_id in label2id.items():
-        print(f"   🔹 {label_name.ljust(15)}: {str(label_counts.get(label_id,0)).rjust(6)} -> Peso: {weights[label_id].item():.4f}")
     return weights
 
 print("📊 Loading Dataset...")
@@ -304,240 +285,172 @@ train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=torch
 print(f"🔪 Split: Train={len(train_ds)} | Valid={len(val_ds)}")
 
 class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
-ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
+ce_loss_fn = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, tokenizer.pad_token_id))
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda b: collate_batch(b, tokenizer.pad_token_id))
 
 # ==========================================================
-# 5️⃣ TRAINING LOOP
+# 🎯 OPTUNA OBJECTIVE
 # ==========================================================
-optimizer_grouped_parameters = [{"params": prompt_encoder.parameters(), "lr": LR_MLP}]
-optimizer = optim.AdamW(optimizer_grouped_parameters, weight_decay=WEIGHT_DECAY)
+def objective(trial):
+    # 1. SUGGEST PARAMETER
+    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+    print(f"\n🧪 TRIAL {trial.number} | LR: {lr:.6f}")
 
-num_training_steps = len(train_loader) * EPOCHS
-num_warmup_steps = int(num_training_steps * WARMUP_RATIO)
-scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
-
-backbone.to(DEVICE)
-backbone.eval() # Backbone always frozen/eval
-
-best_loss = float('inf')
-best_model_state = None
-patience_counter = 0
-
-print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP}")
-
-for epoch in range(1, EPOCHS + 1):
-    # TRAIN
-    prompt_encoder.train()
-    total_train_loss = 0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [Train]")
+    # 2. INIT MODEL (Trainable part only)
+    prompt_encoder = MLPPromptEncoder(
+        original_word_embeddings, 
+        vocab_size, 
+        embed_dim, 
+        dropout=DROPOUT_RATE,
+        prompt_len=PROMPT_LEN,
+        pooling_mode=POOLING_MODE,
+        max_seq_len=desc_input_ids.shape[1]
+    ).to(DEVICE)
     
-    for batch in pbar:
-        batch = {k: v.to(DEVICE) for k, v in batch.items()}
-        optimizer.zero_grad()
-        
-        # 1. Generate Soft Prompts
-        # (NumLabels, PLen, D)
-        soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask) 
-        
-        # Flatten Prompts to a single sequence per sample
-        # (NumLabels * PLen, D)
-        soft_prompts_flat = soft_prompts.view(-1, embed_dim) 
-        prompts_len = soft_prompts_flat.shape[0]
-        
-        # Expand for Batch: (B, TotalPromptLen, D)
-        batch_soft_prompts = soft_prompts_flat.unsqueeze(0).expand(batch["input_ids"].shape[0], -1, -1)
-        
-        # 2. Get Text Embeddings
-        # (B, TextLen, D)
-        text_embeds = backbone.embeddings(batch["input_ids"])
-        
-        # 3. Concatenate: [CLS] + Prompts + [SEP] + Text + [SEP]
-        cls_token = torch.tensor([[tokenizer.cls_token_id]] * batch["input_ids"].shape[0], device=DEVICE)
-        sep_token = torch.tensor([[tokenizer.sep_token_id]] * batch["input_ids"].shape[0], device=DEVICE)
-        
-        cls_embed = backbone.embeddings(cls_token) # (B, 1, D)
-        sep_embed = backbone.embeddings(sep_token) # (B, 1, D)
-        
-        inputs_embeds = torch.cat([
-            cls_embed,
-            batch_soft_prompts,
-            sep_embed,
-            text_embeds,
-            sep_embed
-        ], dim=1)
-        
-        # ATTENTION MASK
-        B = batch["input_ids"].shape[0]
-        prompt_mask = torch.ones((B, prompts_len), device=DEVICE)
-        cls_mask = torch.ones((B, 1), device=DEVICE)
-        sep_mask = torch.ones((B, 1), device=DEVICE)
-        
-        full_mask = torch.cat([
-            cls_mask,
-            prompt_mask,
-            sep_mask,
-            batch["attention_mask"], # Text mask (with 0 for padding)
-            sep_mask
-        ], dim=1)
-        
-        # 4. Forward Backbone
-        outputs = backbone.encoder(inputs_embeds, attention_mask=full_mask.unsqueeze(1).unsqueeze(2)) 
-        sequence_output = outputs.last_hidden_state
-        
-        # 5. Extract Representations
-        # Indices in sequence: CLS (1) + Prompts (PLen) + SEP (1) -> Start of Text is 1 + PLen + 1
-        text_start = 1 + prompts_len + 1
-        text_end = text_start + batch["input_ids"].shape[1]
-        
-        text_reps = sequence_output[:, text_start:text_end, :] # (B, TextLen, D)
-        
-        # Prompt Reps: 1 to 1 + PLen
-        prompt_reps_seq = sequence_output[:, 1:1+prompts_len, :] # (B, NumLabels*PLen, D)
-        
-        # Reshape back to (B, NumLabels, PLen, D)
-        prompt_reps_reshaped = prompt_reps_seq.view(B, soft_prompts.shape[0], soft_prompts.shape[1], embed_dim)
-        
-        # Pool Prompts to get 1 vector per label (Mean over Prompt Length)
-        prompt_vectors = prompt_reps_reshaped.mean(dim=2) # (B, NumLabels, D)
-        
-        # 6. Similarity & Loss
-        H_text = F.normalize(text_reps, dim=-1)
-        H_prompts = F.normalize(prompt_vectors, dim=-1) 
-        
-        # Logits: (B, TextLen, NumLabels)
-        logits = torch.bmm(H_text, H_prompts.transpose(1, 2)) / TEMPERATURE
-        
-        loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP)
-        optimizer.step()
-        scheduler.step()
-        
-        total_train_loss += loss.item()
-        pbar.set_postfix({"loss": loss.item()})
-        
-    avg_train_loss = total_train_loss / len(train_loader)
+    optimizer = optim.AdamW(prompt_encoder.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     
-    # VALIDATION
-    prompt_encoder.eval()
-    total_val_loss = 0
-    with torch.no_grad():
-        for batch in val_loader:
+    num_training_steps = len(train_loader) * EPOCHS
+    num_warmup_steps = int(num_training_steps * WARMUP_RATIO)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+    
+    best_loss = float('inf')
+    
+    # 3. TRAINING LOOP
+    for epoch in range(1, EPOCHS + 1):
+        # TRAIN
+        prompt_encoder.train()
+        total_train_loss = 0
+        
+        # Usiamo tqdm solo se non siamo in un trial troppo verbose, oppure una semplice print
+        # Per Optuna spesso è meglio ridurre l'output.
+        
+        for batch in train_loader:
             batch = {k: v.to(DEVICE) for k, v in batch.items()}
+            optimizer.zero_grad()
             
-            # Same construction as above
-            soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
-            soft_prompts_flat = soft_prompts.view(-1, embed_dim)
+            # --- Logic duplicated from train_mono.py ---
+            soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask) 
+            soft_prompts_flat = soft_prompts.view(-1, embed_dim) 
             prompts_len = soft_prompts_flat.shape[0]
             batch_soft_prompts = soft_prompts_flat.unsqueeze(0).expand(batch["input_ids"].shape[0], -1, -1)
             
             text_embeds = backbone.embeddings(batch["input_ids"])
             cls_token = torch.tensor([[tokenizer.cls_token_id]] * batch["input_ids"].shape[0], device=DEVICE)
             sep_token = torch.tensor([[tokenizer.sep_token_id]] * batch["input_ids"].shape[0], device=DEVICE)
-            cls_embed = backbone.embeddings(cls_token)
-            sep_embed = backbone.embeddings(sep_token)
+            cls_embed = backbone.embeddings(cls_token) # (B, 1, D)
+            sep_embed = backbone.embeddings(sep_token) # (B, 1, D)
             
             inputs_embeds = torch.cat([cls_embed, batch_soft_prompts, sep_embed, text_embeds, sep_embed], dim=1)
             
-            B = batch["input_ids"].shape[0]
-            full_mask = torch.cat([
-                torch.ones((B, 1), device=DEVICE),
-                torch.ones((B, prompts_len), device=DEVICE),
-                torch.ones((B, 1), device=DEVICE),
-                batch["attention_mask"],
-                torch.ones((B, 1), device=DEVICE)
-            ], dim=1)
+            B_batch = batch["input_ids"].shape[0]
+            prompt_mask = torch.ones((B_batch, prompts_len), device=DEVICE)
             
-            outputs = backbone.encoder(inputs_embeds, attention_mask=full_mask.unsqueeze(1).unsqueeze(2))
+            # Attenzione: qui si assume che desc_attn_mask sia 1 per i token validi, ma nel codice originale
+            # si creava una maschera di tutti 1. Verifichiamo. 
+            # Originale: prompt_mask = torch.ones((B, prompts_len), device=DEVICE) -> OK
+            
+            extra_ones = torch.ones((B_batch, 1), device=DEVICE)
+            full_mask = torch.cat([extra_ones, prompt_mask, extra_ones, batch["attention_mask"], extra_ones], dim=1)
+            
+            outputs = backbone.encoder(inputs_embeds, attention_mask=full_mask.unsqueeze(1).unsqueeze(2)) 
             sequence_output = outputs.last_hidden_state
             
             text_start = 1 + prompts_len + 1
             text_end = text_start + batch["input_ids"].shape[1]
-            text_reps = sequence_output[:, text_start:text_end, :]
+            text_reps = sequence_output[:, text_start:text_end, :] 
             
-            prompt_reps_seq = sequence_output[:, 1:1+prompts_len, :]
-            prompt_reps_reshaped = prompt_reps_seq.view(B, soft_prompts.shape[0], soft_prompts.shape[1], embed_dim)
-            prompt_vectors = prompt_reps_reshaped.mean(dim=2)
+            prompt_reps_seq = sequence_output[:, 1:1+prompts_len, :] 
+            prompt_reps_reshaped = prompt_reps_seq.view(B_batch, soft_prompts.shape[0], soft_prompts.shape[1], embed_dim)
+            prompt_vectors = prompt_reps_reshaped.mean(dim=2) 
             
             H_text = F.normalize(text_reps, dim=-1)
-            H_prompts = F.normalize(prompt_vectors, dim=-1)
+            H_prompts = F.normalize(prompt_vectors, dim=-1) 
             
             logits = torch.bmm(H_text, H_prompts.transpose(1, 2)) / TEMPERATURE
-            loss = ce_loss(logits.view(-1, num_labels), batch["labels"].view(-1))
-            total_val_loss += loss.item()
-
-    avg_val_loss = total_val_loss / len(val_loader)
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-    
-    # Save & Early Stopping (Structure Updated)
-    if avg_val_loss < best_loss:
-        best_loss = avg_val_loss
+            loss = ce_loss_fn(logits.view(-1, num_labels), batch["labels"].view(-1))
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(prompt_encoder.parameters(), GRAD_CLIP)
+            optimizer.step()
+            scheduler.step()
+            
+            total_train_loss += loss.item()
+            
+        avg_train_loss = total_train_loss / len(train_loader)
         
-        # Save structured state like reference script
-        best_model_state = {
-            'prompt_encoder': prompt_encoder.state_dict(),
-            'config': {
-                'batch_size': BATCH_SIZE,
-                'epochs': EPOCHS,
-                'dataset_size': len(full_ds),
-                'train_size': len(train_ds),
-                'val_size': len(val_ds),
-                'random_seed': RANDOM_SEED,
-                'lr_mlp': LR_MLP,
-                'weight_decay': WEIGHT_DECAY,
-                'grad_clip': GRAD_CLIP,
-                'warmup_ratio': WARMUP_RATIO,
-                'temperature': TEMPERATURE,
-                'dropout_rate': DROPOUT_RATE,
-                'weight_strategy': WEIGHT_STRATEGY,
-                'gamma_focal_loss': GAMMA_FOCAL_LOSS,
-                'cb_beta': CB_BETA,
-                'validation_split': True,
-                'validation_ratio': VALIDATION_RATIO,
-                'prompt_len': PROMPT_LEN,
-                'pooling_mode': POOLING_MODE,
-                'max_text_len': MAX_TEXT_LEN,
-                'patience': EARLY_STOPPING_PATIENCE
-            }
-        }
+        # VALIDATION
+        prompt_encoder.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(DEVICE) for k, v in batch.items()}
+                
+                soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
+                soft_prompts_flat = soft_prompts.view(-1, embed_dim)
+                prompts_len = soft_prompts_flat.shape[0]
+                batch_soft_prompts = soft_prompts_flat.unsqueeze(0).expand(batch["input_ids"].shape[0], -1, -1)
+                
+                text_embeds = backbone.embeddings(batch["input_ids"])
+                cls_token = torch.tensor([[tokenizer.cls_token_id]] * batch["input_ids"].shape[0], device=DEVICE)
+                sep_token = torch.tensor([[tokenizer.sep_token_id]] * batch["input_ids"].shape[0], device=DEVICE)
+                cls_embed = backbone.embeddings(cls_token)
+                sep_embed = backbone.embeddings(sep_token)
+                
+                inputs_embeds = torch.cat([cls_embed, batch_soft_prompts, sep_embed, text_embeds, sep_embed], dim=1)
+                
+                B_batch = batch["input_ids"].shape[0]
+                prompt_mask = torch.ones((B_batch, prompts_len), device=DEVICE)
+                extra_ones = torch.ones((B_batch, 1), device=DEVICE)
+                full_mask = torch.cat([extra_ones, prompt_mask, extra_ones, batch["attention_mask"], extra_ones], dim=1)
+                
+                outputs = backbone.encoder(inputs_embeds, attention_mask=full_mask.unsqueeze(1).unsqueeze(2))
+                sequence_output = outputs.last_hidden_state
+                
+                text_start = 1 + prompts_len + 1
+                text_end = text_start + batch["input_ids"].shape[1]
+                text_reps = sequence_output[:, text_start:text_end, :]
+                
+                prompt_reps_seq = sequence_output[:, 1:1+prompts_len, :]
+                prompt_reps_reshaped = prompt_reps_seq.view(B_batch, soft_prompts.shape[0], soft_prompts.shape[1], embed_dim)
+                prompt_vectors = prompt_reps_reshaped.mean(dim=2)
+                
+                H_text = F.normalize(text_reps, dim=-1)
+                H_prompts = F.normalize(prompt_vectors, dim=-1)
+                
+                logits = torch.bmm(H_text, H_prompts.transpose(1, 2)) / TEMPERATURE
+                loss = ce_loss_fn(logits.view(-1, num_labels), batch["labels"].view(-1))
+                total_val_loss += loss.item()
+
+        avg_val_loss = total_val_loss / len(val_loader)
         
-        # Move state to CPU to save memory/compatibility
-        for key in best_model_state:
-            if isinstance(best_model_state[key], dict):
-                best_model_state[key] = {k: v.cpu().clone() if isinstance(v, torch.Tensor) else v for k, v in best_model_state[key].items()}
+        # Report intermediate result
+        trial.report(avg_val_loss, epoch)
+        
+        # Pruning check
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+            
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            
+        print(f"  Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        
+    return best_loss
 
-        print(f"  → Nuovo best model (Val Loss: {best_loss:.4f}) - Stato aggiornato in memoria")
-        patience_counter = 0
-    else:
-        patience_counter += 1
-        print(f"  ⏳ Nessun miglioramento. Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
-        if patience_counter >= EARLY_STOPPING_PATIENCE:
-            print(f"\n🛑 Early Stopping attivo! Nessun miglioramento per {EARLY_STOPPING_PATIENCE} epoche.")
-            break
 
-print(f"\n✅ Training completato. Best Validation Loss: {best_loss:.4f}")
-
-# ==========================================================
-# 6️⃣ SALVATAGGIO FINALE
-# ==========================================================
-from datetime import datetime, timedelta
-
-if best_model_state is not None:
-    os.makedirs("savings", exist_ok=True)
+if __name__ == "__main__":
+    print("\n🚀 Inizio Studio Optuna (10 Trials, 10 Epoche)")
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=10)
     
-    now = datetime.now()
-    if is_running_on_kaggle(): 
-        now = now + timedelta(hours=1)
+    print("\n🏆 BEST PARAMETERS FOUND:")
+    print(study.best_params)
+    print(f"Best Validation Loss: {study.best_value}")
     
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    filename = f"mlp_mono_focal_cbclass_val-{timestamp}.pt"
-    save_path = os.path.join("savings", filename)
-    
-    torch.save(best_model_state, save_path)
-    print(f"💾 Modello salvato in {save_path}")
-else:
-    print("⚠️ Nessun modello salvato (Loss mai migliorata?)")
+    # Optional: Save best params to a file for easy reading
+    with open("optuna_best_params_mono.json", "w") as f:
+        json.dump(study.best_params, f, indent=4)
+
+# 8.355496242968421e-05
