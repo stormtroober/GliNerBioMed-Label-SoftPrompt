@@ -10,21 +10,18 @@ from tqdm import tqdm
 import json
 import torch
 from transformers import AutoTokenizer
-from collections import Counter, defaultdict
+from collections import Counter
 import random
 import os
+import configparser
 
-# Configurazione dataset
-#10000 is LONG
-#5000 gave the best result
-#1000 gives almost same results 
+# Configurazione dataset 
+config = configparser.ConfigParser()
+config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset.conf')
+config.read(config_path)
 
-SIMPLE_DATASET_SIZE = 5000 # Numero di esempi da usare se USE_BALANCED_DATASET = False
-USE_BALANCED_DATASET = False  # Se False, usa semplicemente i primi N dati
-
-EXAMPLE_NUMBER_FOR_BALANCED = 600  # Usato solo se USE_BALANCED_DATASET = True
-
-TEST_SAMPLE_SIZE = 2000
+TRAIN_DATASET_SIZE = int(config['dataset']['TRAIN_DATASET_SIZE'])
+TEST_DATASET_SIZE = int(config['dataset']['TEST_DATASET_SIZE'])
 
 # ===============================================================
 # 1️⃣ GENERAZIONE label2desc.json e label2id.json
@@ -36,9 +33,11 @@ print(f"✅ Pile-NER descrizioni caricato — {len(df_labels)} descrizioni total
 # Etichette di interesse
 target_labels = {"cell line", "cell type", "dna", "protein", "rna"}
 
+#print(f"🔍 Etichette trovate nel dataset: {df_labels['entity_type'].unique().tolist()}")
+
 # Filtra solo le descrizioni corrispondenti
 df_labels_filtered = df_labels[df_labels["entity_type"].str.lower().isin(target_labels)]
-print(f"✅ Descrizioni filtrate: {len(df_labels_filtered)}")
+print(f"✅ Descrizioni filtrate: {len(df_labels_filtered)} (Target: {target_labels})")
 
 # Crea dizionari label2desc e label2id
 label2desc = {
@@ -72,6 +71,11 @@ print("\n📥 Caricamento tokenizer...")
 id2label = {v: k for k, v in label2id.items()}
 
 TOKENIZER_NAME = "microsoft/deberta-v3-small"
+
+# Suppress warnings about potential byte fallback issues when converting slow tokenizer to fast one
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers.convert_slow_tokenizer")
+
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
 splits = {
@@ -80,8 +84,6 @@ splits = {
 }
 df_data = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["train"])
 df = df_data.copy()
-#df = df_data.head(15000).copy()
-#print(f"✅ Dataset caricato: {len(df)} righe")
 
 # ===============================================================
 # 3️⃣ MAPPATURA BIO → LABEL BASE
@@ -204,45 +206,12 @@ for _, row in tqdm(df.iterrows(), total=len(df)):
 print(f"\n✅ Creati {len(encoded_dataset)} esempi token-level.")
 
 # ===============================================================
-# 6️⃣ BILANCIAMENTO CLASSI O SELEZIONE SEMPLICE
+# 6️⃣ SELEZIONE DATASET
 # ===============================================================
 
-if USE_BALANCED_DATASET:
-    print(f"\n⚖️  Modalità BILANCIATA attiva - target ~{EXAMPLE_NUMBER_FOR_BALANCED} esempi per classe")
-    # raggruppa frasi per classe se contengono almeno
-    # un'entità di quella classe. Per ogni classe si estraggono fino a
-    # EXAMPLE_NUMBER_FOR_BALANCED esempi casuali. Una stessa frase può
-    # comparire in più classi se contiene più entità diverse.
-
-    label_counts = Counter()
-    for ex in encoded_dataset:
-        for l in ex["labels"].tolist():
-            if l != -100:
-                label_counts[l] += 1
-
-    non_o_labels = [lid for lid in label_counts if id2label[lid] != "O"]
-    if non_o_labels:
-        min_count = min(label_counts[lid] for lid in non_o_labels)
-        target_per_class = EXAMPLE_NUMBER_FOR_BALANCED
-
-    balanced_examples = defaultdict(list)
-    for ex in encoded_dataset:
-        present = {l for l in ex["labels"].tolist() if l != -100 and id2label.get(l, "O") != "O"}
-        for lid in present:
-            balanced_examples[lid].append(ex)
-
-    balanced_dataset = []
-    for lid in non_o_labels:
-        random.shuffle(balanced_examples[lid])
-        balanced_dataset.extend(balanced_examples[lid][:target_per_class])
-
-    final_dataset = balanced_dataset
-    print(f"✅ Dataset bilanciato con {len(final_dataset)} frasi (~{target_per_class} per classe)")
-
-else:
-    print(f"\n📊 Modalità SEMPLICE attiva - primi {SIMPLE_DATASET_SIZE} esempi")
-    final_dataset = encoded_dataset[:SIMPLE_DATASET_SIZE]
-    print(f"✅ Dataset semplice con {len(final_dataset)} frasi (primi {SIMPLE_DATASET_SIZE} esempi)")
+print(f"\n📊 Selezione primi {TRAIN_DATASET_SIZE} esempi")
+final_dataset = encoded_dataset[:TRAIN_DATASET_SIZE]
+print(f"✅ Dataset con {len(final_dataset)} frasi")
 
 # ===============================================================
 # 7️⃣ ESPORTAZIONE IN JSON (SOLO tokens, labels)
@@ -258,9 +227,7 @@ for ex in final_dataset:
         "labels": labels
     })
 
-# Modifica il nome del file in base alla modalità
-filename = "dataset_tokenlevel_balanced.json" if USE_BALANCED_DATASET else "dataset_tokenlevel_simple.json"
-out_path = f"dataset/{filename}"
+out_path = "dataset/dataset_tokenlevel_simple.json"
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(records, f, indent=2, ensure_ascii=False)
@@ -305,7 +272,7 @@ for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding")
 print(f"\n✅ Creati {len(test_encoded_dataset)} esempi test token-level.")
 
 random.seed(42)
-test_sampled = random.sample(test_encoded_dataset, TEST_SAMPLE_SIZE)
+test_sampled = random.sample(test_encoded_dataset, TEST_DATASET_SIZE)
 
 test_records = []
 for ex in test_sampled:
