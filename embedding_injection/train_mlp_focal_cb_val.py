@@ -22,7 +22,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================================
 TRAIN_PROJECTION = True
 BATCH_SIZE = 128
-EPOCHS = 25
+EPOCHS = 30
 
 # LEARNING RATES SEPARATI
 LR_MLP = 0.002
@@ -44,16 +44,16 @@ WEIGHT_STRATEGY = "ClassBalanced"
 VALIDATION_RATIO = 0.1
 EARLY_STOPPING_PATIENCE = 5
 
-if is_running_on_kaggle():
-    input_dir = "/kaggle/input/standard16600/"
-    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
-else:
-    input_dir = "../dataset/"
-    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
 
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
-LABEL2ID_PATH = input_dir + "label2id.json"    
+LABEL2ID_PATH = input_dir + "label2id.json"
+
+if is_running_on_kaggle():
+    MODEL_NAME = '/kaggle/input/glinerbismall2/' 
+else:
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
 

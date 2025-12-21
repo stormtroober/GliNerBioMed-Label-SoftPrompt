@@ -23,12 +23,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================================
 TRAIN_PROJECTION = True
 BATCH_SIZE = 128
-EPOCHS = 15
+EPOCHS = 15 # Reduced for Optuna speed (can be increased)
+# LR and GAMMA will be optimized by Optuna
 
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.011641058260782156
 GRAD_CLIP = 1.0
-WARMUP_RATIO = 0.1
+WARMUP_RATIO = 0.1 # Fixed roughly based on previous
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
@@ -40,7 +41,7 @@ WEIGHT_STRATEGY = "ClassBalanced"
 VALIDATION_RATIO = 0.1
 EARLY_STOPPING_PATIENCE = 5
 
-input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else "../dataset/"
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
 
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"

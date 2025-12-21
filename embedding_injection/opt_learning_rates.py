@@ -6,34 +6,32 @@ import os
 import numpy as np
 import optuna
 from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from collections import Counter
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score
 from gliner import GLiNER
 
 # ==========================================
-# 🔧 PARAMETRI FISSI (Dalle ricerche precedenti)
+# 🔧 CONFIGURAZIONE FISSA (Dai tuoi risultati precedenti)
 # ==========================================
-PROMPT_LEN = 32         
-POOLING_MODE = "conv1d" 
-FIXED_LR_MLP = 0.002     
-FIXED_LR_PROJ = 0.002    
-
-# Loss Params Fixed
-CB_BETA = 0.9999
-FOCAL_GAMMA = 5.0
-TEMP = 0.0116
+PROMPT_LEN = 32          # <--- INSERISCI QUI IL VINCITORE DELLA RICERCA PRECEDENTE
+POOLING_MODE = "conv1d"  # <--- INSERISCI QUI IL VINCITORE DELLA RICERCA PRECEDENTE
 
 BATCH_SIZE = 64
-EPOCHS = 6
+EPOCHS = 6 # Bastano poche epoche per vedere se l'LR converge
 WEIGHT_DECAY = 0.01
+TEMPERATURE = 0.011641058260782156       # Valore fisso da ottimizzazione precedente
+GAMMA_FOCAL = 5.0        # Valore fisso da ottimizzazione precedente
+CB_BETA = 0.9999         # Valore fisso da ottimizzazione precedente
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VALIDATION_RATIO = 0.1
 
 def is_running_on_kaggle(): return os.path.exists('/kaggle/input')
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else "../dataset/"
-DATASET_PATH = input_dir + "../dataset/dataset_tokenlevel_simple.json"
-LABEL2DESC_PATH = input_dir + "../label2desc.json"
-LABEL2ID_PATH = input_dir + "../label2id.json"
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
 MODEL_NAME = '/kaggle/input/glinerbismall2/' if is_running_on_kaggle() else "Ihor/gliner-biomed-bi-small-v1.0"
 
 # ==========================================================
@@ -54,6 +52,9 @@ class PromptPooler(nn.Module):
             self.attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
             self.norm = nn.LayerNorm(embed_dim)
         elif mode == "conv1d":
+            # Conv1D downsampling: apprende come comprimere la sequenza
+            # Usiamo kernel_size e stride calcolati dinamicamente nel forward,
+            # ma qui definiamo i layer convoluzionali
             self.conv_layers = nn.Sequential(
                 nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
                 nn.GELU(),
@@ -62,6 +63,8 @@ class PromptPooler(nn.Module):
             self.adaptive_pool = nn.AdaptiveAvgPool1d(prompt_len)
             self.norm = nn.LayerNorm(embed_dim)
         elif mode == "conv1d_strided":
+            # Versione più aggressiva con stride learnable
+            # Usa una singola convoluzione con kernel grande per catturare contesto
             self.conv = nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2)
             self.adaptive_pool = nn.AdaptiveAvgPool1d(prompt_len)
             self.norm = nn.LayerNorm(embed_dim)
@@ -76,7 +79,7 @@ class PromptPooler(nn.Module):
         B, seq_len, dim = x.shape
         
         if self.mode in ["adaptive_avg", "adaptive_max"]:
-            x_t = x.transpose(1, 2)
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(1).float()
                 if self.mode == "adaptive_avg":
@@ -84,7 +87,7 @@ class PromptPooler(nn.Module):
                 else:
                     x_t = x_t.masked_fill(mask_expanded == 0, float('-inf'))
             pooled = self.pooler(x_t)
-            return pooled.transpose(1, 2)
+            return pooled.transpose(1, 2)  # (B, prompt_len, dim)
         
         elif self.mode == "attention":
             queries = self.queries.expand(B, -1, -1)
@@ -95,26 +98,29 @@ class PromptPooler(nn.Module):
             return self.norm(attn_out + queries)
         
         elif self.mode == "conv1d":
+            # Applica mask prima della convoluzione
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).float()
                 x = x * mask_expanded
             
-            x_t = x.transpose(1, 2)
-            conv_out = self.conv_layers(x_t)
-            pooled = self.adaptive_pool(conv_out)
-            pooled = pooled.transpose(1, 2)
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
+            conv_out = self.conv_layers(x_t)  # (B, dim, seq_len)
+            pooled = self.adaptive_pool(conv_out)  # (B, dim, prompt_len)
+            pooled = pooled.transpose(1, 2)  # (B, prompt_len, dim)
             return self.norm(pooled)
         
         elif self.mode == "conv1d_strided":
+            # Versione con gating mechanism
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).float()
                 x = x * mask_expanded
             
-            x_t = x.transpose(1, 2)
-            conv_out = self.conv(x_t)
-            pooled = self.adaptive_pool(conv_out)
-            pooled = pooled.transpose(1, 2)
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
+            conv_out = self.conv(x_t)  # (B, dim, seq_len)
+            pooled = self.adaptive_pool(conv_out)  # (B, dim, prompt_len)
+            pooled = pooled.transpose(1, 2)  # (B, prompt_len, dim)
             
+            # Gating: permette al modello di decidere quanto "fidarsi" della convoluzione
             gate = self.gate(pooled)
             pooled = pooled * gate
             
@@ -161,7 +167,6 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.alpha = alpha 
-        print(f"🔧 FocalLoss initialized with Gamma={gamma}")
 
     def forward(self, input, target):
         ce_loss = F.cross_entropy(input, target, reduction='none', ignore_index=self.ignore_index)
@@ -175,9 +180,35 @@ class FocalLoss(nn.Module):
         if self.reduction == 'mean': return focal_loss.mean()
         return focal_loss.sum()
 
-# ==========================================================
-# 3️⃣ DATASET
-# ==========================================================
+# ... Load Data & Model ...
+print("📦 Loading Backbone...")
+model = GLiNER.from_pretrained(MODEL_NAME)
+core = model.model
+txt_enc = core.token_rep_layer.bert_layer.model
+lbl_enc = core.token_rep_layer.labels_encoder.model
+proj = core.token_rep_layer.labels_projection
+txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
+lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
+
+for p in txt_enc.parameters(): p.requires_grad = False
+for p in lbl_enc.parameters(): p.requires_grad = False
+# Reset proj state later
+initial_proj_state = {k: v.clone() for k, v in proj.state_dict().items()}
+
+txt_enc.to(DEVICE)
+lbl_enc.to(DEVICE)
+proj.to(DEVICE)
+
+# Setup Dataset & Weights (Fixed for this run)
+with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
+with open(LABEL2ID_PATH) as f: label2id = json.load(f)
+# ... (Codice caricamento descrizioni identico al precedente) ...
+label_names = [k for k in label2id.keys()] # Simplification
+desc_texts = [label2desc[name] for name in label_names]
+desc_inputs = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True)
+desc_input_ids = desc_inputs["input_ids"].to(DEVICE)
+desc_attn_mask = desc_inputs["attention_mask"].to(DEVICE)
+
 class TokenJsonDataset(Dataset):
     def __init__(self, path_json, tokenizer):
         with open(path_json, "r", encoding="utf-8") as f: self.records = json.load(f)
@@ -205,89 +236,60 @@ def collate_batch(batch, pad_id):
         labels[i, :L] = ex["labels"]
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
-# ==========================================================
-# 4️⃣ LOAD MODEL & DATA
-# ==========================================================
-print("📦 Loading Backbone...")
-model = GLiNER.from_pretrained(MODEL_NAME)
-core = model.model
-txt_enc = core.token_rep_layer.bert_layer.model
-lbl_enc = core.token_rep_layer.labels_encoder.model
-proj = core.token_rep_layer.labels_projection
-txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
-lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
+# Pre-calculate weights (FISSI per questo esperimento)
+def get_cb_weights_simple(path, l2id, dev, beta):
+    with open(path) as f: data = json.load(f)
+    cnt = Counter([l for r in data for l in r["labels"] if l != -100])
+    weights = torch.ones(len(l2id)).to(dev)
+    for l_id in l2id.values():
+        c = cnt.get(l_id, 0)
+        weights[l_id] = (1-beta)/(1-beta**c) if c > 0 else 0
+    return weights / weights.sum() * len(l2id)
 
-for p in txt_enc.parameters(): p.requires_grad = False
-for p in lbl_enc.parameters(): p.requires_grad = False
-initial_proj_state = {k: v.clone() for k, v in proj.state_dict().items()}
+class_weights = get_cb_weights_simple(DATASET_PATH, label2id, DEVICE, CB_BETA)
 
-txt_enc.to(DEVICE)
-lbl_enc.to(DEVICE)
-proj.to(DEVICE)
+# Load FULL dataset
+full_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+dataset_size = len(full_ds)
 
-# Load labels
-with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)
-with open(LABEL2ID_PATH) as f: label2id = json.load(f)
+# SPLIT TRAIN/VALIDATION
+val_size = int(dataset_size * VALIDATION_RATIO)
+train_size = dataset_size - val_size
 
-label_names = [k for k in label2id.keys()]
-desc_texts = [label2desc[name] for name in label_names]
-desc_inputs = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True)
-desc_input_ids = desc_inputs["input_ids"].to(DEVICE)
-desc_attn_mask = desc_inputs["attention_mask"].to(DEVICE)
+# Si usa un generator con seed fisso per riproducibilità dello split
+generator = torch.Generator().manual_seed(42)
+train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=generator)
 
-# Load dataset
-ds = TokenJsonDataset(DATASET_PATH, txt_tok)
-train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, 
+# LOADERS
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
                           collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                        collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
 
-# Pre-calcoliamo i count
-with open(DATASET_PATH) as f: raw_data = json.load(f)
-global_counts = Counter([l for r in raw_data for l in r["labels"] if l != -100])
-
-# Funzione Helper per ricalcolare pesi al volo
-def get_weights_dynamic(label_counts, num_classes, beta, device):
-    weights = torch.ones(num_classes).to(device)
-    for lid, count in label_counts.items():
-        if count > 0:
-            eff_num = (1.0 - np.power(beta, count)) / (1.0 - beta)
-            weights[lid] = 1.0 / eff_num
-        else:
-            weights[lid] = 0.0
-    return weights / weights.sum() * num_classes
+print(f"🔪 Dataset Split: {len(train_ds)} Train | {len(val_ds)} Val")
 
 # ==========================================
-# 🎯 OPTUNA OBJECTIVE: SCHEDULER
+# 🎯 OPTUNA OBJECTIVE: LEARNING RATES
 # ==========================================
 def objective(trial):
-    # 1. FIXED PARAMS (from reports)
-    beta = CB_BETA 
-    gamma = FOCAL_GAMMA
-    temperature = TEMP
-
-    # 2. SUGGEST SCHEDULER PARAMS
-    scheduler_type = trial.suggest_categorical("scheduler", ["linear", "cosine", "step", "plateau"])
+    # 1. SUGGEST PARAMETERS
+    # LR MLP: Cerca tra 1e-5 e 1e-2 in scala logaritmica
+    lr_mlp = trial.suggest_float("lr_mlp", 1e-5, 1e-2, log=True)
     
-    scheduler_params = {}
-    if scheduler_type == "linear":
-        scheduler_params["warmup_ratio"] = trial.suggest_float("warmup_ratio", 0.0, 0.3)
-    elif scheduler_type == "cosine":
-        scheduler_params["warmup_ratio"] = trial.suggest_float("warmup_ratio", 0.0, 0.3)
-        scheduler_params["min_lr_ratio"] = trial.suggest_float("min_lr_ratio", 0.0, 0.2)
-    elif scheduler_type == "step":
-        scheduler_params["step_size"] = trial.suggest_int("step_size", 1, EPOCHS-1)
-        scheduler_params["gamma"] = trial.suggest_float("gamma", 0.1, 0.9)
-    elif scheduler_type == "plateau":
-        scheduler_params["patience"] = trial.suggest_int("patience", 1, 3)
-        scheduler_params["factor"] = trial.suggest_float("factor", 0.1, 0.9)
-
-    print(f"\n🧪 TRIAL {trial.number} | Scheduler: {scheduler_type} | Params: {scheduler_params}")
-
-    # 3. SETUP MODEL & OPTIMIZER
-    # Loss Weights
-    current_weights = get_weights_dynamic(global_counts, len(label2id), beta, DEVICE)
-    loss_fn = FocalLoss(alpha=current_weights, gamma=gamma)
+    # STRATEGIA PROJECTION LR: 
+    # Optuna decide se disaccoppiare gli LR o tenerli uguali
+    uncouple = trial.suggest_categorical("uncouple_lr", [True, False])
     
-    # Model Reset
+    if uncouple:
+        # Se disaccoppiati, cerca un LR specifico per la projection
+        lr_proj = trial.suggest_float("lr_proj", 1e-5, 1e-2, log=True)
+    else:
+        # Altrimenti usa lo stesso
+        lr_proj = lr_mlp
+
+    print(f"\n🧪 TRIAL {trial.number} | LR MLP: {lr_mlp:.2e} | LR PROJ: {lr_proj:.2e}")
+
+    # 2. SETUP MODEL
     proj.load_state_dict(initial_proj_state)
     proj.train()
     
@@ -301,99 +303,103 @@ def objective(trial):
     ).to(DEVICE)
     model_encoder.train()
     
+    # 3. OPTIMIZER
     optimizer = optim.AdamW([
-        {"params": model_encoder.parameters(), "lr": FIXED_LR_MLP},
-        {"params": proj.parameters(), "lr": FIXED_LR_PROJ}
+        {"params": model_encoder.parameters(), "lr": lr_mlp},
+        {"params": proj.parameters(), "lr": lr_proj}
     ], weight_decay=WEIGHT_DECAY)
     
-    # 4. SETUP SCHEDULER
-    num_training_steps = len(train_loader) * EPOCHS
-    scheduler = None
-    step_scheduler_in_batch = False # True for linear/cosine, False for step/plateau
+    scheduler = get_linear_schedule_with_warmup(optimizer, 
+                                                num_warmup_steps=int(len(train_loader)*EPOCHS*0.1), 
+                                                num_training_steps=len(train_loader)*EPOCHS)
     
-    if scheduler_type == "linear":
-        num_warmup_steps = int(num_training_steps * scheduler_params["warmup_ratio"])
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-        step_scheduler_in_batch = True
-        
-    elif scheduler_type == "cosine":
-        num_warmup_steps = int(num_training_steps * scheduler_params["warmup_ratio"])
-        # Handling min_lr via Transformers cosine isn't direct in get_cosine_schedule_with_warmup generally (it goes to 0), 
-        # but torch.optim.lr_scheduler.CosineAnnealingLR supports eta_min. 
-        # But let's stick to transformers one for consistency if possible, or use custom lambda. 
-        # Simpler: use Transformers get_cosine_schedule_with_warmup (goes to 0) but maybe that's fine.
-        # If user wants "min_lr_ratio", maybe I should use Torch's CosineAnnealingWarmRestarts or similar?
-        # Let's stick to standard transformers cosine for now, but maybe ignore min_lr_ratio if library doesn't support it easily 
-        # OR use CosineAnnealingLR from torch.
-        # Let's use Torch CosineAnnealingLR for proper min_lr support. 
-        # NOTE: Torch schedulers usually step per epoch, but CosineAnnealingLR can step per iteration if T_max is total steps.
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, 
-                                                         T_max=num_training_steps, 
-                                                         eta_min=FIXED_LR_MLP * scheduler_params["min_lr_ratio"])
-        step_scheduler_in_batch = True
-        
-    elif scheduler_type == "step":
-        scheduler = optim.lr_scheduler.StepLR(optimizer, 
-                                              step_size=scheduler_params["step_size"], 
-                                              gamma=scheduler_params["gamma"])
-        step_scheduler_in_batch = False # Step at epoch end
-        
-    elif scheduler_type == "plateau":
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
-                                                         mode='min', 
-                                                         patience=scheduler_params["patience"], 
-                                                         factor=scheduler_params["factor"])
-        step_scheduler_in_batch = False # Step at epoch end with metric
+    loss_fn = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL)
 
-    # 5. TRAINING LOOP
+    # 4. TRAINING LOOP
+    best_val_f1 = 0.0
+    
     for epoch in range(EPOCHS):
+        # --- TRAIN ---
+        model_encoder.train()
+        proj.train()
         total_loss = 0
+        
         for batch in train_loader:
             optimizer.zero_grad()
             batch = {k: v.to(DEVICE) for k,v in batch.items()}
             
             with torch.no_grad():
-                # Text Encoder
                 H_text = F.normalize(txt_enc(batch["input_ids"], batch["attention_mask"]).last_hidden_state, dim=-1)
             
-            # Prompt Encoder
+            # Encoder
             desc_embeds = model_encoder(desc_input_ids, desc_attn_mask)
             pooled_mask = torch.ones(desc_embeds.shape[:2], device=DEVICE).long() if PROMPT_LEN else desc_attn_mask
             
-            # Label Encoder
+            # Label Enc
             lbl_out = lbl_enc(inputs_embeds=desc_embeds, attention_mask=pooled_mask).last_hidden_state
             mask_exp = pooled_mask.unsqueeze(-1).float()
+            # Mean pooling manuale per sicurezza
             pooled = (lbl_out * mask_exp).sum(1) / mask_exp.sum(1).clamp(min=1e-9)
             H_label = F.normalize(proj(pooled), dim=-1)
             
-            # Logits & Loss
-            logits = torch.matmul(H_text, H_label.T) / temperature
+            logits = torch.matmul(H_text, H_label.T) / TEMPERATURE
             loss = loss_fn(logits.view(-1, len(label2id)), batch["labels"].view(-1))
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model_encoder.parameters(), 1.0)
             optimizer.step()
-            
-            if step_scheduler_in_batch and scheduler is not None:
-                scheduler.step()
-                
+            scheduler.step()
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
+        # --- VALIDATION (End of Epoch) ---
+        model_encoder.eval()
+        proj.eval()
         
-        # Epoch Checkpoint
-        if not step_scheduler_in_batch and scheduler is not None:
-            if scheduler_type == "plateau":
-                scheduler.step(avg_loss)
-            else:
-                scheduler.step()
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(DEVICE) for k,v in batch.items()}
                 
-        trial.report(avg_loss, epoch)
-        if trial.should_prune(): raise optuna.TrialPruned()
+                H_text = F.normalize(txt_enc(batch["input_ids"], batch["attention_mask"]).last_hidden_state, dim=-1)
+                
+                desc_embeds = model_encoder(desc_input_ids, desc_attn_mask)
+                pooled_mask = torch.ones(desc_embeds.shape[:2], device=DEVICE).long() if PROMPT_LEN else desc_attn_mask
+                
+                lbl_out = lbl_enc(inputs_embeds=desc_embeds, attention_mask=pooled_mask).last_hidden_state
+                mask_exp = pooled_mask.unsqueeze(-1).float()
+                pooled = (lbl_out * mask_exp).sum(1) / mask_exp.sum(1).clamp(min=1e-9)
+                H_label = F.normalize(proj(pooled), dim=-1)
+                
+                logits = torch.matmul(H_text, H_label.T) / TEMPERATURE
+                
+                # PREDICTIONS
+                preds = torch.argmax(logits, dim=-1)
+                
+                # Masking pad/ignore (-100)
+                active_loss = batch["labels"].view(-1) != -100
+                active_labels = batch["labels"].view(-1)[active_loss]
+                active_preds = preds.view(-1)[active_loss]
+                
+                all_preds.extend(active_preds.cpu().numpy())
+                all_labels.extend(active_labels.cpu().numpy())
         
-    return avg_loss
+        # CALCOLO MICRO F1 (Più sensibile per ranking generale)
+        # O Macro F1 se preferisci bilanciamento classi
+        val_f1 = f1_score(all_labels, all_preds, average='macro')
+        
+        # Report & Pruning su F1 (Maximize)
+        trial.report(val_f1, epoch)
+        if trial.should_prune(): 
+            raise optuna.TrialPruned()
+            
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            
+    return best_val_f1
 
 if __name__ == "__main__":
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=30)
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
     print(f"🏆 BEST PARAMS: {study.best_params}")

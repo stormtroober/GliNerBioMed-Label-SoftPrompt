@@ -44,22 +44,11 @@ echo "2. Calcolo punteggi combinati..."
 for file in *.md; do
     [ -e "$file" ] || continue
 
-    # Estrae Macro F1 (Formato Standard)
-    # Cerca la riga con "**Macro F1**" e prende la 3a colonna
-    macro_f1=$(grep -F "**Macro F1**" "$file" | awk -F'|' '{print $3}' | sed 's/\*\*//g' | tr -d ' ')
+    # Estrae Macro F1, rimuovendo eventuali ** per compatibilità con nuovi formati
+    macro_f1=$(grep "**Macro F1**" "$file" | awk -F'|' '{print $3}' | sed 's/\*\*//g' | tr -d ' ')
     
-    # Se vuoto, prova il Formato No-O (Tabella più larga: Precision | Recall | F1)
-    if [ -z "$macro_f1" ]; then
-        macro_f1=$(grep -F "**Macro**" "$file" | awk -F'|' '{print $5}' | sed 's/\*\*//g' | tr -d ' ')
-    fi
-
-    # Estrae Micro F1 (Formato Standard)
-    micro_f1=$(grep -F "**Micro F1**" "$file" | awk -F'|' '{print $3}' | sed 's/\*\*//g' | tr -d ' ')
-
-    # Se vuoto, prova il Formato No-O
-    if [ -z "$micro_f1" ]; then
-        micro_f1=$(grep -F "**Micro**" "$file" | awk -F'|' '{print $5}' | sed 's/\*\*//g' | tr -d ' ')
-    fi
+    # Estrae Micro F1, rimuovendo eventuali ** per compatibilità con nuovi formati
+    micro_f1=$(grep "**Micro F1**" "$file" | awk -F'|' '{print $3}' | sed 's/\*\*//g' | tr -d ' ')
 
     # Gestione errori se i valori mancano
     if [ -z "$macro_f1" ]; then macro_f1="0"; fi

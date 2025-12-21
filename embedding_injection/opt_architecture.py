@@ -41,7 +41,7 @@ CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
 # Paths
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else "../dataset/"
+input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else ""
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"

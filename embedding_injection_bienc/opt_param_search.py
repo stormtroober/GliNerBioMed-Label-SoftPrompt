@@ -26,7 +26,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 VALIDATION_RATIO = 0.1
 
 def is_running_on_kaggle(): return os.path.exists('/kaggle/input')
-input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else "../dataset/"
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"

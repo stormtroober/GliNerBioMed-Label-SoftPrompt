@@ -21,9 +21,8 @@ import datetime
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-prefix = "../dataset/"
-TEST_PATH = prefix + "test_dataset_tokenlevel.json"
-LABEL2ID_PATH = prefix + "label2id.json"
+TEST_PATH = "../dataset/test_dataset_tokenlevel.json"
+LABEL2ID_PATH = "../label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 OUTPUT_DIR = "test_results"
 

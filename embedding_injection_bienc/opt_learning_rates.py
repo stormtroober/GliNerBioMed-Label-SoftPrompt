@@ -15,20 +15,20 @@ from gliner import GLiNER
 # ==========================================
 # 🔧 CONFIGURAZIONE FISSA (Dai tuoi risultati precedenti)
 # ==========================================
-PROMPT_LEN = 32          # <--- INSERISCI QUI IL VINCITORE DELLA RICERCA PRECEDENTE
-POOLING_MODE = "conv1d"  # <--- INSERISCI QUI IL VINCITORE DELLA RICERCA PRECEDENTE
+PROMPT_LEN = 32
+POOLING_MODE = "conv1d"
 
 BATCH_SIZE = 64
-EPOCHS = 6 # Bastano poche epoche per vedere se l'LR converge
+EPOCHS = 6
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.011641058260782156       # Valore fisso da ottimizzazione precedente
-GAMMA_FOCAL = 5.0        # Valore fisso da ottimizzazione precedente
-CB_BETA = 0.9999         # Valore fisso da ottimizzazione precedente
+TEMPERATURE = 0.011641058260782156
+GAMMA_FOCAL = 5.0
+CB_BETA = 0.9999
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 VALIDATION_RATIO = 0.1
 
 def is_running_on_kaggle(): return os.path.exists('/kaggle/input')
-input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else "../dataset/"
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"

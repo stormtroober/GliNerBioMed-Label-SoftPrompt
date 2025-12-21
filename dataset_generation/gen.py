@@ -3,6 +3,7 @@
 Generazione dataset token-level BIO-aware con allineamento subtoken
 per GLiNER-BioMed (bi-encoder token-level training).
 Include generazione di label2desc.json e label2id.json.
+Supporta generazione Multipla (Mono e Bi-Encoder).
 """
 
 import pandas as pd
@@ -32,8 +33,6 @@ print(f"✅ Pile-NER descrizioni caricato — {len(df_labels)} descrizioni total
 
 # Etichette di interesse
 target_labels = {"cell line", "cell type", "dna", "protein", "rna"}
-
-#print(f"🔍 Etichette trovate nel dataset: {df_labels['entity_type'].unique().tolist()}")
 
 # Filtra solo le descrizioni corrispondenti
 df_labels_filtered = df_labels[df_labels["entity_type"].str.lower().isin(target_labels)]
@@ -65,28 +64,7 @@ print("✅ label2desc.json e label2id.json salvati")
 print(f"📊 Etichette definite: {list(label2id.keys())}")
 
 # ===============================================================
-# 2️⃣ CONFIGURAZIONE TOKENIZER
-# ===============================================================
-print("\n📥 Caricamento tokenizer...")
-id2label = {v: k for k, v in label2id.items()}
-
-TOKENIZER_NAME = "microsoft/deberta-v3-small"
-
-# Suppress warnings about potential byte fallback issues when converting slow tokenizer to fast one
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="transformers.convert_slow_tokenizer")
-
-tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-
-splits = {
-    "train": "data/train-00000-of-00001.parquet",
-    "test": "data/test-00000-of-00001.parquet"
-}
-df_data = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["train"])
-df = df_data.copy()
-
-# ===============================================================
-# 3️⃣ MAPPATURA BIO → LABEL BASE
+# UTILS DI TOKENIZZAZIONE
 # ===============================================================
 BIO2BASE = {
     "DNA": "dna",
@@ -97,72 +75,14 @@ BIO2BASE = {
 }
 
 def parse_bio_tag(tag: str):
-    if tag == "O":
-        return ("O", "O")
+    if tag == "O": return ("O", "O")
     pref, _, typ = tag.partition("-")
     base = BIO2BASE.get(typ.upper().replace("-", " "), typ.lower())
     return (pref, base or "O")
 
-# ===============================================================
-# ANALISI COMPOSIZIONE DATASET JNLPBA COMPLETO
-# ===============================================================
-print("\n" + "="*60)
-print("📊 ANALISI COMPOSIZIONE DATASET JNLPBA COMPLETO")
-print("="*60)
-
-bio_tag_counts = Counter()
-base_label_counts = Counter()
-entity_counts = Counter()
-total_tokens = 0
-
-for _, row in df.iterrows():
-    bio_tags = list(row["ner_tags"])
-    total_tokens += len(bio_tags)
-    
-    current_entity = None
-    for tag in bio_tags:
-        bio_tag_counts[tag] += 1
-        pref, base = parse_bio_tag(tag)
-        
-        if base != "O":
-            base_label_counts[base] += 1
-        else:
-            base_label_counts["O"] += 1
-        
-        # Conta entità complete (ogni B- inizia una nuova entità)
-        if pref == "B":
-            entity_counts[base] += 1
-
-print(f"\n📈 Totale token: {total_tokens:,}")
-print(f"📈 Totale frasi: {len(df):,}")
-
-print("\n🏷️  DISTRIBUZIONE ETICHETTE BIO COMPLETE:")
-for tag, count in bio_tag_counts.most_common():
-    percentage = (count / total_tokens) * 100
-    print(f"  {tag:20s}: {count:8,} ({percentage:5.2f}%)")
-
-print("\n🏷️  DISTRIBUZIONE ETICHETTE BASE:")
-for label, count in base_label_counts.most_common():
-    percentage = (count / total_tokens) * 100
-    print(f"  {label:20s}: {count:8,} ({percentage:5.2f}%)")
-
-print("\n🎯 NUMERO DI ENTITÀ PER CLASSE:")
-total_entities = sum(entity_counts.values())
-for label, count in entity_counts.most_common():
-    percentage = (count / total_entities) * 100
-    print(f"  {label:20s}: {count:6,} entità ({percentage:5.2f}%)")
-print(f"  {'TOTALE':20s}: {total_entities:6,} entità")
-
-print("="*60 + "\n")
-
-# ===============================================================
-# 4️⃣ TOKENIZZAZIONE + ALLINEAMENTO (BIO-AWARE)
-# ===============================================================
 def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
     """
     Tokenizza e allinea le label a livello di subtoken.
-      - B/I → label valida anche sui subtokens (no -100 interni)
-      - Special tokens ([CLS]/[SEP]) → -100
     """
     assert len(words) == len(bio_tags)
     bio_info = [parse_bio_tag(t) for t in bio_tags]
@@ -189,126 +109,146 @@ def encode_and_align_labels(words, bio_tags, tokenizer, label2id):
     enc["labels"] = torch.tensor(labels_subtok, dtype=torch.long)
     return enc
 
-# ===============================================================
-# 5️⃣ COSTRUZIONE DEL DATASET
-# ===============================================================
-print("\nCostruzione dataset token-level allineato...")
-
-encoded_dataset = []
-for _, row in tqdm(df.iterrows(), total=len(df)):
-    words = list(row["tokens"])
-    bio_tags = list(row["ner_tags"])
-    if not words or not bio_tags or len(words) != len(bio_tags):
-        continue
-    ex = encode_and_align_labels(words, bio_tags, tokenizer, label2id)
-    encoded_dataset.append(ex)
-
-print(f"\n✅ Creati {len(encoded_dataset)} esempi token-level.")
-
-# ===============================================================
-# 6️⃣ SELEZIONE DATASET
-# ===============================================================
-
-print(f"\n📊 Selezione primi {TRAIN_DATASET_SIZE} esempi")
-final_dataset = encoded_dataset[:TRAIN_DATASET_SIZE]
-print(f"✅ Dataset con {len(final_dataset)} frasi")
-
-# ===============================================================
-# 7️⃣ ESPORTAZIONE IN JSON (SOLO tokens, labels)
-# ===============================================================
-records = []
-for ex in final_dataset:
-    input_ids = ex["input_ids"].tolist()
-    labels = ex["labels"].tolist()
-    # Esportiamo SOLO i campi necessari al training:
-    tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-    records.append({
-        "tokens": tokens,
-        "labels": labels
-    })
-
-out_path = "dataset/dataset_tokenlevel_simple.json"
-os.makedirs(os.path.dirname(out_path), exist_ok=True)
-with open(out_path, "w", encoding="utf-8") as f:
-    json.dump(records, f, indent=2, ensure_ascii=False)
-
-print(f"💾 Salvato in: {out_path} ({len(records)} esempi)")
-
-# ===============================================================
-# 8️⃣ VERIFICA
-# ===============================================================
-def verify_final_dataset(records):
+def verify_dataset_stats(records, name):
     total, ignored, valid = 0, 0, 0
     for rec in records:
         for lab in rec["labels"]:
             total += 1
-            if lab == -100:
-                ignored += 1
-            else:
-                valid += 1
-    print(f"\n📊 Tot token: {total} | Label valide: {valid/total*100:.1f}% | Ignorate: {ignored/total*100:.1f}%")
-
-verify_final_dataset(records)
-print("\n✅ Fine generazione dataset allineato.")
+            if lab == -100: ignored += 1
+            else: valid += 1
+    if total > 0:
+        print(f"📊 {name} Stats - Valid: {valid/total*100:.1f}% | Ignored: {ignored/total*100:.1f}%")
 
 # ===============================================================
-# 9️⃣ GENERAZIONE TEST SET (SOLO tokens, labels)
+# 2️⃣ FUNZIONE CORE DI GENERAZIONE
 # ===============================================================
-print("\n📥 Caricamento test split JNLPBA...")
+def generate_for_model(model_name, output_suffix, label2id, df_train, df_test, train_size, test_size):
+    print(f"\n" + "="*60)
+    print(f"🤖 GENERAZIONE DATASET PER: {model_name}")
+    print(f"📂 Suffix output: {output_suffix}")
+    print("="*60)
+
+    try:
+        # Load specific tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except Exception as e:
+        print(f"⚠️ Errore caricamento tokenizer per {model_name}: {e}")
+        return
+
+    # --- TRAIN SET ---
+    print(f"\n⚙️  [TRAIN] Tokenizzazione e allineamento...")
+    encoded_dataset = []
+    
+    # Process only enough records to satisfy TRAIN_DATASET_SIZE * buffer? 
+    # To correspond exactly to previous logic, we process ALL df (expensive?) 
+    # or just enough. Previous script processed ALL. Let's process ALL.
+    
+    for _, row in tqdm(df_train.iterrows(), total=len(df_train), desc="Train encoding"):
+        words = list(row["tokens"])
+        bio_tags = list(row["ner_tags"])
+        if not words or not bio_tags or len(words) != len(bio_tags):
+            continue
+        ex = encode_and_align_labels(words, bio_tags, tokenizer, label2id)
+        encoded_dataset.append(ex)
+
+    final_dataset = encoded_dataset[:train_size]
+    
+    train_records = []
+    for ex in final_dataset:
+        input_ids = ex["input_ids"].tolist()
+        labels = ex["labels"].tolist()
+        tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+        train_records.append({"tokens": tokens, "labels": labels})
+
+    out_train = f"dataset/dataset_tknlvl_{output_suffix}.json"
+    os.makedirs(os.path.dirname(out_train), exist_ok=True)
+    with open(out_train, "w", encoding="utf-8") as f:
+        json.dump(train_records, f, indent=2, ensure_ascii=False)
+    print(f"✅ Train set salvato: {out_train} ({len(train_records)} samples)")
+
+    # --- TEST SET ---
+    print(f"\n⚙️  [TEST] Tokenizzazione e allineamento...")
+    test_encoded = []
+    for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding"):
+        words = list(row["tokens"])
+        bio_tags = list(row["ner_tags"])
+        if not words or not bio_tags or len(words) != len(bio_tags):
+            continue
+        ex = encode_and_align_labels(words, bio_tags, tokenizer, label2id)
+        test_encoded.append(ex)
+
+    # Sampling deterministico per confronto equo
+    # Usiamo un generatore locale per non influenzare lo stato globale
+    rng = random.Random(42)
+    
+    if len(test_encoded) > test_size:
+        test_sampled = rng.sample(test_encoded, test_size)
+    else:
+        test_sampled = test_encoded
+
+    test_records = []
+    for ex in test_sampled:
+        input_ids = ex["input_ids"].tolist()
+        labels = ex["labels"].tolist()
+        tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+        test_records.append({"tokens": tokens, "labels": labels})
+
+    out_test = f"dataset/test_dataset_tknlvl_{output_suffix}.json"
+    with open(out_test, "w", encoding="utf-8") as f:
+        json.dump(test_records, f, indent=2, ensure_ascii=False)
+    print(f"✅ Test set salvato: {out_test} ({len(test_records)} samples)")
+    
+    verify_dataset_stats(train_records, f"TRAIN ({output_suffix})")
+
+# ===============================================================
+# 3️⃣ CARICAMENTO DATI RAW (Una volta sola)
+# ===============================================================
+print("\n📥 Caricamento dataset RAW JNLPBA...")
+splits = {
+    "train": "data/train-00000-of-00001.parquet",
+    "test": "data/test-00000-of-00001.parquet"
+}
+# Train Data
+df_train = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["train"])
+
+# Test Data (Load enough to sample from)
 df_test_raw = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["test"])
-df_test = df_test_raw.head(3000).copy()
-print(f"✅ Test set caricato: {len(df_test)} righe")
+df_test = df_test_raw.head(5000).copy() 
 
-print("\n⚙️  Costruzione test set token-level allineato...")
-test_encoded_dataset = []
-for _, row in tqdm(df_test.iterrows(), total=len(df_test), desc="Test encoding"):
-    words = list(row["tokens"])
-    bio_tags = list(row["ner_tags"])
-    if not words or not bio_tags or len(words) != len(bio_tags):
-        continue
-    ex = encode_and_align_labels(words, bio_tags, tokenizer, label2id)
-    test_encoded_dataset.append(ex)
+print(f"✅ Dati Raw caricati. Train: {len(df_train)} | Test Pool: {len(df_test)}")
 
-print(f"\n✅ Creati {len(test_encoded_dataset)} esempi test token-level.")
+# ===============================================================
+# 4️⃣ ESECUZIONE GENERAZIONE MULTIPLA
+# ===============================================================
 
-random.seed(42)
-test_sampled = random.sample(test_encoded_dataset, TEST_DATASET_SIZE)
+# CONFIGURAZIONI TARGET
+configs = [
+    {
+        "model": "microsoft/deberta-v3-small", 
+        "suffix": "mono",
+        "description": "Per Mono-Encoder (urchade/gliner_small-v2.1)"
+    },
+    {
+        "model": "Ihor/gliner-biomed-bi-small-v1.0", 
+        "suffix": "bi",
+        "description": "Per Bi-Encoder (Ihor/gliner-biomed-bi-small-v1.0)"
+    }
+]
 
-test_records = []
-for ex in test_sampled:
-    input_ids = ex["input_ids"].tolist()
-    labels = ex["labels"].tolist()
-    tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
-    test_records.append({
-        "tokens": tokens,
-        "labels": labels
-    })
+# Suppress tokenizer warnings
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers.convert_slow_tokenizer")
 
-test_out_path = "dataset/test_dataset_tokenlevel.json"
-os.makedirs(os.path.dirname(test_out_path), exist_ok=True)
-with open(test_out_path, "w", encoding="utf-8") as f:
-    json.dump(test_records, f, indent=2, ensure_ascii=False)
+for cfg in configs:
+    generate_for_model(
+        model_name=cfg["model"],
+        output_suffix=cfg["suffix"],
+        label2id=label2id,
+        df_train=df_train,
+        df_test=df_test,
+        train_size=TRAIN_DATASET_SIZE,
+        test_size=TEST_DATASET_SIZE
+    )
 
-print(f"💾 Test set salvato in: {test_out_path} ({len(test_records)} esempi)")
-
-# Distribuzione test set (opzionale ma utile)
-def verify_test_dataset(records):
-    total, ignored, valid = 0, 0, 0
-    label_dist = Counter()
-    for rec in records:
-        for lab in rec["labels"]:
-            total += 1
-            if lab == -100:
-                ignored += 1
-            else:
-                valid += 1
-                label_dist[lab] += 1
-    print(f"\n📊 TEST SET - Tot token: {total} | Label valide: {valid/total*100:.1f}% | Ignorate: {ignored/total*100:.1f}%")
-    print("\nDistribuzione etichette nel test set:")
-    for label_id, count in label_dist.most_common():
-        label_name = id2label.get(label_id, f"ID_{label_id}")
-        percentage = (count / max(valid, 1)) * 100
-        print(f"  {label_name:15s}: {count:6d} ({percentage:5.1f}%)")
-
-verify_test_dataset(test_records)
-print("\n✅ Fine generazione test set.")
+print("\n" + "="*60)
+print("✅ TUTTI I DATASET GENERATI CON SUCCESSO")

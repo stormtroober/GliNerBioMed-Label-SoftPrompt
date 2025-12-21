@@ -6,34 +6,30 @@ import os
 import numpy as np
 import optuna
 from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from collections import Counter
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score
 from gliner import GLiNER
-
 # ==========================================
 # 🔧 PARAMETRI FISSI (Dalle ricerche precedenti)
 # ==========================================
-PROMPT_LEN = 32         
-POOLING_MODE = "conv1d" 
-FIXED_LR_MLP = 0.002     
-FIXED_LR_PROJ = 0.002    
-
-# Loss Params Fixed
-CB_BETA = 0.9999
-FOCAL_GAMMA = 5.0
-TEMP = 0.0116
+PROMPT_LEN = 32
+POOLING_MODE = "conv1d"
+FIXED_LR_MLP = 0.002
+FIXED_LR_PROJ = 0.002
 
 BATCH_SIZE = 64
 EPOCHS = 6
 WEIGHT_DECAY = 0.01
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+VALIDATION_RATIO = 0.1
 
 def is_running_on_kaggle(): return os.path.exists('/kaggle/input')
-input_dir = "/kaggle/input/standard5000/" if is_running_on_kaggle() else "../dataset/"
-DATASET_PATH = input_dir + "../dataset/dataset_tokenlevel_simple.json"
-LABEL2DESC_PATH = input_dir + "../label2desc.json"
-LABEL2ID_PATH = input_dir + "../label2id.json"
+input_dir = "/kaggle/input/standard15000/" if is_running_on_kaggle() else ""
+DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+LABEL2DESC_PATH = input_dir + "label2desc.json"
+LABEL2ID_PATH = input_dir + "label2id.json"
 MODEL_NAME = '/kaggle/input/glinerbismall2/' if is_running_on_kaggle() else "Ihor/gliner-biomed-bi-small-v1.0"
 
 # ==========================================================
@@ -161,9 +157,9 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.alpha = alpha 
-        print(f"🔧 FocalLoss initialized with Gamma={gamma}")
 
     def forward(self, input, target):
+        
         ce_loss = F.cross_entropy(input, target, reduction='none', ignore_index=self.ignore_index)
         pt = torch.exp(-ce_loss) 
         mask = target != self.ignore_index
@@ -235,12 +231,27 @@ desc_inputs = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=
 desc_input_ids = desc_inputs["input_ids"].to(DEVICE)
 desc_attn_mask = desc_inputs["attention_mask"].to(DEVICE)
 
-# Load dataset
-ds = TokenJsonDataset(DATASET_PATH, txt_tok)
-train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, 
-                          collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+# Load FULL dataset
+full_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+dataset_size = len(full_ds)
 
-# Pre-calcoliamo i count
+# SPLIT TRAIN/VALIDATION
+val_size = int(dataset_size * VALIDATION_RATIO)
+train_size = dataset_size - val_size
+
+# Si usa un generator con seed fisso per riproducibilità dello split
+generator = torch.Generator().manual_seed(42)
+train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=generator)
+
+# LOADERS
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
+                          collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, 
+                        collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+
+print(f"🔪 Dataset Split: {len(train_ds)} Train | {len(val_ds)} Val")
+
+# Pre-calcoliamo i count una volta sola per velocità (su tutto il dataset o solo train? Meglio train per rigore, ma tutto è ok per i pesi classi)
 with open(DATASET_PATH) as f: raw_data = json.load(f)
 global_counts = Counter([l for r in raw_data for l in r["labels"] if l != -100])
 
@@ -256,41 +267,34 @@ def get_weights_dynamic(label_counts, num_classes, beta, device):
     return weights / weights.sum() * num_classes
 
 # ==========================================
-# 🎯 OPTUNA OBJECTIVE: SCHEDULER
+# 🎯 OPTUNA OBJECTIVE: F1 SCORE (MAXIMIZE)
 # ==========================================
 def objective(trial):
-    # 1. FIXED PARAMS (from reports)
-    beta = CB_BETA 
-    gamma = FOCAL_GAMMA
-    temperature = TEMP
-
-    # 2. SUGGEST SCHEDULER PARAMS
-    scheduler_type = trial.suggest_categorical("scheduler", ["linear", "cosine", "step", "plateau"])
+    # 1. SUGGEST PARAMETERS
     
-    scheduler_params = {}
-    if scheduler_type == "linear":
-        scheduler_params["warmup_ratio"] = trial.suggest_float("warmup_ratio", 0.0, 0.3)
-    elif scheduler_type == "cosine":
-        scheduler_params["warmup_ratio"] = trial.suggest_float("warmup_ratio", 0.0, 0.3)
-        scheduler_params["min_lr_ratio"] = trial.suggest_float("min_lr_ratio", 0.0, 0.2)
-    elif scheduler_type == "step":
-        scheduler_params["step_size"] = trial.suggest_int("step_size", 1, EPOCHS-1)
-        scheduler_params["gamma"] = trial.suggest_float("gamma", 0.1, 0.9)
-    elif scheduler_type == "plateau":
-        scheduler_params["patience"] = trial.suggest_int("patience", 1, 3)
-        scheduler_params["factor"] = trial.suggest_float("factor", 0.1, 0.9)
+    # Class Balanced Beta: valori tipici [0.9, 0.99, 0.999, 0.9999]
+    # Usiamo una selezione categorica perché beta è molto sensibile
+    beta_str = trial.suggest_categorical("cb_beta", ["0.999", "0.9999", "0.99999"])
+    beta = float(beta_str)
+    
+    # Focal Loss Gamma: [0.0 = CrossEntropy standard, 5.0 = Focus estremo su hard examples]
+    gamma = trial.suggest_float("focal_gamma", 4.5, 6.0, step=0.5)
+    
+    # Temperature: [0.01 molto "sharp", 0.1 più "smooth"]
+    temperature = trial.suggest_float("temperature", 0.01, 0.15)
 
-    print(f"\n🧪 TRIAL {trial.number} | Scheduler: {scheduler_type} | Params: {scheduler_params}")
+    print(f"\n🧪 TRIAL {trial.number} | Beta: {beta} | Gamma: {gamma} | Temp: {temperature:.3f}")
 
-    # 3. SETUP MODEL & OPTIMIZER
-    # Loss Weights
+    # 2. CALCOLO PESI DINAMICO
+    # I pesi cambiano in base al Beta scelto nel trial
     current_weights = get_weights_dynamic(global_counts, len(label2id), beta, DEVICE)
     loss_fn = FocalLoss(alpha=current_weights, gamma=gamma)
-    
-    # Model Reset
+
+    # 3. SETUP MODEL & OPTIMIZER (Usa gli LR fissi)
+    # Reset proj weights
     proj.load_state_dict(initial_proj_state)
-    proj.train()
     
+    # Re-init Model Wrapper
     model_encoder = MLPPromptEncoder(
         lbl_enc.embeddings.word_embeddings, 
         vocab_size=lbl_enc.embeddings.word_embeddings.num_embeddings,
@@ -299,101 +303,102 @@ def objective(trial):
         pooling_mode=POOLING_MODE,
         max_seq_len=desc_input_ids.shape[1]
     ).to(DEVICE)
-    model_encoder.train()
     
     optimizer = optim.AdamW([
         {"params": model_encoder.parameters(), "lr": FIXED_LR_MLP},
         {"params": proj.parameters(), "lr": FIXED_LR_PROJ}
-    ], weight_decay=WEIGHT_DECAY)
+    ], weight_decay=0.01)
     
-    # 4. SETUP SCHEDULER
-    num_training_steps = len(train_loader) * EPOCHS
-    scheduler = None
-    step_scheduler_in_batch = False # True for linear/cosine, False for step/plateau
-    
-    if scheduler_type == "linear":
-        num_warmup_steps = int(num_training_steps * scheduler_params["warmup_ratio"])
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-        step_scheduler_in_batch = True
-        
-    elif scheduler_type == "cosine":
-        num_warmup_steps = int(num_training_steps * scheduler_params["warmup_ratio"])
-        # Handling min_lr via Transformers cosine isn't direct in get_cosine_schedule_with_warmup generally (it goes to 0), 
-        # but torch.optim.lr_scheduler.CosineAnnealingLR supports eta_min. 
-        # But let's stick to transformers one for consistency if possible, or use custom lambda. 
-        # Simpler: use Transformers get_cosine_schedule_with_warmup (goes to 0) but maybe that's fine.
-        # If user wants "min_lr_ratio", maybe I should use Torch's CosineAnnealingWarmRestarts or similar?
-        # Let's stick to standard transformers cosine for now, but maybe ignore min_lr_ratio if library doesn't support it easily 
-        # OR use CosineAnnealingLR from torch.
-        # Let's use Torch CosineAnnealingLR for proper min_lr support. 
-        # NOTE: Torch schedulers usually step per epoch, but CosineAnnealingLR can step per iteration if T_max is total steps.
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, 
-                                                         T_max=num_training_steps, 
-                                                         eta_min=FIXED_LR_MLP * scheduler_params["min_lr_ratio"])
-        step_scheduler_in_batch = True
-        
-    elif scheduler_type == "step":
-        scheduler = optim.lr_scheduler.StepLR(optimizer, 
-                                              step_size=scheduler_params["step_size"], 
-                                              gamma=scheduler_params["gamma"])
-        step_scheduler_in_batch = False # Step at epoch end
-        
-    elif scheduler_type == "plateau":
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
-                                                         mode='min', 
-                                                         patience=scheduler_params["patience"], 
-                                                         factor=scheduler_params["factor"])
-        step_scheduler_in_batch = False # Step at epoch end with metric
+    # Scheduler solo per le epoch previste
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = get_linear_schedule_with_warmup(optimizer, 
+                                                num_warmup_steps=int(total_steps*0.1), 
+                                                num_training_steps=total_steps)
 
-    # 5. TRAINING LOOP
+    # 4. TRAINING LOOP
+    best_val_f1 = 0.0
+    
     for epoch in range(EPOCHS):
-        total_loss = 0
+        
+        # --- TRAIN ---
+        model_encoder.train()
+        proj.train()
+        
         for batch in train_loader:
             optimizer.zero_grad()
             batch = {k: v.to(DEVICE) for k,v in batch.items()}
             
             with torch.no_grad():
-                # Text Encoder
                 H_text = F.normalize(txt_enc(batch["input_ids"], batch["attention_mask"]).last_hidden_state, dim=-1)
             
-            # Prompt Encoder
+            # Encoder
             desc_embeds = model_encoder(desc_input_ids, desc_attn_mask)
             pooled_mask = torch.ones(desc_embeds.shape[:2], device=DEVICE).long() if PROMPT_LEN else desc_attn_mask
             
-            # Label Encoder
             lbl_out = lbl_enc(inputs_embeds=desc_embeds, attention_mask=pooled_mask).last_hidden_state
             mask_exp = pooled_mask.unsqueeze(-1).float()
             pooled = (lbl_out * mask_exp).sum(1) / mask_exp.sum(1).clamp(min=1e-9)
             H_label = F.normalize(proj(pooled), dim=-1)
             
-            # Logits & Loss
+            # QUI USIAMO LA TEMPERATURA DEL TRIAL
             logits = torch.matmul(H_text, H_label.T) / temperature
+            
             loss = loss_fn(logits.view(-1, len(label2id)), batch["labels"].view(-1))
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model_encoder.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             
-            if step_scheduler_in_batch and scheduler is not None:
-                scheduler.step()
-                
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(train_loader)
+        # --- VALIDATION (End of Epoch) ---
+        model_encoder.eval()
+        proj.eval()
         
-        # Epoch Checkpoint
-        if not step_scheduler_in_batch and scheduler is not None:
-            if scheduler_type == "plateau":
-                scheduler.step(avg_loss)
-            else:
-                scheduler.step()
-                
-        trial.report(avg_loss, epoch)
-        if trial.should_prune(): raise optuna.TrialPruned()
+        all_preds = []
+        all_labels = []
         
-    return avg_loss
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(DEVICE) for k,v in batch.items()}
+                
+                H_text = F.normalize(txt_enc(batch["input_ids"], batch["attention_mask"]).last_hidden_state, dim=-1)
+                
+                desc_embeds = model_encoder(desc_input_ids, desc_attn_mask)
+                pooled_mask = torch.ones(desc_embeds.shape[:2], device=DEVICE).long() if PROMPT_LEN else desc_attn_mask
+                
+                lbl_out = lbl_enc(inputs_embeds=desc_embeds, attention_mask=pooled_mask).last_hidden_state
+                mask_exp = pooled_mask.unsqueeze(-1).float()
+                pooled = (lbl_out * mask_exp).sum(1) / mask_exp.sum(1).clamp(min=1e-9)
+                H_label = F.normalize(proj(pooled), dim=-1)
+                
+                logits = torch.matmul(H_text, H_label.T) / temperature
+                
+                # PREDICTIONS
+                preds = torch.argmax(logits, dim=-1)
+                
+                # Masking pad/ignore (-100)
+                active_loss = batch["labels"].view(-1) != -100
+                active_labels = batch["labels"].view(-1)[active_loss]
+                active_preds = preds.view(-1)[active_loss]
+                
+                all_preds.extend(active_preds.cpu().numpy())
+                all_labels.extend(active_labels.cpu().numpy())
+        
+        # CALCOLO MICRO F1 (Più sensibile per ranking generale)
+        # O Macro F1 se preferisci bilanciamento classi
+        val_f1 = f1_score(all_labels, all_preds, average='macro')
+        
+        # Report & Pruning su F1 (Maximize)
+        trial.report(val_f1, epoch)
+        if trial.should_prune(): 
+            raise optuna.TrialPruned()
+            
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            
+    return best_val_f1
 
 if __name__ == "__main__":
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=30)
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
     print(f"🏆 BEST PARAMS: {study.best_params}")
