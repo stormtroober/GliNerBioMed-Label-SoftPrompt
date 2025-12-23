@@ -165,6 +165,9 @@ class MLPPromptEncoder(nn.Module):
 # ==========================================================
 # 2️⃣ WRAPPER FOR LABEL ENCODER
 # ==========================================================
+# ==========================================================
+# 2️⃣ WRAPPER FOR LABEL ENCODER (EMBEDDING REPLACEMENT WITH [CLS]/[SEP])
+# ==========================================================
 class SoftPromptLabelEncoderWrapper(nn.Module):
     def __init__(self, original_encoder, prompt_encoder):
         super().__init__()
@@ -173,107 +176,96 @@ class SoftPromptLabelEncoderWrapper(nn.Module):
         self.config = original_encoder.config    # Expose config for compatibility
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        # 1. Generate Soft Prompts from input_ids (which are the label text IDs)
-        # prompt_encoder expects input_ids.
-        # Note: The input_ids here are [CLS] label [SEP].
+        # 1. Generate Soft Prompts (The REPLACEMENT content)
         soft_prompts = self.prompt_encoder(input_ids, attention_mask) # (B, P, D)
         
-        # 2. Get standard embeddings for the ORIGINAL input (text)
-        # We need the embeddings layer of the original encoder.
-        # Verified in vivisect_bi_gliner.py: the original_encoder is a BertModel,
-        # so it has an 'embeddings' module.
+        # 2. Get the original embeddings to extract [CLS] and [SEP]
         std_embeddings_layer = self.original_encoder.embeddings
-
+        # minimal call to get static embeddings
         token_embeddings = std_embeddings_layer(input_ids=input_ids) # (B, L, D)
         
+        # Extract [CLS] (always at index 0)
         cls_embeds = token_embeddings[:, 0:1, :] # (B, 1, D)
-        rest_embeds = token_embeddings[:, 1:, :] # (B, L-1, D)
         
-        # Combine:
-        final_embeds = torch.cat([cls_embeds, soft_prompts, rest_embeds], dim=1) # (B, 1 + P + L-1, D)
+        # Create a [SEP] token embedding.
+        # We can't assume input_ids ends with SEP at a fixed index due to padding, 
+        # but usually for single labels it's: [CLS] label [SEP] [PAD]...
+        # A robust way is to specifically ask for the embedding of the SEP token id.
+        sep_token_id = self.config.sep_token_id if hasattr(self.config, 'sep_token_id') else 102 # Default BERT
+        # Create a tensor of SEP IDs
+        sep_ids = torch.full((input_ids.shape[0], 1), sep_token_id, device=input_ids.device, dtype=torch.long)
+        sep_embeds = std_embeddings_layer(input_ids=sep_ids) # (B, 1, D)
         
-        # 4. Adjust Attention Mask
-        # Standard mask: [1, 1, 1, 0, 0]
-        # We inserted P tokens at index 1.
-        # New mask: [1] + [1]*P + [Rest]
+        # 3. Sandwich: [CLS] + [Soft Prompts] + [SEP]
+        final_embeds = torch.cat([cls_embeds, soft_prompts, sep_embeds], dim=1) # (B, 1 + P + 1, D)
+        
+        # 4. Create Mask
+        # Structure: 1 (CLS) + P (Prompts) + 1 (SEP)
         B = input_ids.shape[0]
         P = soft_prompts.shape[1]
         
-        prompt_mask = torch.ones((B, P), device=input_ids.device, dtype=attention_mask.dtype)
+        # Mask is all 1s because we constructed a valid dense sequence
+        final_mask = torch.ones((B, 1 + P + 1), device=input_ids.device, dtype=attention_mask.dtype)
         
-        cls_mask = attention_mask[:, 0:1]
-        rest_mask = attention_mask[:, 1:]
-        
-        final_mask = torch.cat([cls_mask, prompt_mask, rest_mask], dim=1)
-        
-        # 5. Forward to original encoder with inputs_embeds
-        # Note: original_encoder might be a BertModel.
+        # 5. Forward
         outputs = self.original_encoder(inputs_embeds=final_embeds, attention_mask=final_mask, **kwargs)
         
         return outputs
 
     def __getattr__(self, name):
-         # Delegate unknown attributes to original encoder (e.g. save_pretrained, etc.)
-         # BEWARE: infinite recursion if not careful.
          if name in ["original_encoder", "prompt_encoder", "config", "forward"]:
              return super().__getattr__(name)
          return getattr(self.original_encoder, name)
 
 def patch_bi_encoder_for_soft_prompts(bi_encoder_module):
     """
-    Patches the BiEncoder module's encode_labels method to correctly handle
-    attention masks expanded by Soft Prompts during pooling.
+    Patches the BiEncoder module's encode_labels method.
+    Structure is now: [CLS] [Prompt_Vectors] [SEP]
+    Pooling should consider this whole sequence.
     """
     import types
 
     def patched_encode_labels(self, input_ids, attention_mask, *args, **kwargs):
-        # 1. Call the wrapped encoder.
-        # Note: self.labels_encoder(input_ids, ...) calls our wrapper.
-        # Our wrapper (SoftPromptLabelEncoderWrapper) handles the expansion of input_ids/embeddings 
-        # AND internally creates the correct expanded attention_mask for the BERT model.
-        # HOWEVER, the output of our wrapper is (B, NewLen, D).
-        
-        # We need to construct the expanded mask here too, so we can pass it to mean_pooling.
-        batch_size = input_ids.shape[0]
-        # Access the prompt encoder from the wrapper to know the length
-        prompt_len = self.labels_encoder.model.prompt_encoder.pooler.prompt_len if self.labels_encoder.model.prompt_encoder.pooler else 0
-        
-        if prompt_len > 0:
-            # Reconstruct the mask logic used in wrapper
-            # [CLS] [Prompts] [Rest]
-            # Assuming input_ids is [CLS] label [SEP] (at least)
-            prompt_mask = torch.ones((batch_size, prompt_len), device=input_ids.device, dtype=attention_mask.dtype)
-            cls_mask = attention_mask[:, 0:1]
-            rest_mask = attention_mask[:, 1:]
-            expanded_mask = torch.cat([cls_mask, prompt_mask, rest_mask], dim=1)
-        else:
-            expanded_mask = attention_mask
+        # 1. Determine Prompt Length
+        try:
+            prompt_len = self.labels_encoder.model.prompt_encoder.pooler.prompt_len
+        except AttributeError:
+            prompt_len = 0
             
-        # Call the encoder (which is our wrapper inside)
+        batch_size = input_ids.shape[0]
+        
+        # 2. Construct the mask expected by Mean Pooling
+        # Structure: [CLS] (1) + [Prompts] (P) + [SEP] (1)
+        # Total Length: P + 2
+        if prompt_len > 0:
+            total_len = prompt_len + 2
+            pooling_mask = torch.ones((batch_size, total_len), device=input_ids.device, dtype=attention_mask.dtype)
+        else:
+            # Fallback if no prompt len (shouldn't happen in this setup)
+            pooling_mask = attention_mask
+
+        # 3. Call the encoder
         label_kwargs = dict(kwargs)
         label_kwargs.pop("packing_config", None)
         label_kwargs.pop("pair_attention_mask", None)
-        label_kwargs["attention_mask"] = attention_mask # Pass original, wrapper handles expansion internally
+        # Pass original mask for the MLP internal processing
+        label_kwargs["attention_mask"] = attention_mask 
         
         labels_embeddings = self.labels_encoder(input_ids, *args, **label_kwargs)
         
-        # HuggingFace models return a class/tuple; GLiNER expects it might be just tensor or tuple?
-        # GLiNER source: labels_embeddings = self.labels_encoder(...)
-        # If it returns BaseModelOutput, we typically need last_hidden_state.
-        # Our wrapper returns whatever original_encoder returns.
         if hasattr(labels_embeddings, "last_hidden_state"):
             labels_embeddings = labels_embeddings.last_hidden_state
             
         if hasattr(self, "labels_projection"):
             labels_embeddings = self.labels_projection(labels_embeddings)
             
-        # NOW use the EXPANDED mask for mean pooling
-        labels_embeddings = self.mean_pooling(labels_embeddings, expanded_mask)
+        # 4. Pool
+        labels_embeddings = self.mean_pooling(labels_embeddings, pooling_mask)
         return labels_embeddings
 
     # Apply patch
     bi_encoder_module.encode_labels = types.MethodType(patched_encode_labels, bi_encoder_module)
-    print("🧩 Monkey-patch applied to encode_labels (Cleaned)")
+    print("🧩 Monkey-patch applied (Replacement with [CLS]...[SEP])")
 
 # ==========================================================
 # 3️⃣ MAIN SCRIPT
