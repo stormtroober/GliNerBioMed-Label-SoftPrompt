@@ -119,20 +119,20 @@ def main():
     base_path = "/home/aless/Desktop/GliNerBioMed-Label-SoftPrompt"
     
     # Load mappings
-    with open(os.path.join(base_path, "label2id.json"), 'r') as f:
+    with open(os.path.join(base_path, "./dataset/label2id.json"), 'r') as f:
         label2id = json.load(f)
     print(f"Loaded {len(label2id)} labels.")
     
     # Convert Train
     reconstruct_and_convert(
-        os.path.join(base_path, "dataset/dataset_tokenlevel_simple.json"),
+        os.path.join(base_path, "dataset/dataset_tknlvl_mono.json"),
         label2id,
         "jnlpa_train.json"
     )
 
     # Convert Test
     reconstruct_and_convert(
-        os.path.join(base_path, "dataset/test_dataset_tokenlevel.json"),
+        os.path.join(base_path, "dataset/test_dataset_tknlvl_mono.json"),
         label2id,
         "jnlpa_test.json"
     )

@@ -2,9 +2,6 @@
 import os
 import datetime
 import argparse
-import zipfile
-import tempfile
-import shutil
 import json
 import torch
 import numpy as np
@@ -13,10 +10,8 @@ from collections import defaultdict
 from gliner import GLiNER
 
 # ==========================================
-# CONFIGURATION & UTILS
+# METRICS UTIL (Reused)
 # ==========================================
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
 def calculate_metrics(dataset, model, batch_size=8):
     import gc
     if torch.cuda.is_available():
@@ -95,7 +90,7 @@ def calculate_metrics(dataset, model, batch_size=8):
     header = f"{'Label':<30} | {'Prec.':<8} | {'Rec.':<8} | {'F1':<8} | {'Supp.':<8}"
     print(header)
     print("-" * 80)
-
+    
     report_lines = []
     report_lines.append(header)
     report_lines.append("-" * 80)
@@ -126,7 +121,7 @@ def calculate_metrics(dataset, model, batch_size=8):
     micro_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
     micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
     
-    print("\n## 📈 Global Metrics (Label2ID Mode)\n")
+    print("\n## 📈 Global Metrics (From .pt checkpoint)\n")
     print(f"### Performance Summary")
     print(f"| Average Type | Precision | Recall | F1-Score |")
     print(f"|:-------------|----------:|-------:|---------:|")
@@ -138,13 +133,11 @@ def calculate_metrics(dataset, model, batch_size=8):
 def convert_ids_to_labels(dataset, id_map):
     converted_count = 0
     filtered_count = 0
-    total_spans = 0
     new_dataset = []
     
     for item in dataset:
         new_ner = []
         for start, end, label_id in item['ner']:
-            total_spans += 1
             label_id = str(label_id)
             if label_id in id_map:
                 label_name = id_map[label_id]
@@ -154,47 +147,83 @@ def convert_ids_to_labels(dataset, id_map):
                 new_ner.append([start, end, label_name])
                 converted_count += 1
             else:
-                 print(f"Warning: Label ID not found in map: {label_id}")
+                 pass # Warning could be logged
     
         item['ner'] = new_ner
         new_dataset.append(item)
     return new_dataset
 
 def main():
-    parser = argparse.ArgumentParser(description="Test GLiNER model from a zip file.")
-    parser.add_argument("--zip_path", type=str, help="Path to the model zip file.", required=False)
-    parser.add_argument("--models_dir", type=str, default="./models", help="Directory containing model zips (if zip_path not provided).")
+    parser = argparse.ArgumentParser(description="Test GLiNER model from a .pt checkpoint.")
+    parser.add_argument("--pt_path", type=str, default="models/", help="Path to the model .pt file.")
     parser.add_argument("--test_data", type=str, default="jnlpa_test.json", help="Path to test dataset.")
     parser.add_argument("--label2id", type=str, default="../dataset/label2id.json", help="Path to label2id mapping.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation.")
     
     args = parser.parse_args()
     
-    # 1. Resolve Zip Path
-    zip_path = args.zip_path
-    if not zip_path:
-        # Try to find a zip in models_dir
-        if os.path.exists(args.models_dir):
-            zips = [f for f in os.listdir(args.models_dir) if f.endswith(".zip")]
-            if zips:
-                zip_path = os.path.join(args.models_dir, zips[0]) # store the first one found
-                print(f"No specific zip provided. Found {len(zips)} zips in {args.models_dir}. Using: {zip_path}")
-            else:
-                 # Check if finetune/models has it
-                 alt_models_dir = "finetune/models"
-                 if os.path.exists(alt_models_dir):
-                     zips = [f for f in os.listdir(alt_models_dir) if f.endswith(".zip")]
-                     if zips:
-                         zip_path = os.path.join(alt_models_dir, zips[0])
-                         print(f"No specific zip provided. Found {len(zips)} zips in {alt_models_dir}. Using: {zip_path}")
+    # Handle directory input for pt_path
+    if os.path.isdir(args.pt_path):
+        print(f"Searching for .pt files in {args.pt_path}...")
+        pt_files = [f for f in os.listdir(args.pt_path) if f.endswith('.pt')]
+        if not pt_files:
+            print(f"Error: No .pt file found in {args.pt_path}")
+            return
+        # Sort by modification time, newest first
+        pt_files.sort(key=lambda x: os.path.getmtime(os.path.join(args.pt_path, x)), reverse=True)
+        
+        print(f"Found {len(pt_files)} checkpoints. Using the latest one:")
+        for idx, f in enumerate(pt_files[:3]):
+            print(f"  - {f}")
+            
+        args.pt_path = os.path.join(args.pt_path, pt_files[0])
+        print(f"Selected checkpoint: {args.pt_path}")
 
-    if not zip_path or not os.path.exists(zip_path):
-        print(f"Error: Could not find model zip file at '{zip_path}' or in directories.")
+    if not os.path.exists(args.pt_path):
+        print(f"Error: .pt file not found at {args.pt_path}")
         return
 
-    print(f"Testing model from: {zip_path}")
+    print(f"Loading checkpoint from: {args.pt_path}")
+    checkpoint = torch.load(args.pt_path, map_location=torch.device('cpu'), weights_only=False) # Load keys first
+    
+    # Extract Metadata
+    metadata = checkpoint.get("training_metadata", {})
+    print("\n" + "="*50)
+    print("TRAINING METADATA")
+    print("="*50)
+    for k, v in metadata.items():
+        print(f"{k}: {v}")
+    print("="*50 + "\n")
+    
+    MODEL_NAME = "urchade/gliner_small-v2.1"
+    
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    
+    try:
+        print(f"Initializing base model: {MODEL_NAME}")
+        # Initialize model structure
+        model = GLiNER.from_pretrained(MODEL_NAME)
+        
+        # Load State Dict
+        print("Loading state dict from checkpoint...")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device)
+        model.eval()
+        print("Model loaded successfully.")
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Attempting to load 'urchade/gliner_small-v2.1' as fallback base...")
+        try:
+            model = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model.to(device)
+            model.eval()
+        except Exception as e2:
+             print(f"Fallback failed: {e2}")
+             return
 
-    # 2. Load Data
+    # Load Data
     print(f"Loading test data from {args.test_data}...")
     with open(args.test_data, "r") as f:
         test_dataset = json.load(f)
@@ -204,76 +233,39 @@ def main():
         label2id = json.load(f)
     id2label = {str(v): k for k, v in label2id.items()}
     
-    # 3. Process Data
     print("Converting Test Dataset IDs to Labels...")
     test_dataset = convert_ids_to_labels(test_dataset, id2label)
     print(f'Final Test dataset size: {len(test_dataset)}')
-
-    # 4. Unzip and Load Model
-    with tempfile.TemporaryDirectory() as temp_dir:
-        print(f"Extracting model to temporary directory: {temp_dir}")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-            
-        # Check if the extracted content is in a subdir (common issue with zipping)
-        # GLiNER expects config.json and model.safetensors/bin in the dir
-        model_dir = temp_dir
-        # If the zip contains a folder, we might need to go into it
-        # Simple heuristic: if no config.json in root, look in subdirs
-        if not os.path.exists(os.path.join(model_dir, "config.json")):
-             subdirs = [d for d in os.listdir(model_dir) if os.path.isdir(os.path.join(model_dir, d))]
-             if len(subdirs) == 1:
-                 model_dir = os.path.join(model_dir, subdirs[0])
-                 print(f"Found model in subdirectory: {model_dir}")
+    
+    macro_f1, micro_f1, report_str = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
+    
+    # Export Results
+    TEST_RESULTS_DIR = "test/results"
+    os.makedirs(TEST_RESULTS_DIR, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"{TEST_RESULTS_DIR}/eval_from_pt_{timestamp}.md"
+    
+    with open(filename, "w", encoding="utf-8") as f:
+        # Config Section
+        f.write("## 🔧 Training Configuration\n")
+        f.write("| Parameter | Value |\n|---|---|\n")
+        # Sort keys for consistency
+        for k in sorted(metadata.keys()):
+             f.write(f"| **{k}** | `{metadata[k]}` |\n")
+        f.write("\n")
         
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        try:
-            print(f"Loading GLiNER model from {model_dir}...")
-            model = GLiNER.from_pretrained(model_dir).to(device)
-            print(f"Model loaded successfully on {device}")
-            
-            # 5. Evaluate
-            macro_f1, micro_f1, report_str = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
-            
-            # Export Results
-            TEST_RESULTS_DIR = "test/results"
-            os.makedirs(TEST_RESULTS_DIR, exist_ok=True)
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            zip_name = os.path.basename(zip_path).replace('.zip', '')
-            filename = f"{TEST_RESULTS_DIR}/eval_{zip_name}_{timestamp}.md"
-            
-            with open(filename, "w", encoding="utf-8") as f:
-                # Config Section
-                config_path = os.path.join(model_dir, "config.json")
-                if os.path.exists(config_path):
-                    try:
-                        with open(config_path, 'r') as cf:
-                            config = json.load(cf)
-                        f.write("## 🔧 Model Configuration\n")
-                        f.write("| Parameter | Value |\n|---|---|\n")
-                        for k in sorted(config.keys()):
-                             val = str(config[k])
-                             if len(val) > 100: val = val[:100] + "..."
-                             f.write(f"| **{k}** | `{val}` |\n")
-                        f.write("\n")
-                    except:
-                        pass
-                
-                # Metrics Section
-                f.write("## Metriche Chiave\n")
-                f.write("| Metric | Value |\n|---|---|\n")
-                f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
-                f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
-                
-                # Report Section
-                f.write("## Report\n```\n")
-                f.write(report_str)
-                f.write("\n```\n")
-                
-            print(f"💾 Saved to {filename}")
-            
-        except Exception as e:
-            print(f"Failed to load model or evaluate: {e}")
+        # Metrics Section
+        f.write("## Metriche Chiave\n")
+        f.write("| Metric | Value |\n|---|---|\n")
+        f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
+        f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
+        
+        # Report Section
+        f.write("## Report\n```\n")
+        f.write(report_str)
+        f.write("\n```\n")
+        
+    print(f"💾 Saved to {filename}")
 
 if __name__ == "__main__":
     main()

@@ -14,6 +14,8 @@
 
 embedding_injection_monoenc/test_results/
 
+finetune/test/results/
+
 .directory
 
 *.zip
