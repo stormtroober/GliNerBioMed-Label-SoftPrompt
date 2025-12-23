@@ -27,7 +27,7 @@ label2id_path = path + "label2id.json"
 
 # Training Configuration
 target_steps = None       # Se impostato, il training si fermerà esattamente a questi step
-target_epochs = 5         # Usato solo se target_steps è None
+target_epochs = 10         # Usato solo se target_steps è None
 batch_size = 32
 
 # ==========================================
@@ -261,16 +261,16 @@ trainer = model.train_model(
     train_dataset=train_dataset,
     eval_dataset=test_dataset,
     output_dir="models_mono_noO",
-    learning_rate=5e-6,
+    learning_rate=7.746915067305043e-05,
     weight_decay=0.01,
     others_lr=1e-5,
     others_weight_decay=0.01,
-    lr_scheduler_type="linear",
+    lr_scheduler_type="constant_with_warmup",
     warmup_ratio=0.1,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    focal_loss_alpha=0.75,
-    focal_loss_gamma=2,
+    focal_loss_alpha=0.40551794519885276,
+    focal_loss_gamma=2.83001777615741,
     num_train_epochs=num_train_epochs,
     max_steps=max_steps,
     save_steps=save_steps,
@@ -299,10 +299,10 @@ checkpoint = {
         "test_dataset_size": len(test_dataset),
         "num_epochs": num_train_epochs,
         "batch_size": batch_size,
-        "learning_rate": 5e-6, 
+        "learning_rate": 7.746915067305043e-05, 
         "weight_decay": 0.01,
-        "focal_loss_alpha": 0.75,
-        "focal_loss_gamma": 2,
+        "focal_loss_alpha": 0.40551794519885276,
+        "focal_loss_gamma": 2.83001777615741,
         "timestamp": timestamp
     }
 }
