@@ -461,15 +461,36 @@ for epoch in range(1, EPOCHS + 1):
         # MODIFICATO: passa attention_mask al prompt_encoder
         soft_embeds = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
         
-        # Crea nuova attention mask per il label encoder (se pooling attivo)
-        if PROMPT_LEN is not None:
-            # Dopo pooling, tutti i token sono validi
-            pooled_attn_mask = torch.ones(soft_embeds.shape[0], soft_embeds.shape[1], 
-                                        dtype=torch.long, device=DEVICE)
-        else:
-            pooled_attn_mask = desc_attn_mask
+        # --- NEW LOGIC: [CLS] + MLP_PROMPTS + [SEP] ---
+        # 1. Recupera gli embedding statici di CLS e SEP dal modello originale (congelato)
+        # lbl_enc.embeddings è un BertEmbeddings (o simile)
+        # IDs per CLS e SEP
+        cls_id = torch.tensor([[lbl_tok.cls_token_id]], device=DEVICE) # (1, 1)
+        sep_id = torch.tensor([[lbl_tok.sep_token_id]], device=DEVICE) # (1, 1)
         
-        outputs = lbl_enc(inputs_embeds=soft_embeds, attention_mask=pooled_attn_mask)
+        # Espandi per il numero di label (che è la "batch size" in questo punto, soft_embeds.shape[0])
+        num_labels_batch = soft_embeds.shape[0]
+        
+        cls_embeds = lbl_enc.embeddings.word_embeddings(cls_id).expand(num_labels_batch, -1, -1) # (NumLabels, 1, D)
+        sep_embeds = lbl_enc.embeddings.word_embeddings(sep_id).expand(num_labels_batch, -1, -1) # (NumLabels, 1, D)
+        
+        # 2. Concatena: [CLS] + [Soft Prompts] + [SEP]
+        enclosed_soft_embeds = torch.cat([cls_embeds, soft_embeds, sep_embeds], dim=1) # (NumLabels, 1 + P + 1, D)
+        
+        # 3. Aggiorna Maschera e Input per Encoder
+        if PROMPT_LEN is not None:
+            # Dopo pooling + aggiunta CLS/SEP
+            # Lunghezza totale = 1 (CLS) + PromptLen + 1 (SEP)
+            total_len = 1 + soft_embeds.shape[1] + 1
+            pooled_attn_mask = torch.ones(num_labels_batch, total_len, dtype=torch.long, device=DEVICE)
+        else:
+            # Fallback se non usassimo pooling (ma qui PROMPT_LEN=32)
+            # Dobbiamo creare una maschera per la nuova lunghezza
+             total_len = 1 + soft_embeds.shape[1] + 1
+             pooled_attn_mask = torch.ones(num_labels_batch, total_len, dtype=torch.long, device=DEVICE)
+        
+        # Passiamo la sequenza "incapsulata"
+        outputs = lbl_enc(inputs_embeds=enclosed_soft_embeds, attention_mask=pooled_attn_mask)
         
         mask_exp = pooled_attn_mask.unsqueeze(-1).float()
         pooled = torch.sum(outputs.last_hidden_state * mask_exp, 1) / torch.clamp(mask_exp.sum(1), min=1e-9)
@@ -502,13 +523,24 @@ for epoch in range(1, EPOCHS + 1):
             
             soft_embeds = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
             
-            if PROMPT_LEN is not None:
-                pooled_attn_mask = torch.ones(soft_embeds.shape[0], soft_embeds.shape[1], 
-                                            dtype=torch.long, device=DEVICE)
-            else:
-                pooled_attn_mask = desc_attn_mask
+            # --- NEW LOGIC: [CLS] + MLP_PROMPTS + [SEP] (VALIDATION) ---
+            cls_id = torch.tensor([[lbl_tok.cls_token_id]], device=DEVICE)
+            sep_id = torch.tensor([[lbl_tok.sep_token_id]], device=DEVICE)
             
-            outputs = lbl_enc(inputs_embeds=soft_embeds, attention_mask=pooled_attn_mask)
+            num_labels_batch = soft_embeds.shape[0]
+            cls_embeds = lbl_enc.embeddings.word_embeddings(cls_id).expand(num_labels_batch, -1, -1)
+            sep_embeds = lbl_enc.embeddings.word_embeddings(sep_id).expand(num_labels_batch, -1, -1)
+            
+            enclosed_soft_embeds = torch.cat([cls_embeds, soft_embeds, sep_embeds], dim=1)
+            
+            if PROMPT_LEN is not None:
+                total_len = 1 + soft_embeds.shape[1] + 1
+                pooled_attn_mask = torch.ones(num_labels_batch, total_len, dtype=torch.long, device=DEVICE)
+            else:
+                 total_len = 1 + soft_embeds.shape[1] + 1
+                 pooled_attn_mask = torch.ones(num_labels_batch, total_len, dtype=torch.long, device=DEVICE)
+            
+            outputs = lbl_enc(inputs_embeds=enclosed_soft_embeds, attention_mask=pooled_attn_mask)
             
             mask_exp = pooled_attn_mask.unsqueeze(-1).float()
             pooled = torch.sum(outputs.last_hidden_state * mask_exp, 1) / torch.clamp(mask_exp.sum(1), min=1e-9)
