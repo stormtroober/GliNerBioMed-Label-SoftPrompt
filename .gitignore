@@ -10,9 +10,9 @@
 
 /embedding_injection/__pycache__/
 
-/embedding_injection/test_results/
 
 embedding_injection_monoenc/test_results/
+embedding_injection_bienc/test_results/
 
 finetune/test/results/
 
