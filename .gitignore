@@ -16,6 +16,8 @@ embedding_injection_monoenc/test_results/
 
 finetune/test/results/
 
+*.code-workspace
+
 .directory
 
 *.zip
