@@ -13,6 +13,7 @@
 
 embedding_injection_monoenc/test_results/
 embedding_injection_bienc/test_results/
+bienc_embedding_glinerev/test_results/
 
 finetune/test/results/
 
