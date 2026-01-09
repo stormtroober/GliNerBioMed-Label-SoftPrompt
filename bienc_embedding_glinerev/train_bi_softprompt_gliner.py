@@ -1,3 +1,4 @@
+
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 def is_running_on_kaggle():
@@ -9,6 +10,7 @@ from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 from gliner import GLiNER
 import shutil
 
@@ -17,18 +19,18 @@ import shutil
 # ==========================================
 
 if is_running_on_kaggle():
-    path = "/kaggle/input/spanbi16k/"
+    path = "/kaggle/input/spanbi5k/"
 else:
-    path = "finetune/"
+    path = "../dataset/"
 
-train_path = path + "jnlpa_train.json"
-test_path = path + "jnlpa_test.json"
+train_path = path + "dataset_span_bi.json"
+test_path = path + "test_dataset_span_bi.json"
 label2id_path = path + "label2id.json"
 
 # Training Configuration
 target_steps = None       # Se impostato, il training si fermerà esattamente a questi step
-target_epochs = 10         # Usato solo se target_steps è None
-batch_size = 32
+target_epochs = 5         # Usato solo se target_steps è None
+batch_size = 8
 
 # ==========================================
 # METRICS FUNCTION
@@ -221,9 +223,9 @@ print(f'Final Test dataset size: {len(test_dataset)}')
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 if is_running_on_kaggle():
-    MODEL_NAME = '/kaggle/input/gliner2-1small/'
+    MODEL_NAME = '/kaggle/input/glinerbismall2/'
 else:
-    MODEL_NAME = "urchade/gliner_small-v2.1"
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 model = GLiNER.from_pretrained(MODEL_NAME).to(device)
@@ -233,6 +235,129 @@ print("\n" + "="*50)
 print("BASELINE EVALUATION (Pre-Training / Zero-shot with Short Labels)")
 print("="*50)
 calculate_metrics(test_dataset, model)
+
+# ==========================================
+# SOFT PROMPT INJECTION (Monkey Patch)
+# ==========================================
+print("\n" + "="*50)
+print("INJECTING SOFT PROMPT ENCODER")
+print("="*50)
+
+class MLPPromptEncoder(nn.Module):
+    def __init__(self, original_embeddings, vocab_size, embed_dim, hidden_dim=None, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        with torch.no_grad():
+            self.embedding.weight.copy_(original_embeddings.weight)
+        
+        if hidden_dim is None: hidden_dim = embed_dim # REDUCED from *4 to *1 for regularization
+            
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, input_ids):
+        # 1. Get original embeddings
+        x = self.embedding(input_ids)
+        
+        # 2. Compute Transform
+        # Residual connection: x + mlp(x)
+        delta = self.mlp(x)
+        
+        # 3. Apply Mask: Do NOT transform [CLS](101), [SEP](102), [PAD](0)
+        # We want delta to be 0 for these tokens.
+        # BERT Standard IDs: PAD=0, CLS=101, SEP=102
+        mask = (input_ids != 101) & (input_ids != 102) & (input_ids != 0)
+        
+        # Expand mask to match embedding dim (batch, seq, dim)
+        mask = mask.unsqueeze(-1).expand_as(delta).float()
+        
+        # Apply mask
+        delta = delta * mask
+        
+        return self.norm(x + delta)
+
+class SoftPromptLabelEncoderWrapper(nn.Module):
+    def __init__(self, original_encoder, prompt_encoder):
+        super().__init__()
+        self.original_encoder = original_encoder
+        self.prompt_encoder = prompt_encoder
+        
+    def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, **kwargs):
+        # Intercept inputs
+        if inputs_embeds is None and input_ids is not None:
+            # Generate soft embeddings from input_ids using our Prompt Encoder
+            inputs_embeds = self.prompt_encoder(input_ids)
+        
+        # Delegate to original encoder
+        return self.original_encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
+
+    def __getattr__(self, name):
+        # Delegate attribute access to original encoder if not found here
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.original_encoder, name)
+
+# 1. Setup Wrapper
+lbl_enc_model = model.model.token_rep_layer.labels_encoder.model
+original_embeddings = lbl_enc_model.embeddings.word_embeddings
+vocab_size = original_embeddings.num_embeddings
+embed_dim = original_embeddings.embedding_dim
+
+prompt_encoder = MLPPromptEncoder(
+    original_embeddings, 
+    vocab_size, 
+    embed_dim, 
+    dropout=0.4 # INCREASED form 0.1 for regularization
+).to(device)
+
+wrapped_encoder = SoftPromptLabelEncoderWrapper(lbl_enc_model, prompt_encoder)
+
+# 2. Inject Wrapper
+model.model.token_rep_layer.labels_encoder.model = wrapped_encoder
+print("✅ SoftPromptLabelEncoderWrapper injected into model.")
+
+# 3. Configure Freezing
+# Freeze Text Encoder
+txt_enc = model.model.token_rep_layer.bert_layer.model
+for p in txt_enc.parameters(): 
+    p.requires_grad = False
+
+# Freeze Original Label Encoder (inside wrapper)
+for p in lbl_enc_model.parameters():
+    p.requires_grad = False
+
+# Unfreeze Prompt Encoder
+for p in prompt_encoder.parameters():
+    p.requires_grad = True
+
+# Unfreeze Projection -> FREEZE IT NOW (Source of Overfitting)
+# proj = model.model.token_rep_layer.labels_projection
+# for p in proj.parameters():
+#     p.requires_grad = True
+
+print("===========")
+print("INJECTING SOFT PROMPT ENCODER")
+print("===========")
+print("🔒 Text Encoder, Original Label Encoder AND Projection Layer Frozen.")
+print("🔓 ONLY Prompt Encoder Unfrozen.")
+
+# Verify
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Trainable Parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.2%})")
+print("🔓 Prompt Encoder and Projection Layer Unfrozen.")
+
+# Verify trainable parameters
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Trainable Parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.2%})")
 
 # ==========================================
 # TRAINING
@@ -254,23 +379,23 @@ use_cuda = torch.cuda.is_available()
 use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
 use_fp16 = use_cuda and not use_bf16
 
-save_steps = 100
+save_steps = 50
 logging_steps = save_steps
 
 trainer = model.train_model(
     train_dataset=train_dataset,
     eval_dataset=test_dataset,
-    output_dir="models_mono_noO",
-    learning_rate=7.746915067305043e-05,
+    output_dir="models_short_label",
+    learning_rate=5e-6,
     weight_decay=0.01,
-    others_lr=1e-5,
-    others_weight_decay=0.01,
-    lr_scheduler_type="constant_with_warmup",
+    others_lr=5e-6, # REDUCED from 1e-5
+    others_weight_decay=0.05, # INCREASED from 0.01
+    lr_scheduler_type="linear",
     warmup_ratio=0.1,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    focal_loss_alpha=0.40551794519885276,
-    focal_loss_gamma=2.83001777615741,
+    focal_loss_alpha=0.75,
+    focal_loss_gamma=2,
     num_train_epochs=num_train_epochs,
     max_steps=max_steps,
     save_steps=save_steps,
@@ -285,39 +410,37 @@ trainer = model.train_model(
     report_to="none",
     )
 
-from datetime import datetime
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# Save FULL model state dict to 'savings' folder with TIMESTAMP
+import datetime
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+savings_dir = "savings"
+if not os.path.exists(savings_dir):
+    os.makedirs(savings_dir)
 
-# Create a comprehensive checkpoint dictionary
-# Since load_best_model_at_end=True, 'model' is currently the best model found during training.
-checkpoint = {
-    "model_state_dict": model.state_dict(),
-    "config": model.config, 
-    "training_metadata": {
-        "base_model_name": MODEL_NAME,
-        "train_dataset_size": len(train_dataset),
-        "test_dataset_size": len(test_dataset),
-        "num_epochs": num_train_epochs,
-        "batch_size": batch_size,
-        "learning_rate": 7.746915067305043e-05, 
-        "weight_decay": 0.01,
-        "focal_loss_alpha": 0.40551794519885276,
-        "focal_loss_gamma": 2.83001777615741,
-        "timestamp": timestamp
+best_model_name = f"best_softprompt_model_{timestamp}.pt"
+best_model_path = os.path.join(savings_dir, best_model_name)
+
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'config': {
+        'vocab_size': vocab_size,
+        'embed_dim': embed_dim,
+        'hidden_dim': embed_dim, # Updated
+        'dropout': 0.4, # Updated
+        'num_train_epochs': num_train_epochs,
+        'learning_rate': 5e-6,
+        'weight_decay': 0.01,
+        'per_device_train_batch_size': batch_size,
+        'focal_loss_alpha': 0.75,
+        'focal_loss_gamma': 2
     }
-}
+}, best_model_path)
 
-# Save ONLY the .pt file
-pt_filename = f"finetune_monoenc_{timestamp}.pt"
-pt_path = os.path.join("models_mono_noO", pt_filename)
+print(f"✅ Best Full Model (Soft Prompt) saved to {best_model_path}")
 
-if not os.path.exists("models_mono_noO"):
-    os.makedirs("models_mono_noO")
-
-torch.save(checkpoint, pt_path)
-print(f"Best model checkpoint (.pt) saved to {pt_path}")
-
-# Load and Evaluate (using the loaded model)
+# Load and Evaluate
+# NOTE: We skip reloading from disk for immediate eval.
+# The 'model' variable currently holds the best state because load_best_model_at_end=True
 trained_model = model 
 print("\n" + "="*50)
 print("FINAL EVALUATION (Post-Training)")

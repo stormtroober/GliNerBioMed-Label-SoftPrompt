@@ -44,13 +44,13 @@ echo "2. Calcolo punteggi combinati..."
 for file in *.md; do
     [ -e "$file" ] || continue
 
-    # Estrae Macro F1
-    # Formato atteso nel file.md: **Macro F1**: 0.xxxx
-    macro_f1=$(grep "**Macro F1**" "$file" | awk -F': ' '{print $2}' | tr -d ' \r')
+    # Estrae Macro F1 dalla tabella Markdown
+    # Formato: | **Macro** | P | R | **F1** |
+    macro_f1=$(grep "| \*\*Macro\*\*" "$file" | awk -F'|' '{print $5}' | tr -d '* \r')
     
-    # Estrae Micro F1
-    # Formato atteso nel file.md: **Micro F1**: 0.xxxx
-    micro_f1=$(grep "**Micro F1**" "$file" | awk -F': ' '{print $2}' | tr -d ' \r')
+    # Estrae Micro F1 dalla tabella Markdown
+    # Formato: | **Micro** | P | R | **F1** |
+    micro_f1=$(grep "| \*\*Micro\*\*" "$file" | awk -F'|' '{print $5}' | tr -d '* \r')
 
     # Gestione errori se i valori mancano
     if [ -z "$macro_f1" ]; then macro_f1="0"; fi

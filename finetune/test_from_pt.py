@@ -156,7 +156,7 @@ def convert_ids_to_labels(dataset, id_map):
 def main():
     parser = argparse.ArgumentParser(description="Test GLiNER model from a .pt checkpoint.")
     parser.add_argument("--pt_path", type=str, default="models/", help="Path to the model .pt file.")
-    parser.add_argument("--test_data", type=str, default="jnlpa_test.json", help="Path to test dataset.")
+    parser.add_argument("--test_data", type=str, default="../dataset/test_dataset_span_mono.json", help="Path to test dataset.")
     parser.add_argument("--label2id", type=str, default="../dataset/label2id.json", help="Path to label2id mapping.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation.")
     
