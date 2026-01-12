@@ -40,9 +40,9 @@ RANDOM_SEED = 42
 GAMMA_FOCAL_LOSS = 4.0
 CB_BETA = 0.9999
 
-DATASET_PATH = "../dataset/dataset_tokenlevel_balanced.json"
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
+DATASET_PATH = "../dataset/dataset_tknlvl_bi.json"
+LABEL2DESC_PATH = "../dataset/label2desc.json"
+LABEL2ID_PATH = "../dataset/label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 torch.manual_seed(RANDOM_SEED)
