@@ -244,7 +244,7 @@ print("INJECTING SOFT PROMPT ENCODER")
 print("="*50)
 
 class MLPPromptEncoder(nn.Module):
-    def __init__(self, original_embeddings, vocab_size, embed_dim, hidden_dim=None, dropout=0.1):
+    def __init__(self, original_embeddings, vocab_size, embed_dim, hidden_dim=None, dropout=0.4, tokenizer=None):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         with torch.no_grad():
@@ -260,25 +260,51 @@ class MLPPromptEncoder(nn.Module):
             nn.Dropout(dropout)
         )
         self.norm = nn.LayerNorm(embed_dim)
+        self._debug_printed = False
+        self.tokenizer = tokenizer
 
     def forward(self, input_ids):
+        if not self._debug_printed:
+            print("\n[DEBUG] MLPPromptEncoder First Forward Pass")
+            print("==========================================")
+            ids = input_ids[0].tolist()
+            token_strings = []
+            if self.tokenizer:
+                token_strings = self.tokenizer.convert_ids_to_tokens(ids)
+            
+            print(f"Input IDs (First Sequence): {ids}")
+            
         # 1. Get original embeddings
         x = self.embedding(input_ids)
         
         # 2. Compute Transform
-        # Residual connection: x + mlp(x)
         delta = self.mlp(x)
         
         # 3. Apply Mask: Do NOT transform [CLS](101), [SEP](102), [PAD](0)
-        # We want delta to be 0 for these tokens.
-        # BERT Standard IDs: PAD=0, CLS=101, SEP=102
         mask = (input_ids != 101) & (input_ids != 102) & (input_ids != 0)
+        mask_float = mask.unsqueeze(-1).expand_as(delta).float()
         
-        # Expand mask to match embedding dim (batch, seq, dim)
-        mask = mask.unsqueeze(-1).expand_as(delta).float()
+        if not self._debug_printed:
+            m_vals = mask[0].tolist()
+            print(f"Mask Values (0=Original, 1=SoftPrompt): {m_vals}")
+            print("Interpretation:")
+            for i, (tid, m) in enumerate(zip(ids, m_vals)):
+                token_label = "???"
+                if token_strings:
+                     token_label = token_strings[i]
+                else:
+                    if tid == 101: token_label = "[CLS]"
+                    elif tid == 102: token_label = "[SEP]"
+                    elif tid == 0: token_label = "[PAD]"
+                    else: token_label = "WORD"
+                
+                action = "IDENTITY (Original)" if m == 0 else "SOFT PROMPT (Modified)"
+                print(f"  Pos {i}: ID {tid:<5} ({token_label:<10}) -> Mask {m} -> {action}")
+            print("==========================================\n")
+            self._debug_printed = True
         
         # Apply mask
-        delta = delta * mask
+        delta = delta * mask_float
         
         return self.norm(x + delta)
 
@@ -310,11 +336,21 @@ original_embeddings = lbl_enc_model.embeddings.word_embeddings
 vocab_size = original_embeddings.num_embeddings
 embed_dim = original_embeddings.embedding_dim
 
+# Load Tokenizer for Debugging
+from transformers import AutoTokenizer
+try:
+    # Use the same tokenizer as the model backbone (usually BERT-like for all-MiniLM)
+    debug_tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+except Exception as e:
+    print(f"Warning: Could not load debug tokenizer: {e}")
+    debug_tokenizer = None
+
 prompt_encoder = MLPPromptEncoder(
     original_embeddings, 
     vocab_size, 
     embed_dim, 
-    dropout=0.4 # INCREASED form 0.1 for regularization
+    dropout=0.4, # INCREASED form 0.1 for regularization
+    tokenizer=debug_tokenizer
 ).to(device)
 
 wrapped_encoder = SoftPromptLabelEncoderWrapper(lbl_enc_model, prompt_encoder)
@@ -324,29 +360,21 @@ model.model.token_rep_layer.labels_encoder.model = wrapped_encoder
 print("✅ SoftPromptLabelEncoderWrapper injected into model.")
 
 # 3. Configure Freezing
-# Freeze Text Encoder
-txt_enc = model.model.token_rep_layer.bert_layer.model
-for p in txt_enc.parameters(): 
-    p.requires_grad = False
+# ==========================================
+# 3. UNFREEZE EVERYTHING (Full Fine-Tuning)
+# ==========================================
+# User requested to train EVERYTHING, similar to standard fine-tuning, 
+# but with our Soft Prompt injection active.
 
-# Freeze Original Label Encoder (inside wrapper)
-for p in lbl_enc_model.parameters():
-    p.requires_grad = False
-
-# Unfreeze Prompt Encoder
-for p in prompt_encoder.parameters():
+for p in model.parameters():
     p.requires_grad = True
-
-# Unfreeze Projection -> FREEZE IT NOW (Source of Overfitting)
-# proj = model.model.token_rep_layer.labels_projection
-# for p in proj.parameters():
-#     p.requires_grad = True
 
 print("===========")
 print("INJECTING SOFT PROMPT ENCODER")
 print("===========")
-print("🔒 Text Encoder, Original Label Encoder AND Projection Layer Frozen.")
-print("🔓 ONLY Prompt Encoder Unfrozen.")
+print("✅ SoftPromptLabelEncoderWrapper injected into model.")
+print("🔓 UNFROZEN EVERYTHING: Text Encoder, Label Encoder, Prompt Encoder, Projection.")
+print("   (Standard Fine-Tuning + Soft Prompts)")
 
 # Verify
 total_params = sum(p.numel() for p in model.parameters())
