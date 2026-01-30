@@ -5,7 +5,8 @@ per GLiNER-BioMed (bi-encoder token-level training).
 Include generazione di label2desc.json e label2id.json.
 Supporta generazione Multipla (Mono e Bi-Encoder).
 
-Dataset: AnatEM (Anatomy Named Entity Recognition)
+Dataset: BC5CDR (BioCreative V Chemical Disease Relation)
+Entity types: CHEMICAL, DISEASE
 """
 
 import polars as pl
@@ -21,7 +22,7 @@ import configparser
 
 # Configurazione dataset 
 config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset_anatEM.conf')
+config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset_bc5cdr.conf')
 config.read(config_path)
 
 TRAIN_DATASET_SIZE = int(config['dataset']['TRAIN_DATASET_SIZE'])
@@ -29,14 +30,14 @@ VALIDATION_DATASET_SIZE = int(config['dataset']['VALIDATION_DATASET_SIZE'])
 TEST_DATASET_SIZE = int(config['dataset']['TEST_DATASET_SIZE'])
 
 # ===============================================================
-# 1️⃣ GENERAZIONE label2desc.json e label2id.json per AnatEM
+# 1️⃣ GENERAZIONE label2desc.json e label2id.json per BC5CDR
 # ===============================================================
 print("📥 Caricamento Pile-NER descrizioni...")
 df_labels = pd.read_parquet("hf://datasets/disi-unibo-nlp/Pile-NER-biomed-descriptions/data/train-00000-of-00001.parquet")
 print(f"✅ Pile-NER descrizioni caricato — {len(df_labels)} descrizioni totali")
 
-# Etichette di interesse per AnatEM
-target_labels = {"anatomy"}
+# Etichette di interesse per BC5CDR
+target_labels = {"chemical", "disease"}
 
 # Filtra solo le descrizioni corrispondenti
 df_labels_filtered = df_labels[df_labels["entity_type"].str.lower().isin(target_labels)]
@@ -48,7 +49,7 @@ label2desc = {
     for _, row in df_labels_filtered.iterrows()
 }
 # Aggiungi descrizione per l'etichetta "O" (outside/non-entity)
-label2desc["O"] = "Tokens that do not belong to any named entity. These are regular words, punctuation, or other text elements that are not part of any anatomical entity."
+label2desc["O"] = "Tokens that do not belong to any named entity. These are regular words, punctuation, or other text elements that are not part of any chemical or disease entity."
 
 # Crea label2id 
 label2id = {}
@@ -59,20 +60,21 @@ for i, lab in enumerate(label2desc.keys()):
 label2id["O"] = len(label2id)
 
 # Salva su disco
-os.makedirs("dataset_anatEM", exist_ok=True)
-with open("dataset_anatEM/label2desc.json", "w") as f:
+os.makedirs("dataset_bc5cdr", exist_ok=True)
+with open("dataset_bc5cdr/label2desc.json", "w") as f:
     json.dump(label2desc, f, indent=2)
-with open("dataset_anatEM/label2id.json", "w") as f:
+with open("dataset_bc5cdr/label2id.json", "w") as f:
     json.dump(label2id, f, indent=2)
 
-print("✅ dataset_anatEM/label2desc.json e dataset_anatEM/label2id.json salvati")
+print("✅ dataset_bc5cdr/label2desc.json e dataset_bc5cdr/label2id.json salvati")
 print(f"📊 Etichette definite: {list(label2id.keys())}")
 
 # ===============================================================
 # UTILS DI TOKENIZZAZIONE
 # ===============================================================
 BIO2BASE = {
-    "ANATOMY": "anatomy",
+    "CHEMICAL": "chemical",
+    "DISEASE": "disease",
 }
 
 def parse_bio_tag(tag: str):
@@ -135,7 +137,7 @@ def get_spans_from_bio(words, bio_tags, label2id):
     # Parse first
     first_tag = bio_tags[0]
     p_pref, p_base = parse_bio_tag(first_tag)
-    p_id = label2id.get(p_base, label2id.get("O", 1)) # Fallback a O=1 se manca
+    p_id = label2id.get(p_base, label2id.get("O", 2)) # Fallback a O=2 se manca (BC5CDR ha 3 label)
     p_id_str = str(p_id) 
     
     current_label = p_id_str
@@ -144,7 +146,7 @@ def get_spans_from_bio(words, bio_tags, label2id):
     for i in range(1, len(words)):
         tag = bio_tags[i]
         c_pref, c_base = parse_bio_tag(tag)
-        c_id = label2id.get(c_base, label2id.get("O", 1))
+        c_id = label2id.get(c_base, label2id.get("O", 2))
         c_id_str = str(c_id)
 
         # Decision limit:
@@ -212,7 +214,7 @@ def generate_for_model(model_name, output_suffix, label2id, df_train, df_val, df
         tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
         train_records.append({"tokens": tokens, "labels": labels})
 
-    out_train = f"dataset_anatEM/anatEM_train_tknlvl_{output_suffix}.json"
+    out_train = f"dataset_bc5cdr/dataset_tknlvl_{output_suffix}.json"
     os.makedirs(os.path.dirname(out_train), exist_ok=True)
     with open(out_train, "w", encoding="utf-8") as f:
         json.dump(train_records, f, indent=2, ensure_ascii=False)
@@ -234,7 +236,7 @@ def generate_for_model(model_name, output_suffix, label2id, df_train, df_val, df
         
     final_span_train = full_span_train[:train_size]
     
-    out_span_train = f"dataset_anatEM/anatEM_train_span_{output_suffix}.json"
+    out_span_train = f"dataset_bc5cdr/dataset_span_{output_suffix}.json"
     with open(out_span_train, "w", encoding="utf-8") as f:
         json.dump(final_span_train, f, indent=2, ensure_ascii=False)
     print(f"✅ Train set (span-based) salvato: {out_span_train} ({len(final_span_train)} samples)")
@@ -292,12 +294,12 @@ def generate_for_model(model_name, output_suffix, label2id, df_train, df_val, df
         tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
         val_records.append({"tokens": tokens, "labels": labels})
 
-    out_val = f"dataset_anatEM/anatEM_val_tknlvl_{output_suffix}.json"
+    out_val = f"dataset_bc5cdr/val_dataset_tknlvl_{output_suffix}.json"
     with open(out_val, "w", encoding="utf-8") as f:
         json.dump(val_records, f, indent=2, ensure_ascii=False)
     print(f"✅ Validation set (token-level) salvato: {out_val} ({len(val_records)} samples)")
         
-    out_span_val = f"dataset_anatEM/anatEM_val_span_{output_suffix}.json"
+    out_span_val = f"dataset_bc5cdr/val_dataset_span_{output_suffix}.json"
     with open(out_span_val, "w", encoding="utf-8") as f:
         json.dump(list(final_span_val), f, indent=2, ensure_ascii=False)
     print(f"✅ Validation set (span-based) salvato: {out_span_val} ({len(final_span_val)} samples)")
@@ -356,12 +358,12 @@ def generate_for_model(model_name, output_suffix, label2id, df_train, df_val, df
         tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
         test_records.append({"tokens": tokens, "labels": labels})
 
-    out_test = f"dataset_anatEM/anatEM_test_tknlvl_{output_suffix}.json"
+    out_test = f"dataset_bc5cdr/test_dataset_tknlvl_{output_suffix}.json"
     with open(out_test, "w", encoding="utf-8") as f:
         json.dump(test_records, f, indent=2, ensure_ascii=False)
     print(f"✅ Test set (token-level) salvato: {out_test} ({len(test_records)} samples)")
         
-    out_span_test = f"dataset_anatEM/anatEM_test_span_{output_suffix}.json"
+    out_span_test = f"dataset_bc5cdr/test_dataset_span_{output_suffix}.json"
     with open(out_span_test, "w", encoding="utf-8") as f:
         json.dump(list(final_span_test), f, indent=2, ensure_ascii=False)
     print(f"✅ Test set (span-based) salvato: {out_span_test} ({len(final_span_test)} samples)")
@@ -372,7 +374,7 @@ def generate_for_model(model_name, output_suffix, label2id, df_train, df_val, df
 # ===============================================================
 # 3️⃣ CARICAMENTO DATI RAW (Una volta sola) con Polars
 # ===============================================================
-print("\n📥 Caricamento dataset RAW AnatEM...")
+print("\n📥 Caricamento dataset RAW BC5CDR...")
 splits = {
     'train': 'data/train-00000-of-00001.parquet', 
     'validation': 'data/validation-00000-of-00001.parquet', 
@@ -380,9 +382,9 @@ splits = {
 }
 
 # Load with Polars, convert to Pandas for compatibility with existing logic
-df_train_pl = pl.read_parquet('hf://datasets/disi-unibo-nlp/AnatEM/' + splits['train'])
-df_val_pl = pl.read_parquet('hf://datasets/disi-unibo-nlp/AnatEM/' + splits['validation'])
-df_test_pl = pl.read_parquet('hf://datasets/disi-unibo-nlp/AnatEM/' + splits['test'])
+df_train_pl = pl.read_parquet('hf://datasets/disi-unibo-nlp/bc5cdr/' + splits['train'])
+df_val_pl = pl.read_parquet('hf://datasets/disi-unibo-nlp/bc5cdr/' + splits['validation'])
+df_test_pl = pl.read_parquet('hf://datasets/disi-unibo-nlp/bc5cdr/' + splits['test'])
 
 df_train = df_train_pl.to_pandas()
 df_val = df_val_pl.to_pandas()
@@ -429,4 +431,4 @@ for cfg in configs:
     )
 
 print("\n" + "="*60)
-print("✅ TUTTI I DATASET AnatEM GENERATI CON SUCCESSO")
+print("✅ TUTTI I DATASET BC5CDR GENERATI CON SUCCESSO")

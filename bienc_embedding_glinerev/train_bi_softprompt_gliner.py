@@ -19,7 +19,7 @@ import shutil
 # ==========================================
 
 if is_running_on_kaggle():
-    path = "/kaggle/input/spanbi5k/"
+    path = "/kaggle/input/spanbi16k/"
 else:
     path = "../dataset/"
 
@@ -244,7 +244,7 @@ print("INJECTING SOFT PROMPT ENCODER")
 print("="*50)
 
 class MLPPromptEncoder(nn.Module):
-    def __init__(self, original_embeddings, vocab_size, embed_dim, hidden_dim=None, dropout=0.4, tokenizer=None):
+    def __init__(self, original_embeddings, vocab_size, embed_dim, hidden_dim=None, dropout=0.1, tokenizer=None):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         with torch.no_grad():
@@ -349,7 +349,7 @@ prompt_encoder = MLPPromptEncoder(
     original_embeddings, 
     vocab_size, 
     embed_dim, 
-    dropout=0.4, # INCREASED form 0.1 for regularization
+    dropout=0.1,
     tokenizer=debug_tokenizer
 ).to(device)
 
@@ -454,7 +454,7 @@ torch.save({
         'vocab_size': vocab_size,
         'embed_dim': embed_dim,
         'hidden_dim': embed_dim, # Updated
-        'dropout': 0.4, # Updated
+        'dropout': 0.1, # Updated
         'num_train_epochs': num_train_epochs,
         'learning_rate': 5e-6,
         'weight_decay': 0.01,

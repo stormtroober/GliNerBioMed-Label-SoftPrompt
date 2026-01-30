@@ -24,9 +24,9 @@ from datetime import datetime
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset_anatEM/test_dataset_tknlvl_bi.json"
-LABEL2DESC_PATH = "../dataset_anatEM/label2desc.json"
-LABEL2ID_PATH = "../dataset_anatEM/label2id.json"
+TEST_PATH = "../dataset/test_dataset_tknlvl_bi.json"
+LABEL2DESC_PATH = "../dataset/label2desc.json"
+LABEL2ID_PATH = "../dataset/label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 # Trova ultimo checkpoint salvato
