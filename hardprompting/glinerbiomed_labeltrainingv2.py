@@ -3,14 +3,20 @@ Dataset: dataset_tokenlevel_balanced.json
 Label set: derivato da label2desc.json / label2id.json
 """
 
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+def is_running_on_kaggle():
+    return os.path.exists('/kaggle/input')
+
 import json, torch, torch.nn.functional as F
 import time
+from datetime import datetime
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
-import os
 
 #layer in più per descrizioni, sblocca encoder input, dopo hard prompting
 # ==========================================================
@@ -27,10 +33,19 @@ WARMUP_STEPS = 50
 EARLY_STOPPING_PATIENCE = 3
 RANDOM_SEED = 42
 
-DATASET_PATH = "../dataset/dataset_tknlvl_bi.json"
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
-MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+# ==========================================
+# KAGGLE / LOCAL PATHS
+# ==========================================
+if is_running_on_kaggle():
+    path = "/kaggle/input/anatem_tknlvl_bi_train/"
+    MODEL_NAME = "/kaggle/input/glinerbismall2/"
+else:
+    path = "../dataset/"
+    MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+
+DATASET_PATH = path + "dataset_tknlvl_bi.json"
+LABEL2DESC_PATH = path + "label2desc.json"
+LABEL2ID_PATH = path + "label2id.json"
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -275,11 +290,51 @@ print(f"🏆 Best loss: {best_loss:.4f} (epoch {best_epoch})")
 print(f"\n💾 Salvataggio modello...")
 
 os.makedirs("savings", exist_ok=True)
-save_path = f"savings/model_bs{BATCH_SIZE}_ep{EPOCHS}_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}_temp{TEMPERATURE}_gc{GRAD_CLIP}_warmup{WARMUP_STEPS}_patience{EARLY_STOPPING_PATIENCE}.pt"
+
+# Estrai nome dataset dal path
+dataset_name = os.path.splitext(os.path.basename(DATASET_PATH))[0]
+dataset_size = len(ds)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Nome file con dataset info e timestamp (parametri salvati dentro il .pt)
+save_path = f"savings/model_{dataset_name}_size{dataset_size}_{timestamp}.pt"
 
 torch.save({
+    # State dicts
     'label_encoder_state_dict': lbl_enc.state_dict(),
     'projection_state_dict': proj.state_dict(),
+    
+    # Dataset info
+    'dataset_name': dataset_name,
+    'dataset_path': DATASET_PATH,
+    'dataset_size': dataset_size,
+    
+    # Tutti gli iperparametri
+    'hyperparameters': {
+        'batch_size': BATCH_SIZE,
+        'epochs': EPOCHS,
+        'learning_rate': LEARNING_RATE,
+        'weight_decay': WEIGHT_DECAY,
+        'temperature': TEMPERATURE,
+        'grad_clip': GRAD_CLIP,
+        'warmup_steps': WARMUP_STEPS,
+        'early_stopping_patience': EARLY_STOPPING_PATIENCE,
+        'random_seed': RANDOM_SEED,
+    },
+    
+    # Training info
+    'training_info': {
+        'best_loss': best_loss,
+        'best_epoch': best_epoch,
+        'total_training_time_seconds': total_training_time,
+        'model_name': MODEL_NAME,
+    },
+    
+    # Label mappings (utili per inference)
+    'label2id': label2id,
+    'label2desc': label2desc,
 }, save_path)
 
 print(f"✅ Modello salvato: {save_path}")
+print(f"📊 Dataset: {dataset_name} (size: {dataset_size})")
+print(f"📋 Parametri salvati nel checkpoint")

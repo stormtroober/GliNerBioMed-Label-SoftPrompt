@@ -18,14 +18,15 @@ from transformers import AutoTokenizer
 from sklearn.metrics import precision_recall_fscore_support, classification_report
 from collections import Counter
 import os
+from datetime import datetime
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset/test_dataset_tknlvl_bi.json"
-LABEL2DESC_PATH = "../dataset/label2desc.json"
-LABEL2ID_PATH = "../dataset/label2id.json"
+TEST_PATH = "../dataset_anatEM/test_dataset_tknlvl_bi.json"
+LABEL2DESC_PATH = "../dataset_anatEM/label2desc.json"
+LABEL2ID_PATH = "../dataset_anatEM/label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 # Trova ultimo checkpoint salvato
@@ -123,7 +124,7 @@ def compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj):
     vecs = proj(pooled)
     return F.normalize(vecs, dim=-1)
 
-def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name):
+def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpoint_info=None):
     """Valuta il modello sul test set."""
     print(f"\n🔍 Valutazione {model_name}...")
     
@@ -217,21 +218,76 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name):
         label_name = id2label[label_id]
         print(f"{label_name:<15} {pred_counts[label_id]:<8} {true_counts.get(label_id, 0):<8}")
     
-    # Salva risultati
-    filename = f"results_{model_name.replace(' ', '_').replace('-', '_')}.md"
+    # Salva risultati con datetime nel nome
+    os.makedirs("testresults", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"results_{model_name.replace(' ', '_').replace('-', '_')}_{timestamp}.md"
+    
     with open(f'testresults/{filename}', "w") as f:
         f.write(f"# Risultati - {model_name}\n\n")
+        f.write(f"**Data test:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        # Se abbiamo info dal checkpoint, includiamo tutti i dettagli
+        if checkpoint_info:
+            f.write(f"## Informazioni Checkpoint\n\n")
+            f.write(f"**Checkpoint path:** `{checkpoint_info.get('checkpoint_path', 'N/A')}`\n\n")
+            
+            # Dataset info
+            f.write(f"### Dataset di Training\n\n")
+            f.write(f"- **Nome dataset:** {checkpoint_info.get('dataset_name', 'N/A')}\n")
+            f.write(f"- **Path dataset:** `{checkpoint_info.get('dataset_path', 'N/A')}`\n")
+            f.write(f"- **Dimensione dataset:** {checkpoint_info.get('dataset_size', 'N/A')} samples\n\n")
+            
+            # Iperparametri
+            hyperparams = checkpoint_info.get('hyperparameters', {})
+            if hyperparams:
+                f.write(f"### Iperparametri di Training\n\n")
+                f.write(f"| Parametro | Valore |\n")
+                f.write(f"|-----------|--------|\n")
+                f.write(f"| Batch Size | {hyperparams.get('batch_size', 'N/A')} |\n")
+                f.write(f"| Epochs | {hyperparams.get('epochs', 'N/A')} |\n")
+                f.write(f"| Learning Rate | {hyperparams.get('learning_rate', 'N/A')} |\n")
+                f.write(f"| Weight Decay | {hyperparams.get('weight_decay', 'N/A')} |\n")
+                f.write(f"| Temperature | {hyperparams.get('temperature', 'N/A')} |\n")
+                f.write(f"| Gradient Clip | {hyperparams.get('grad_clip', 'N/A')} |\n")
+                f.write(f"| Warmup Steps | {hyperparams.get('warmup_steps', 'N/A')} |\n")
+                f.write(f"| Early Stopping Patience | {hyperparams.get('early_stopping_patience', 'N/A')} |\n")
+                f.write(f"| Random Seed | {hyperparams.get('random_seed', 'N/A')} |\n\n")
+            
+            # Training info
+            training_info = checkpoint_info.get('training_info', {})
+            if training_info:
+                f.write(f"### Risultati Training\n\n")
+                f.write(f"- **Best Loss:** {training_info.get('best_loss', 'N/A'):.4f}\n")
+                f.write(f"- **Best Epoch:** {training_info.get('best_epoch', 'N/A')}\n")
+                training_time = training_info.get('total_training_time_seconds', 0)
+                f.write(f"- **Tempo Training:** {training_time:.1f}s ({training_time/60:.1f} min)\n")
+                f.write(f"- **Modello Base:** `{training_info.get('model_name', 'N/A')}`\n\n")
+        
+        f.write(f"## Risultati Test\n\n")
         f.write(f"**Token valutati:** {len(y_true_all)}\n\n")
-        f.write(f"## Metriche aggregate\n\n")
-        f.write(f"- **Macro F1:** {f1_macro:.4f}\n")
-        f.write(f"- **Micro F1:** {f1_micro:.4f}\n")
-        f.write(f"- **Precision (macro):** {prec_macro:.4f}\n")
-        f.write(f"- **Recall (macro):** {rec_macro:.4f}\n")
-        f.write(f"- **Precision (micro):** {prec_micro:.4f}\n")
-        f.write(f"- **Recall (micro):** {rec_micro:.4f}\n\n")
-        f.write(f"## Report per classe\n\n```\n{class_report}\n```\n")
+        f.write(f"### Metriche aggregate\n\n")
+        f.write(f"| Metrica | Valore |\n")
+        f.write(f"|---------|--------|\n")
+        f.write(f"| Macro F1 | {f1_macro:.4f} |\n")
+        f.write(f"| Micro F1 | {f1_micro:.4f} |\n")
+        f.write(f"| Precision (macro) | {prec_macro:.4f} |\n")
+        f.write(f"| Recall (macro) | {rec_macro:.4f} |\n")
+        f.write(f"| Precision (micro) | {prec_micro:.4f} |\n")
+        f.write(f"| Recall (micro) | {rec_micro:.4f} |\n\n")
+        
+        # Distribuzione predizioni vs ground truth
+        f.write(f"### Distribuzione Predizioni\n\n")
+        f.write(f"| Label | Predizioni | Ground Truth |\n")
+        f.write(f"|-------|------------|-------------|\n")
+        for label_id in sorted(true_counts.keys(), key=lambda x: true_counts[x], reverse=True):
+            label_name = id2label[label_id]
+            f.write(f"| {label_name} | {pred_counts.get(label_id, 0)} | {true_counts[label_id]} |\n")
+        f.write(f"\n")
+        
+        f.write(f"### Report per classe\n\n```\n{class_report}\n```\n")
     
-    print(f"💾 Risultati salvati in: {filename}")
+    print(f"💾 Risultati salvati in: testresults/{filename}")
     
     return {
         'macro_f1': f1_macro,
@@ -243,30 +299,7 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name):
     }
 
 # ==========================================================
-# 3️⃣ VALUTAZIONE MODELLO BASE
-# ==========================================================
-print("\n" + "="*60)
-print("🔹 MODELLO BASE")
-print("="*60)
-
-model_base = GLiNER.from_pretrained(MODEL_NAME)
-core_base = model_base.model
-
-txt_enc_base = core_base.token_rep_layer.bert_layer.model
-lbl_enc_base = core_base.token_rep_layer.labels_encoder.model
-proj_base = core_base.token_rep_layer.labels_projection
-
-txt_tok = AutoTokenizer.from_pretrained(txt_enc_base.config._name_or_path)
-lbl_tok = AutoTokenizer.from_pretrained(lbl_enc_base.config._name_or_path)
-
-txt_enc_base.to(DEVICE)
-lbl_enc_base.to(DEVICE)
-proj_base.to(DEVICE)
-
-results_base = evaluate_model(txt_enc_base, lbl_enc_base, proj_base, txt_tok, lbl_tok, "Base")
-
-# ==========================================================
-# 4️⃣ VALUTAZIONE MODELLO FINE-TUNATO
+# 3️⃣ VALUTAZIONE MODELLO FINE-TUNATO
 # ==========================================================
 print("\n" + "="*60)
 print("🔸 MODELLO FINE-TUNATO")
@@ -275,7 +308,7 @@ print("="*60)
 # Selezione interattiva checkpoint
 CHECKPOINT_PATH = select_checkpoint_interactive("savings")
 
-# Carica stesso modello base
+# Carica modello base
 model_ft = GLiNER.from_pretrained(MODEL_NAME)
 core_ft = model_ft.model
 
@@ -283,9 +316,28 @@ txt_enc_ft = core_ft.token_rep_layer.bert_layer.model
 lbl_enc_ft = core_ft.token_rep_layer.labels_encoder.model
 proj_ft = core_ft.token_rep_layer.labels_projection
 
+txt_tok = AutoTokenizer.from_pretrained(txt_enc_ft.config._name_or_path)
+lbl_tok = AutoTokenizer.from_pretrained(lbl_enc_ft.config._name_or_path)
+
 # Carica checkpoint
 print(f"📦 Caricamento checkpoint: {CHECKPOINT_PATH}")
 checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+
+# Estrai informazioni dal checkpoint (nuovo formato)
+checkpoint_info = {
+    'checkpoint_path': CHECKPOINT_PATH,
+    'dataset_name': checkpoint.get('dataset_name', 'N/A'),
+    'dataset_path': checkpoint.get('dataset_path', 'N/A'),
+    'dataset_size': checkpoint.get('dataset_size', 'N/A'),
+    'hyperparameters': checkpoint.get('hyperparameters', {}),
+    'training_info': checkpoint.get('training_info', {}),
+}
+
+# Stampa info checkpoint
+print(f"📊 Dataset di training: {checkpoint_info['dataset_name']} ({checkpoint_info['dataset_size']} samples)")
+if checkpoint_info['hyperparameters']:
+    hp = checkpoint_info['hyperparameters']
+    print(f"⚙️  Hyperparameters: bs={hp.get('batch_size')}, lr={hp.get('learning_rate')}, epochs={hp.get('epochs')}")
 
 lbl_enc_ft.load_state_dict(checkpoint['label_encoder_state_dict'])
 proj_ft.load_state_dict(checkpoint['projection_state_dict'])
@@ -294,25 +346,6 @@ txt_enc_ft.to(DEVICE)
 lbl_enc_ft.to(DEVICE)
 proj_ft.to(DEVICE)
 
-results_ft = evaluate_model(txt_enc_ft, lbl_enc_ft, proj_ft, txt_tok, lbl_tok, "Fine-tuned")
-
-# ==========================================================
-# 5️⃣ CONFRONTO FINALE
-# ==========================================================
-print("\n" + "="*60)
-print("📊 CONFRONTO FINALE")
-print("="*60)
-print(f"\n{'Metrica':<20} {'Base':<12} {'Fine-tuned':<12} {'Δ':<10}")
-print("-" * 60)
-
-metrics = ['macro_f1', 'micro_f1', 'macro_precision', 'macro_recall']
-metric_names = ['Macro F1', 'Micro F1', 'Macro Precision', 'Macro Recall']
-
-for metric, name in zip(metrics, metric_names):
-    base_val = results_base[metric]
-    ft_val = results_ft[metric]
-    delta = ft_val - base_val
-    delta_str = f"+{delta:.4f}" if delta >= 0 else f"{delta:.4f}"
-    print(f"{name:<20} {base_val:<12.4f} {ft_val:<12.4f} {delta_str:<10}")
+results_ft = evaluate_model(txt_enc_ft, lbl_enc_ft, proj_ft, txt_tok, lbl_tok, "Fine_tuned", checkpoint_info)
 
 print("\n✅ Valutazione completata!")
