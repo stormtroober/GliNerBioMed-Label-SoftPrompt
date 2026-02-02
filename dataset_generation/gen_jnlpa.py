@@ -177,7 +177,7 @@ def get_spans_from_bio(words, bio_tags, label2id):
 # ===============================================================
 # 2️⃣ FUNZIONE CORE DI GENERAZIONE
 # ===============================================================
-def generate_for_model(model_name, output_suffix, label2id, df_train, df_test, train_size, test_size):
+def generate_for_model(model_name, output_suffix, label2id, df_train, df_val, df_test, train_size, test_size):
     print(f"\n" + "="*60)
     print(f"🤖 GENERAZIONE DATASET PER: {model_name}")
     print(f"📂 Suffix output: {output_suffix}")
@@ -260,6 +260,50 @@ def generate_for_model(model_name, output_suffix, label2id, df_train, df_test, t
     with open(out_span_train, "w", encoding="utf-8") as f:
         json.dump(final_span_train, f, indent=2, ensure_ascii=False)
     print(f"✅ Train set (span-based) salvato: {out_span_train} ({len(final_span_train)} samples)")
+
+    # --- VAL SET ---
+    print(f"\n⚙️  [VAL] Tokenizzazione e allineamento...")
+    val_encoded = []
+    for _, row in tqdm(df_val.iterrows(), total=len(df_val), desc="Val encoding"):
+        words = list(row["tokens"])
+        bio_tags = list(row["ner_tags"])
+        if not words or not bio_tags or len(words) != len(bio_tags):
+            continue
+        ex = encode_and_align_labels(words, bio_tags, tokenizer, label2id)
+        val_encoded.append(ex)
+
+    val_records = []
+    for ex in val_encoded:
+        input_ids = ex["input_ids"].tolist()
+        labels = ex["labels"].tolist()
+        tokens = tokenizer.convert_ids_to_tokens(input_ids, skip_special_tokens=False)
+        val_records.append({"tokens": tokens, "labels": labels})
+
+    out_val = f"dataset/val_dataset_tknlvl_{output_suffix}.json"
+    with open(out_val, "w", encoding="utf-8") as f:
+        json.dump(val_records, f, indent=2, ensure_ascii=False)
+    print(f"✅ Val set (token-level) salvato: {out_val} ({len(val_records)} samples)")
+
+    # --- VAL SPAN SET ---
+    print(f"⚙️  [VAL] Generazione dataset span-based...")
+    full_span_val = []
+    for _, row in df_val.iterrows():
+        words = list(row["tokens"])
+        bio_tags = list(row["ner_tags"])
+        if not words or not bio_tags or len(words) != len(bio_tags):
+            continue
+        spans = get_spans_from_bio(words, bio_tags, label2id)
+        full_span_val.append({
+            "tokenized_text": words,
+            "ner": spans
+        })
+        
+    out_span_val = f"dataset/val_dataset_span_{output_suffix}.json"
+    with open(out_span_val, "w", encoding="utf-8") as f:
+        json.dump(full_span_val, f, indent=2, ensure_ascii=False)
+    print(f"✅ Val set (span-based) salvato: {out_span_val} ({len(full_span_val)} samples)")
+    
+    verify_dataset_stats(val_records, f"VAL ({output_suffix})")
 
     # --- TEST SET ---
     print(f"\n⚙️  [TEST] Tokenizzazione e allineamento...")
@@ -394,7 +438,20 @@ splits = {
     "test": "data/test-00000-of-00001.parquet"
 }
 # Train Data
-df_train = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["train"])
+df_train_full = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["train"])
+
+# Split 20% for Validation
+# Apply TRAIN_DATASET_SIZE constraint if specified, then split 80/20
+print(f"✂️  Limiting dataset to {TRAIN_DATASET_SIZE} samples (if larger) then splitting 80/20...")
+df_train_full = df_train_full.sample(frac=1, random_state=42).reset_index(drop=True)
+
+if len(df_train_full) > TRAIN_DATASET_SIZE:
+    df_train_full = df_train_full.iloc[:TRAIN_DATASET_SIZE]
+
+val_split_idx = int(len(df_train_full) * 0.2)
+df_val = df_train_full.iloc[:val_split_idx].copy()
+df_train = df_train_full.iloc[val_split_idx:].copy()
+print(f"✅ Split completato: Total={len(df_train_full)} | Train={len(df_train)} | Val={len(df_val)}")
 
 # Test Data (Load enough to sample from)
 df_test_raw = pd.read_parquet("hf://datasets/disi-unibo-nlp/JNLPBA/" + splits["test"])
@@ -430,6 +487,7 @@ for cfg in configs:
         output_suffix=cfg["suffix"],
         label2id=label2id,
         df_train=df_train,
+        df_val=df_val,
         df_test=df_test,
         train_size=TRAIN_DATASET_SIZE,
         test_size=TEST_DATASET_SIZE

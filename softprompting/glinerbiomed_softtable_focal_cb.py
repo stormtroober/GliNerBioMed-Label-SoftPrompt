@@ -3,7 +3,7 @@
 Training IBRIDATO:
 - Architettura & Salvataggio: Identici al 'File 2' (Soft Embedding Table + Projection, NO MLP).
 - Strategia Loss: Identica al 'File 1' (Class Balanced Weights + Focal Loss Gamma 4.0).
-- Kaggle Ready: supporto per Kaggle/Local paths, validation separata/split, logging e saving migliorato.
+- Test finale sul test set dopo il training
 """
 
 import os
@@ -16,11 +16,13 @@ import json
 import torch
 import torch.nn.functional as F
 import time
-import numpy as np
 from datetime import datetime
+import numpy as np
 from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from collections import Counter
+from sklearn.metrics import precision_recall_fscore_support, classification_report
+
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
@@ -29,25 +31,19 @@ from tqdm import tqdm
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 16
-EPOCHS = 10
+BATCH_SIZE = 32
+EPOCHS = 15
 
 # LEARNING RATES (Differenziati come richiesto dalla strategia avanzata)
-LR_EMBED = 1e-3   # Learning rate per la tabella Soft Embeddings
-LR_PROJ = 1e-3    # Learning rate per la Proiezione
+LR_EMBED = 5e-4   # Learning rate per la tabella Soft Embeddings
+LR_PROJ = 1e-4    # Learning rate per la Proiezione
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 1.0
+TEMPERATURE = 0.2
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 50
-EARLY_STOPPING_PATIENCE = 3
+EARLY_STOPPING_PATIENCE = 4
 RANDOM_SEED = 42
-VAL_SPLIT_RATIO = 0.2  # Usato solo se USE_SEPARATE_VAL_FILE = False
-
-# 🔄 Flag per gestione validation:
-# - True: usa file di validation separato (es. dataset_anatEM ha val_dataset_tknlvl_bi.json)
-# - False: split del training set (80% train, 20% val)
-USE_SEPARATE_VAL_FILE = True
 
 # PARAMETRI STRATEGIA AVANZATA (Class Balanced + Focal)
 GAMMA_FOCAL_LOSS = 4.0
@@ -57,24 +53,20 @@ CB_BETA = 0.9999
 # KAGGLE / LOCAL PATHS
 # ==========================================
 if is_running_on_kaggle():
-    path = "/kaggle/input/bc5dr-full/"
-    #path = "/kaggle/input/tknlvl-jnlpa-5k/"
-    MODEL_NAME = "/kaggle/input/glinerbismall2/"
+    # Modifica qui il nome del dataset Kaggle se necessario
+    path = "/kaggle/input/jnlpa-6-2k5-1-2-complete/" 
+    # Modifica qui il path del modello su Kaggle se necessario
+    MODEL_NAME = "/kaggle/input/glinerbismall2/" 
 else:
     path = "../dataset/"
-    path_val = "../dataset_anatEM/"
     MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 DATASET_PATH = path + "dataset_tknlvl_bi.json"
+VAL_DATASET_PATH = path + "val_dataset_tknlvl_bi.json"
+TEST_DATASET_PATH = path + "test_dataset_tknlvl_bi.json"
+
 LABEL2DESC_PATH = path + "label2desc.json"
 LABEL2ID_PATH = path + "label2id.json"
-
-# Path validation (usato solo se USE_SEPARATE_VAL_FILE = True)
-if USE_SEPARATE_VAL_FILE:
-    if is_running_on_kaggle():
-        VAL_DATASET_PATH = "/kaggle/input/bc5dr-full/val_dataset_tknlvl_bi.json"
-    else:
-        VAL_DATASET_PATH = "../dataset_anatEM/val_dataset_tknlvl_bi.json"
 
 torch.manual_seed(RANDOM_SEED)
 
@@ -192,13 +184,67 @@ core.token_rep_layer.soft_label_embeddings = soft_table
 soft_table.to(DEVICE)
 
 # ==========================================================
-# 3️⃣ DATASET
+# 3️⃣ DATASET & VALIDATION UTILS
 # ==========================================================
+def truncate_tokens_safe(tokens, tokenizer, max_len=None):
+    if max_len is None: max_len = tokenizer.model_max_length
+    if len(tokens) <= max_len: return tokens
+    if tokens[0] == tokenizer.cls_token and tokens[-1] == tokenizer.sep_token and max_len >= 2:
+        return [tokens[0]] + tokens[1:max_len-1] + [tokens[-1]]
+    return tokens[:max_len]
+
+def validate(val_records, txt_enc, txt_tok, soft_table, proj, device):
+    """Validation Loop - Soft Table Mode (same logic as test_jnlpa_dual_mode.py)"""
+    print("🔍 Validation (Soft Table Mode)...")
+    txt_enc.eval()
+    soft_table.eval()
+    proj.eval()
+    
+    y_true_all = []
+    y_pred_all = []
+    
+    with torch.no_grad():
+        # Calcolo Label Matrix da Soft Table
+        label_vecs = proj(soft_table.weight)
+        label_matrix = F.normalize(label_vecs, dim=-1) # [Num_Labels, Proj_Dim]
+        
+        for record in val_records:
+            tokens = record["tokens"]
+            labels = record["labels"]
+            
+            if len(tokens) != len(labels): continue
+            
+            input_ids = txt_tok.convert_tokens_to_ids(tokens)
+            
+            max_len = getattr(txt_tok, "model_max_length", 512)
+            if len(input_ids) > max_len:
+                input_ids = truncate_tokens_safe(input_ids, txt_tok, max_len)
+                labels = labels[:len(input_ids)]
+            
+            input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+            
+            out_txt = txt_enc(input_ids=input_ids, attention_mask=attention_mask)
+            H = F.normalize(out_txt.last_hidden_state, dim=-1)
+            
+            logits = torch.matmul(H, label_matrix.T).squeeze(0) # [Seq_Len, Num_Labels]
+            preds = logits.argmax(-1).cpu().numpy()
+            
+            for pred, true_label in zip(preds, labels):
+                if true_label != -100:
+                    y_true_all.append(true_label)
+                    y_pred_all.append(pred)
+                    
+    # Metriche
+    macro_f1 = precision_recall_fscore_support(y_true_all, y_pred_all, average="macro", zero_division=0)[2]
+    micro_f1 = precision_recall_fscore_support(y_true_all, y_pred_all, average="micro", zero_division=0)[2]
+    
+    return macro_f1, micro_f1
+
 class TokenJsonDataset(Dataset):
-    def __init__(self, path_json, tokenizer, label2id=None):
+    def __init__(self, path_json, tokenizer):
         with open(path_json, "r", encoding="utf-8") as f: self.records = json.load(f)
         self.tok = tokenizer
-        self.label2id = label2id
     def __len__(self): return len(self.records)
     def __getitem__(self, idx):
         rec = self.records[idx]
@@ -209,12 +255,12 @@ class TokenJsonDataset(Dataset):
             "labels": torch.tensor(rec["labels"]),
         }
 
-def collate_batch(batch, pad_id, ignore_index=-100):
+def collate_batch(batch, pad_id):
     maxlen = max(len(x["input_ids"]) for x in batch)
     B = len(batch)
     input_ids = torch.full((B, maxlen), pad_id, dtype=torch.long)
     attn_mask = torch.zeros((B, maxlen), dtype=torch.long)
-    labels = torch.full((B, maxlen), ignore_index, dtype=torch.long)
+    labels = torch.full((B, maxlen), -100, dtype=torch.long)
     for i, ex in enumerate(batch):
         L = len(ex["input_ids"])
         input_ids[i, :L] = ex["input_ids"]
@@ -222,9 +268,21 @@ def collate_batch(batch, pad_id, ignore_index=-100):
         labels[i, :L] = ex["labels"]
     return {"input_ids": input_ids, "attention_mask": attn_mask, "labels": labels}
 
-print("📚 Caricamento dataset...")
-ds = TokenJsonDataset(DATASET_PATH, txt_tok, label2id)
-print(f"📊 Total dataset size: {len(ds)}\n")
+print(f"📥 Caricamento Training Set: {DATASET_PATH}")
+ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, txt_tok.pad_token_id))
+
+# Caricamento Validation Set (Raw per consistenza con Test script)
+print(f"📥 Caricamento Validation Set: {VAL_DATASET_PATH}")
+with open(VAL_DATASET_PATH, "r", encoding="utf-8") as f:
+    val_records = json.load(f)
+print(f"✅ Val Set caricato: {len(val_records)} records")
+
+# Caricamento Test Set
+print(f"📥 Caricamento Test Set: {TEST_DATASET_PATH}")
+with open(TEST_DATASET_PATH, "r", encoding="utf-8") as f:
+    test_records = json.load(f)
+print(f"✅ Test Set caricato: {len(test_records)} records")
 
 # ==========================================================
 # 4️⃣ TRAINING SETUP (Strategia File 1 applicata a File 2)
@@ -234,36 +292,62 @@ print(f"📊 Total dataset size: {len(ds)}\n")
 cb_weights = get_cb_weights(DATASET_PATH, label2id, beta=CB_BETA).to(DEVICE)
 criterion = FocalLoss(alpha=cb_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
 
+# 2. Optimizer con Learning Rates differenziati
+# Qui applichiamo la strategia LR differenziata agli oggetti del File 2
+optimizer = optim.AdamW([
+    {"params": soft_table.parameters(), "lr": LR_EMBED},
+    {"params": proj.parameters(), "lr": LR_PROJ}
+], weight_decay=WEIGHT_DECAY)
+
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=len(train_loader)*EPOCHS)
+
 # 3. Early Stopping
 class EarlyStopping:
     def __init__(self, patience=3, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
-        self.best_loss = None
+        self.best_score = -float('inf') # Maximizing F1
         self.early_stop = False
-    def __call__(self, loss):
-        if self.best_loss is None:
-            self.best_loss = loss
-        elif loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            print(f"⚠️  EarlyStopping counter: {self.counter}/{self.patience}")
-            if self.counter >= self.patience: self.early_stop = True
-        else:
-            self.best_loss = loss
+    def __call__(self, score):
+        if score > self.best_score + self.min_delta:
+            self.best_score = score
             self.counter = 0
+            return True # Improved
+        else:
+            self.counter += 1
+            if self.counter >= self.patience: self.early_stop = True
+            return False # Not improved
 
-# ✨ Funzione per eseguire un'epoca di training
-def run_epoch(loader, soft_table, proj, txt_enc, criterion, optimizer, scheduler=None):
-    """Esegue un'epoca di training"""
-    soft_table.train()
-    proj.train()
+early_stopping = EarlyStopping(patience=EARLY_STOPPING_PATIENCE)
+
+# ==========================================================
+# 5️⃣ TRAINING LOOP
+# ==========================================================
+total_start_time = time.time()
+print(f"\n🚀 Inizio Training | Embed LR: {LR_EMBED} | Proj LR: {LR_PROJ}")
+print(f"🎯 Strategia: Focal (Gamma {GAMMA_FOCAL_LOSS}) + CB Weights (Beta {CB_BETA})")
+
+txt_enc.eval()
+soft_table.train()
+proj.train()
+
+best_val_f1 = -float('inf')
+best_epoch = 0
+
+# 🆕 Determina il nome del file UNA VOLTA con datetime
+os.makedirs("savings", exist_ok=True)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+dataset_name = os.path.splitext(os.path.basename(DATASET_PATH))[0]
+best_checkpoint_path = f"savings/soft_model_{dataset_name}_{timestamp}.pt"
+
+for epoch in range(1, EPOCHS + 1):
+    epoch_start_time = time.time()
+    total_loss = 0
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
     
-    total_loss, total_acc, n_tokens = 0.0, 0.0, 0
-    
-    for batch in loader:
+    for batch in pbar:
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
-        
         optimizer.zero_grad()
         
         # 1. Text Embeddings (Frozen)
@@ -272,6 +356,8 @@ def run_epoch(loader, soft_table, proj, txt_enc, criterion, optimizer, scheduler
             H_text = F.normalize(out_txt.last_hidden_state, dim=-1)
         
         # 2. Label Embeddings (Soft Table diretta)
+        # soft_table.weight è [num_labels, hidden]. 
+        # Proiettiamo -> [num_labels, proj_dim]
         label_vecs = proj(soft_table.weight)
         label_matrix = F.normalize(label_vecs, dim=-1)
         
@@ -282,246 +368,185 @@ def run_epoch(loader, soft_table, proj, txt_enc, criterion, optimizer, scheduler
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(soft_table.parameters()) + list(proj.parameters()), GRAD_CLIP)
         optimizer.step()
+        scheduler.step()
         
-        if scheduler is not None:
-            scheduler.step()
-        
-        mask = batch["labels"] != -100
-        preds = logits.argmax(-1)
-        total_acc += (preds[mask] == batch["labels"][mask]).float().sum().item()
-        n_tokens += mask.sum().item()
         total_loss += loss.item()
-    
-    avg_loss = total_loss / len(loader)
-    avg_acc = (total_acc / n_tokens) * 100
-    return avg_loss, avg_acc
-
-# ✨ Funzione per eseguire validation (senza gradient)
-@torch.no_grad()
-def run_validation_epoch(loader, soft_table, proj, txt_enc, criterion):
-    """Esegue validation (no gradient)"""
-    soft_table.eval()
-    proj.eval()
-    
-    total_loss, total_acc, n_tokens = 0.0, 0.0, 0
-    
-    for batch in loader:
-        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+        pbar.set_postfix({"loss": loss.item()})
         
-        out_txt = txt_enc(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-        H_text = F.normalize(out_txt.last_hidden_state, dim=-1)
-        
-        label_vecs = proj(soft_table.weight)
-        label_matrix = F.normalize(label_vecs, dim=-1)
-        
-        logits = torch.matmul(H_text, label_matrix.T) / TEMPERATURE
-        loss = criterion(logits.view(-1, num_labels), batch["labels"].view(-1))
-        
-        mask = batch["labels"] != -100
-        preds = logits.argmax(-1)
-        total_acc += (preds[mask] == batch["labels"][mask]).float().sum().item()
-        n_tokens += mask.sum().item()
-        total_loss += loss.item()
-    
-    avg_loss = total_loss / len(loader)
-    avg_acc = (total_acc / n_tokens) * 100
-    return avg_loss, avg_acc
-
-# ✨ Timer totale
-total_start_time = time.time()
-
-# ==========================================================
-# 5️⃣ TRAINING LOOP
-# ==========================================================
-print(f"\n🚀 Inizio Training | Embed LR: {LR_EMBED} | Proj LR: {LR_PROJ}")
-print(f"🎯 Strategia: Focal (Gamma {GAMMA_FOCAL_LOSS}) + CB Weights (Beta {CB_BETA})")
-
-txt_enc.eval()
-
-# ✨ DataLoader per training e validation
-if USE_SEPARATE_VAL_FILE:
-    # Usa file di validation separato
-    train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
-                              collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
-    
-    print("📚 Caricamento validation dataset da file separato...")
-    val_ds = TokenJsonDataset(VAL_DATASET_PATH, txt_tok, label2id)
-    print(f"📊 Validation dataset size: {len(val_ds)}")
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
-else:
-    # Split del training set
-    print(f"� Splitting training set ({int((1-VAL_SPLIT_RATIO)*100)}% train, {int(VAL_SPLIT_RATIO*100)}% val)...")
-    val_size = int(len(ds) * VAL_SPLIT_RATIO)
-    train_size = len(ds) - val_size
-    train_ds, val_ds = random_split(ds, [train_size, val_size], 
-                                     generator=torch.Generator().manual_seed(RANDOM_SEED))
-    
-    print(f"📊 Training size: {len(train_ds)}, Validation size: {len(val_ds)}")
-    
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                            collate_fn=lambda b: collate_batch(b, pad_id=txt_tok.pad_token_id))
-
-# 2. Optimizer con Learning Rates differenziati
-optimizer = optim.AdamW([
-    {"params": soft_table.parameters(), "lr": LR_EMBED},
-    {"params": proj.parameters(), "lr": LR_PROJ}
-], weight_decay=WEIGHT_DECAY)
-
-total_steps = len(train_loader) * EPOCHS
-scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
-
-training_start_time = time.time()
-
-# ✨ Inizializza early stopping
-early_stopping = EarlyStopping(patience=EARLY_STOPPING_PATIENCE)
-best_loss = float('inf')
-best_epoch = 0
-
-# Training loop
-for epoch in range(1, EPOCHS + 1):
-    epoch_start_time = time.time()
-    
-    # Training
-    train_loss, train_acc = run_epoch(
-        tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [Train]"),
-        soft_table, proj, txt_enc, criterion, optimizer, scheduler
-    )
-    
-    # ✨ Validation
-    val_loss, val_acc = run_validation_epoch(
-        tqdm(val_loader, desc=f"Epoch {epoch}/{EPOCHS} [Val]", leave=False),
-        soft_table, proj, txt_enc, criterion
-    )
-    
+    avg_loss = total_loss / len(train_loader)
     epoch_time = time.time() - epoch_start_time
+    print(f"Epoch {epoch} | Train Loss: {avg_loss:.4f} | Time: {epoch_time:.1f}s")
     
-    # ✨ Traccia miglior epoca basata su validation loss
-    if val_loss < best_loss:
-        best_loss = val_loss
+    # VALIDATION
+    val_macro_f1, val_micro_f1 = validate(val_records, txt_enc, txt_tok, soft_table, proj, DEVICE)
+    print(f"Epoch {epoch} | Val Macro F1: {val_macro_f1:.4f} | Val Micro F1: {val_micro_f1:.4f}")
+    
+    # Check Early Stopping & Saving Best
+    is_improved = early_stopping(val_macro_f1)
+    
+    if is_improved:
+        best_val_f1 = val_macro_f1
         best_epoch = epoch
         
-        # 💾 SALVATAGGIO BEST MODEL
-        save_dict_best = {
+        # 💾 SALVATAGGIO - Sovrascrive sempre lo stesso file
+        save_dict = {
+            # Components for inference
             'soft_embeddings': soft_table.state_dict(),
             'projection': proj.state_dict(),
+            
+            # Label info
             'label2id': label2id,
             'id2label': id2label,
-            'config': {
-                'gamma': GAMMA_FOCAL_LOSS,
-                'beta': CB_BETA
+            'label2desc': label2desc,
+            
+            # Metadata Standard (Metriche e Timestamp)
+            'training_info': {
+                'best_epoch': best_epoch,
+                'best_val_macro_f1': best_val_f1,
+                'timestamp': timestamp
+            },
+            
+            # Tutti gli Iperparametri e Configurazioni
+            'hyperparameters': {
+                'lr_embed': LR_EMBED,
+                'lr_proj': LR_PROJ,
+                'batch_size': BATCH_SIZE,
+                'epochs': EPOCHS,
+                'weight_decay': WEIGHT_DECAY,
+                'temperature': TEMPERATURE,
+                'grad_clip': GRAD_CLIP,
+                'warmup_steps': WARMUP_STEPS,
+                'es_patience': EARLY_STOPPING_PATIENCE,
+                'gamma_focal': GAMMA_FOCAL_LOSS,
+                'cb_beta': CB_BETA,
+                'random_seed': RANDOM_SEED,
+                'dataset_path': os.path.abspath(DATASET_PATH),
+                'val_dataset_path': os.path.abspath(VAL_DATASET_PATH),
+                'dataset_size': len(ds),
+                'model_name': MODEL_NAME
             }
         }
-        os.makedirs("savings", exist_ok=True)
-        best_save_path = "savings/soft_embeddings_best_hybrid.pt"
-        torch.save(save_dict_best, best_save_path)
-        print(f"  💾 Best model saved to {best_save_path}")
-    
-    current_lr = scheduler.get_last_lr()[0]
-    print(f"Epoch {epoch}/{EPOCHS} | train_loss={train_loss:.4f} train_acc={train_acc:.1f}% | "
-          f"val_loss={val_loss:.4f} val_acc={val_acc:.1f}% | lr={current_lr:.2e} | time={epoch_time:.1f}s")
-    
-    # ✨ Early stopping check basato su validation loss
-    early_stopping(val_loss)
+        
+        torch.save(save_dict, best_checkpoint_path)
+        print(f"  💾 Best model saved (Macro F1: {best_val_f1:.4f}) to {best_checkpoint_path}")
+
     if early_stopping.early_stop:
-        print(f"\n🛑 Early stopping triggered at epoch {epoch}")
-        print(f"🏆 Best val_loss: {best_loss:.4f} (epoch {best_epoch})")
+        print(f"🛑 Early stopping at epoch {epoch}")
         break
 
-# ✨ Timer totale
 total_training_time = time.time() - total_start_time
-
-print(f"\n⏱️  TEMPO TOTALE: {total_training_time:.1f}s ({total_training_time/60:.1f}min)")
-print(f"🏆 Best val_loss: {best_loss:.4f} (epoch {best_epoch})")
-
-# ==========================================================
-# 💾 SALVATAGGIO MODELLO FINALE
-# ==========================================================
-print(f"\n💾 Salvataggio modello finale...")
-
-os.makedirs("savings", exist_ok=True)
-
-# Estrai nome dataset dal path
-dataset_name = os.path.splitext(os.path.basename(DATASET_PATH))[0]
-dataset_size = len(ds)
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-# Nome file con dataset info e timestamp (parametri salvati dentro il .pt)
-save_path = f"savings/softprompt_{dataset_name}_size{dataset_size}_{timestamp}.pt"
-
-torch.save({
-    # State dicts
-    'soft_embeddings': soft_table.state_dict(),
-    'projection': proj.state_dict(),
-    
-    # Dataset info
-    'dataset_name': dataset_name,
-    'dataset_path': DATASET_PATH,
-    'dataset_size': dataset_size,
-    'use_separate_val_file': USE_SEPARATE_VAL_FILE,
-    'val_dataset_path': VAL_DATASET_PATH if USE_SEPARATE_VAL_FILE else None,
-    'val_split_ratio': None if USE_SEPARATE_VAL_FILE else VAL_SPLIT_RATIO,
-    'val_dataset_size': len(val_ds),
-    
-    # Tutti gli iperparametri
-    'hyperparameters': {
-        'batch_size': BATCH_SIZE,
-        'epochs': EPOCHS,
-        'lr_embed': LR_EMBED,
-        'lr_proj': LR_PROJ,
-        'weight_decay': WEIGHT_DECAY,
-        'temperature': TEMPERATURE,
-        'grad_clip': GRAD_CLIP,
-        'warmup_steps': WARMUP_STEPS,
-        'early_stopping_patience': EARLY_STOPPING_PATIENCE,
-        'random_seed': RANDOM_SEED,
-        'gamma_focal_loss': GAMMA_FOCAL_LOSS,
-        'cb_beta': CB_BETA,
-    },
-    
-    # Training info
-    'training_info': {
-        'best_loss': best_loss,
-        'best_epoch': best_epoch,
-        'total_training_time_seconds': total_training_time,
-        'model_name': MODEL_NAME,
-    },
-    
-    # Label mappings (utili per inference)
-    'label2id': label2id,
-    'label2desc': label2desc,
-    'id2label': id2label,
-    
-    # Config specifico per soft prompting
-    'config': {
-        'gamma': GAMMA_FOCAL_LOSS,
-        'beta': CB_BETA
-    }
-}, save_path)
-
-print(f"✅ Modello salvato: {save_path}")
-print(f"📊 Dataset: {dataset_name} (size: {dataset_size})")
-print(f"📋 Parametri salvati nel checkpoint")
+print(f"\n✅ Training Completato. Best Val Macro F1: {best_val_f1:.4f} (Epoch {best_epoch})")
+print(f"⏱️  TEMPO TOTALE: {total_training_time:.1f}s ({total_training_time/60:.1f}min)")
 
 # ==========================================================
-# 🧪 TEST RAPIDO INFERENCE
+# 6️⃣ TEST FINALE SUL TEST SET
 # ==========================================================
-print("\n🧪 Test Inference Rapido")
-test_txt = "Aspirin inhibits NF-kappa B activation."
-inp = txt_tok(test_txt, return_tensors="pt").to(DEVICE)
+print("\n" + "="*70)
+print("🧪 TEST FINALE SUL TEST SET")
+print("="*70)
+
+# Caricamento best checkpoint
+print(f"📦 Caricamento best checkpoint: {best_checkpoint_path}")
+checkpoint = torch.load(best_checkpoint_path, map_location=DEVICE)
+soft_table.load_state_dict(checkpoint['soft_embeddings'])
+proj.load_state_dict(checkpoint['projection'])
+print("✅ Best checkpoint caricato")
+
+# Impostazione modalità eval
+txt_enc.eval()
+soft_table.eval()
+proj.eval()
+
+y_true_all = []
+y_pred_all = []
+n_skipped = 0
+
+print(f"🔍 Processando {len(test_records)} esempi del test set...")
 
 with torch.no_grad():
-    soft_table.eval()
-    proj.eval()
+    # Calcolo Label Matrix da Soft Table
+    label_vecs = proj(soft_table.weight)
+    label_matrix = F.normalize(label_vecs, dim=-1)
     
-    H = F.normalize(txt_enc(**inp).last_hidden_state, dim=-1)
-    L = F.normalize(proj(soft_table.weight), dim=-1)
+    for idx, record in enumerate(test_records):
+        if (idx + 1) % 100 == 0:
+            print(f"   Processati {idx + 1}/{len(test_records)} esempi...")
+        
+        tokens = record["tokens"]
+        labels = record["labels"]
+        
+        if len(tokens) != len(labels):
+            n_skipped += 1
+            continue
+        
+        input_ids = txt_tok.convert_tokens_to_ids(tokens)
+        
+        max_len = getattr(txt_tok, "model_max_length", 512)
+        if len(input_ids) > max_len:
+            input_ids = truncate_tokens_safe(input_ids, txt_tok, max_len)
+            labels = labels[:len(input_ids)]
+        
+        input_ids = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=DEVICE)
+        
+        out_txt = txt_enc(input_ids=input_ids, attention_mask=attention_mask)
+        H = F.normalize(out_txt.last_hidden_state, dim=-1)
+        
+        logits = torch.matmul(H, label_matrix.T).squeeze(0)
+        preds = logits.argmax(-1).cpu().numpy()
+        
+        for pred, true_label in zip(preds, labels):
+            if true_label != -100:
+                y_true_all.append(true_label)
+                y_pred_all.append(pred)
+
+if n_skipped > 0:
+    print(f"⚠️  Skipped {n_skipped} records (token/label mismatch)")
+
+# 🆕 Calcolo SOLO Macro e Micro F1
+all_label_ids = list(range(num_labels))
+
+_, _, f1_macro, _ = precision_recall_fscore_support(
+    y_true_all, y_pred_all, average="macro", zero_division=0, labels=all_label_ids
+)
+_, _, f1_micro, _ = precision_recall_fscore_support(
+    y_true_all, y_pred_all, average="micro", zero_division=0, labels=all_label_ids
+)
+
+# 🆕 Stampa Risultati SEMPLIFICATA
+print(f"\n{'='*70}")
+print(f"📊 RISULTATI TEST FINALE")
+print(f"{'='*70}")
+print(f"Token valutati: {len(y_true_all):,}")
+print(f"\n🎯 Macro F1:  {f1_macro:.4f}")
+print(f"🎯 Micro F1:  {f1_micro:.4f}")
+print(f"{'='*70}")
+
+# Salvataggio Risultati
+results_dir = "test_results"
+os.makedirs(results_dir, exist_ok=True)
+
+filename = f"{results_dir}/final_test_results_{timestamp}.md"
+
+with open(filename, "w", encoding="utf-8") as f:
+    f.write(f"# Risultati Test Finale - SOFT TABLE MODE\n\n")
+    f.write(f"**Timestamp:** {timestamp}\n")
+    f.write(f"**Environment:** {'Kaggle' if is_running_on_kaggle() else 'Local'}\n\n")
     
-    logits = torch.matmul(H, L.T)
-    preds = logits.argmax(-1).squeeze().cpu().tolist()
-    tokens = txt_tok.convert_ids_to_tokens(inp["input_ids"][0])
+    f.write(f"## Training Info\n")
+    f.write(f"- **Best Epoch:** {best_epoch}\n")
+    f.write(f"- **Best Val Macro F1:** {best_val_f1:.4f}\n")
+    f.write(f"- **Total Training Time:** {total_training_time:.1f}s ({total_training_time/60:.1f}min)\n")
+    f.write(f"- **Gamma (Focal Loss):** {GAMMA_FOCAL_LOSS}\n")
+    f.write(f"- **Beta (CB Weights):** {CB_BETA}\n\n")
     
-    for t, p in zip(tokens, preds):
-        print(f"{t:<15} -> {id2label[p]}")
+    f.write(f"## Test Set Performance\n")
+    f.write(f"- **Token valutati:** {len(y_true_all):,}\n")
+    f.write(f"- **Macro F1:** {f1_macro:.4f}\n")
+    f.write(f"- **Micro F1:** {f1_micro:.4f}\n\n")
+    
+    f.write(f"## Model Path\n")
+    f.write(f"- **Checkpoint:** `{best_checkpoint_path}`\n")
+
+print(f"\n💾 Risultati salvati in: {filename}")
+print(f"✅ TRAINING E TEST COMPLETATI!")

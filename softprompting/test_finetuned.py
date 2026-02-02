@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Valutazione modello fine-tunato con Soft Prompting su TEST SET.
-Supporta due modalità:
-1. SOFT TABLE: Usa i vettori ottimizzati salvati nel checkpoint (Massima performance sulle classi note)
-2. DESCRIZIONI: Usa il testo delle descrizioni + proiezione fine-tunata (Test Zero-shot / Generalizzazione)
+Versione SOFT TABLE Only.
 """
 
 import json
@@ -16,6 +14,7 @@ from collections import Counter
 import os
 import datetime
 import argparse
+import re
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
@@ -85,16 +84,6 @@ def select_checkpoint_interactive(savings_dir=SAVINGS_DIR):
             print("\n\n❌ Operazione annullata.")
             exit(0)
 
-def compute_label_matrix_from_descriptions(label2desc, lbl_tok, lbl_enc, proj, label_names):
-    """Calcola embeddings dalle descrizioni testuali (Modalità HARD/Zero-shot)."""
-    desc_texts = [label2desc[k] for k in label_names]
-    batch = lbl_tok(desc_texts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-    out = lbl_enc(**batch).last_hidden_state
-    mask = batch["attention_mask"].unsqueeze(-1).float()
-    pooled = (out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-    vecs = proj(pooled)
-    return F.normalize(vecs, dim=-1)
-
 def compute_label_matrix_from_soft_table(soft_table, proj):
     """Usa i vettori ottimizzati nella Soft Table (Modalità SOFT)."""
     # soft_table.weight è [Num_Labels, Hidden_Dim]
@@ -119,20 +108,10 @@ def truncate_tokens_safe(tokens, tokenizer, max_len=None):
 # ==========================================================
 if __name__ == "__main__":
     print(f"🔍 DEVICE: {DEVICE}")
-    
-    # 0. Selezione Modalità
     print("\n" + "="*70)
-    print("🛠️ Scegli Modalità di Test")
+    print("🛠️  Modalità di Test: SOFT TABLE ONLY")
     print("="*70)
-    print("1. 🍦 SOFT TABLE: Usa i vettori ottimizzati (Performance Massima)")
-    print("2. 🧱 DESCRIZIONI: Usa il testo originale (Test Generalizzazione)")
     
-    mode_choice = input("\n👉 Seleziona (1-2) [default: 1]: ").strip()
-    use_soft_table = True if mode_choice in ["1", ""] else False
-    mode_name = "SOFT TABLE" if use_soft_table else "DESCRIZIONI"
-    
-    print(f"✅ Modalità selezionata: {mode_name}")
-
     # 1. Caricamento Dati
     print(f"\n📥 Caricamento configurazione LABELS...")
     with open(LABEL2DESC_PATH) as f:
@@ -141,10 +120,7 @@ if __name__ == "__main__":
         label2id = json.load(f)
     
     id2label = {v: k for k, v in label2id.items()}
-    label_names = list(label2desc.keys()) # Ordine garantito da python 3.7+ per dict insertion order
-    
-    # Ordiniamo label_names in base all'ID per sicurezza (id 0, id 1...)
-    # perché la Soft Table è indicizzata per ID numerico
+    # Ordine garantito per ID
     label_names = [id2label[i] for i in range(len(label2id))]
     
     num_labels = len(label_names)
@@ -161,10 +137,36 @@ if __name__ == "__main__":
     print("="*70)
     
     checkpoint_path = select_checkpoint_interactive(SAVINGS_DIR)
+    checkpoint_filename = os.path.basename(checkpoint_path)
     
     print(f"\n📦 Caricamento checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    print(f"✅ Checkpoint caricato (epoch: {checkpoint.get('epoch', 'N/A')})")
+    print(f"✅ Checkpoint caricato.")
+
+    print("\n📋 CONTENUTO COMPLETO DEL CHECKPOINT (SAVE DICT):")
+    print("=" * 60)
+    for key, value in checkpoint.items():
+        if key in ['soft_embeddings', 'projection', 'model_state_dict', 'optimizer_state_dict', 'label2id', 'id2label', 'label2desc']:
+             if key in ['label2id', 'id2label', 'label2desc']:
+                 print(f"🔹 [{key}]: <Dict with {len(value)} items> (Skipped for brevity)")
+             else:
+                 print(f"🔹 [{key}]: <Tensor/StateDict> (Skipped)")
+        elif isinstance(value, dict):
+             print(f"🔹 [{key}]:")
+             for sub_k, sub_v in value.items():
+                 print(f"    - {sub_k}: {sub_v}")
+        else:
+             print(f"🔹 [{key}]: {value}")
+    print("=" * 60)
+
+    # Estrazione iperparametri DAL FILE PT
+    hyperparams = checkpoint.get("hyperparameters", {})
+    if not hyperparams:
+        # Fallback: prova a cercare chiavi comuni al top-level se non c'è la chiave 'hyperparameters'
+        common_keys = ["batch_size", "lr", "learning_rate", "epochs", "weight_decay", "temperature", "grad_clip", "warmup_steps", "patience"]
+        for k in common_keys:
+            if k in checkpoint:
+                hyperparams[k] = checkpoint[k]
     
     model = GLiNER.from_pretrained(MODEL_NAME)
     core = model.model
@@ -186,12 +188,9 @@ if __name__ == "__main__":
         proj.load_state_dict(checkpoint['projection'])
         print("✅ Soft Table + Projection caricati.")
     else:
-        print("⚠️  'soft_embeddings' NON trovati. Si presume checkpoint legacy o Hard Prompting.")
-        if use_soft_table:
-            print("❌ ERRORE: Hai scelto modalità SOFT TABLE ma il checkpoint non ne ha una.")
-            exit(1)
-        lbl_enc.load_state_dict(checkpoint.get('label_encoder_state_dict', lbl_enc.state_dict()))
-        proj.load_state_dict(checkpoint.get('projection_state_dict', proj.state_dict()))
+        print("❌ ERRORE: 'soft_embeddings' NON trovati nel checkpoint.")
+        print("   Questo script supporta solo modalità SOFT TABLE.")
+        exit(1)
 
     txt_tok = AutoTokenizer.from_pretrained(txt_enc.config._name_or_path)
     lbl_tok = AutoTokenizer.from_pretrained(lbl_enc.config._name_or_path)
@@ -201,23 +200,19 @@ if __name__ == "__main__":
     proj.to(DEVICE)
     
     # 3. Valutazione
-    print(f"\n🔍 Valutazione in corso (Mode: {mode_name})...")
+    print(f"\n🔍 Valutazione in corso (Soft Table)...")
     
     txt_enc.eval()
     lbl_enc.eval()
     proj.eval()
-    if soft_table: soft_table.eval()
+    soft_table.eval()
     
     y_true_all = []
     y_pred_all = []
     n_skipped = 0
     
     with torch.no_grad():
-        # SCELTA MATRICE EMBEDDING
-        if use_soft_table:
-            label_matrix = compute_label_matrix_from_soft_table(soft_table, proj).to(DEVICE)
-        else:
-            label_matrix = compute_label_matrix_from_descriptions(label2desc, lbl_tok, lbl_enc, proj, label_names).to(DEVICE)
+        label_matrix = compute_label_matrix_from_soft_table(soft_table, proj).to(DEVICE)
         
         for idx, record in enumerate(test_records):
             tokens = record["tokens"]
@@ -251,6 +246,11 @@ if __name__ == "__main__":
     # 4. Report
     all_label_ids = list(range(num_labels))
     
+    # Identifica ID della label "O" se presente
+    o_label_id = label2id.get("O", -1)
+    no_o_label_ids = [lid for lid in all_label_ids if lid != o_label_id]
+    
+    # --- METRICHE COMPLETE (Con O) ---
     prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
         y_true_all, y_pred_all, average="macro", zero_division=0, labels=all_label_ids
     )
@@ -265,16 +265,31 @@ if __name__ == "__main__":
         zero_division=0,
         digits=4
     )
+
+    # --- METRICHE CLEAN (Senza O) ---
+    f1_macro_no_o, f1_micro_no_o = 0.0, 0.0
+    if o_label_id != -1 and len(no_o_label_ids) > 0:
+        p_ma_no, r_ma_no, f1_macro_no_o, _ = precision_recall_fscore_support(
+            y_true_all, y_pred_all, average="macro", zero_division=0, labels=no_o_label_ids
+        )
+        p_mi_no, r_mi_no, f1_micro_no_o, _ = precision_recall_fscore_support(
+            y_true_all, y_pred_all, average="micro", zero_division=0, labels=no_o_label_ids
+        )
     
     print(f"\n{'='*70}")
-    print(f"📊 RISULTATI TEST ({mode_name})")
+    print(f"📊 RISULTATI TEST (SOFT TABLE)")
     print(f"{'='*70}")
-    print(f"Checkpoint: {os.path.basename(checkpoint_path)}")
+    print(f"Checkpoint: {checkpoint_filename}")
     print(f"Token valutati: {len(y_true_all):,}")
     
-    print(f"\n🎯 METRICHE AGGREGATE:")
+    print(f"\n🎯 METRICHE AGGREGATE (Tutte le label inclusa 'O'):")
     print(f"  Macro F1:          {f1_macro:.4f}")
     print(f"  Micro F1:          {f1_micro:.4f}")
+
+    if o_label_id != -1:
+        print(f"\n🚀 METRICHE CLEAN (Esclusa 'O'):")
+        print(f"  Macro F1 (No-O):   {f1_macro_no_o:.4f}")
+        print(f"  Micro F1 (No-O):   {f1_micro_no_o:.4f}")
     
     print(f"\n📋 REPORT PER CLASSE:")
     print(class_report)
@@ -299,17 +314,48 @@ if __name__ == "__main__":
     results_dir = "test_results"
     os.makedirs(results_dir, exist_ok=True)
     
-    filename = f"{results_dir}/test_eval_{mode_name.replace(' ', '_')}_{timestamp}.md"
+    filename = f"{results_dir}/test_eval_SOFT_TABLE_{timestamp}.md"
     
     with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"# Risultati Test - {mode_name}\n\n")
+        f.write(f"# Risultati Test - SOFT TABLE\n\n")
         f.write(f"**Timestamp:** {timestamp}\n")
-        f.write(f"**Checkpoint:** {os.path.basename(checkpoint_path)}\n")
-        f.write(f"**Mode:** {mode_name}\n\n")
-        f.write(f"## Metriche aggregate\n")
+        f.write(f"**Checkpoint:** {checkpoint_filename}\n")
+        
+        f.write(f"## Dettagli Training e Configurazione\n")
+        
+        # 1. Iperparametri Base (lr, batch_size, etc.)
+        f.write("### Iperparametri\n")
+        if hyperparams:
+            for k, v in hyperparams.items():
+                f.write(f"- **{k}:** {v}\n")
+        else:
+            f.write("_Nessun iperparametro di base trovato._\n")
+
+        # 2. Configurazione Aggiuntiva (Parametri Loss, Gamma, Temp, ecc)
+        # Recuperiamo direttamente dal checkpoint se presente
+        config_data = checkpoint.get("config", {})
+        if config_data and isinstance(config_data, dict):
+            f.write("\n### Configurazione (Loss/Model)\n")
+            for k, v in config_data.items():
+                f.write(f"- **{k}:** {v}\n")
+
+        # 3. Info Training (Epoche, Best Val Score)
+        train_info = checkpoint.get("training_info", {})
+        if train_info and isinstance(train_info, dict):
+            f.write("\n### Info Training Run\n")
+            for k, v in train_info.items():
+                f.write(f"- **{k}:** {v}\n")
+        
+        f.write(f"\n## Metriche aggregate (Standard)\n")
         f.write(f"- **Macro F1:** {f1_macro:.4f}\n")
-        f.write(f"- **Micro F1:** {f1_micro:.4f}\n\n")
-        f.write(f"## Report per classe\n```\n{class_report}\n```\n")
+        f.write(f"- **Micro F1:** {f1_micro:.4f}\n")
+
+        if o_label_id != -1:
+             f.write(f"\n## Metriche Clean (No 'O')\n")
+             f.write(f"- **Macro F1 (No-O):** {f1_macro_no_o:.4f}\n")
+             f.write(f"- **Micro F1 (No-O):** {f1_micro_no_o:.4f}\n")
+
+        f.write(f"\n## Report per classe\n```\n{class_report}\n```\n")
     
     print(f"\n💾 Risultati salvati in: {filename}")
     print(f"✅ Test completato!")
