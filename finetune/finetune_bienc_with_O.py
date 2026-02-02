@@ -13,13 +13,38 @@ import torch
 from gliner import GLiNER
 import shutil
 
+# Seed for reproducibility
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
-train_path = "finetune/jnlpa_train.json"
-test_path = "finetune/jnlpa_test.json"
+if is_running_on_kaggle():
+    path = "/kaggle/input/jnlpa15k/"
+else:
+    path = "finetune/"
+
+train_path = path + "jnlpa_train.json"
+test_path = path + "jnlpa_test.json"
 label2desc_path = "label2desc.json"
-label2id_path = "label2id.json"
+label2id_path = path + "label2id.json"
+
+# ==========================================
+# VALIDATION CONFIGURATION
+# ==========================================
+# 🔄 Flag per gestione validation:
+# - True: usa file di validation separato
+# - False: split del training set (80% train, 20% val)
+USE_SEPARATE_VAL_FILE = False
+VAL_SPLIT_RATIO = 0.2  # Usato solo se USE_SEPARATE_VAL_FILE = False
+
+# Path validation (usato solo se USE_SEPARATE_VAL_FILE = True)
+if USE_SEPARATE_VAL_FILE:
+    if is_running_on_kaggle():
+        val_path = "/kaggle/input/jnlpa15k/jnlpa_val.json"
+    else:
+        val_path = path + "jnlpa_val.json"
 
 # Training Configuration
 target_steps = None       
@@ -205,7 +230,24 @@ train_dataset = convert_ids_to_labels(train_dataset, id2label)
 print("\nConverting Test Dataset IDs to Labels (WITH O)...")
 test_dataset = convert_ids_to_labels(test_dataset, id2label)
 
+# ==========================================
+# VALIDATION SPLIT
+# ==========================================
+if USE_SEPARATE_VAL_FILE:
+    print(f"\n📚 Loading validation dataset from separate file: {val_path}")
+    with open(val_path, "r") as f:
+        val_dataset = json.load(f)
+    print("Converting Validation Dataset IDs to Labels (WITH O)...")
+    val_dataset = convert_ids_to_labels(val_dataset, id2label)
+else:
+    print(f"\n📊 Splitting training set ({int((1-VAL_SPLIT_RATIO)*100)}% train, {int(VAL_SPLIT_RATIO*100)}% val)...")
+    random.shuffle(train_dataset)
+    val_size = int(len(train_dataset) * VAL_SPLIT_RATIO)
+    val_dataset = train_dataset[:val_size]
+    train_dataset = train_dataset[val_size:]
+
 print(f'\nFinal Train dataset size: {len(train_dataset)}')
+print(f'Final Validation dataset size: {len(val_dataset)}')
 print(f'Final Test dataset size: {len(test_dataset)}')
 
 # ==========================================
@@ -250,7 +292,7 @@ use_fp16 = use_cuda and not use_bf16
 
 trainer = model.train_model(
     train_dataset=train_dataset,
-    eval_dataset=test_dataset,
+    eval_dataset=val_dataset,  # ✅ Usa validation set, NON test set
     output_dir="models_short_label_with_O_filtered",
     learning_rate=5e-6,
     weight_decay=0.01,
