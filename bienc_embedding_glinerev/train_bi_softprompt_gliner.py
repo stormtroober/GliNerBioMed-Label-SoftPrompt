@@ -24,6 +24,7 @@ else:
     path = "../dataset/"
 
 train_path = path + "dataset_span_bi.json"
+val_path = path + "val_dataset_span_bi.json"
 test_path = path + "test_dataset_span_bi.json"
 label2id_path = path + "label2id.json"
 
@@ -159,6 +160,9 @@ print("Loading datasets and mappings...")
 with open(train_path, "r") as f:
     train_dataset = json.load(f)
 
+with open(val_path, "r") as f:
+    val_dataset = json.load(f)
+
 with open(test_path, "r") as f:
     test_dataset = json.load(f)
 
@@ -211,10 +215,14 @@ def convert_ids_to_labels(dataset, id_map):
 print("\nConverting Training Dataset IDs to Labels...")
 train_dataset = convert_ids_to_labels(train_dataset, id2label)
 
+print("\nConverting Validation Dataset IDs to Labels...")
+val_dataset = convert_ids_to_labels(val_dataset, id2label)
+
 print("\nConverting Test Dataset IDs to Labels...")
 test_dataset = convert_ids_to_labels(test_dataset, id2label)
 
 print(f'\nFinal Train dataset size: {len(train_dataset)}')
+print(f'Final Val dataset size: {len(val_dataset)}')
 print(f'Final Test dataset size: {len(test_dataset)}')
 
 # ==========================================
@@ -360,11 +368,6 @@ model.model.token_rep_layer.labels_encoder.model = wrapped_encoder
 print("✅ SoftPromptLabelEncoderWrapper injected into model.")
 
 # 3. Configure Freezing
-# ==========================================
-# 3. UNFREEZE EVERYTHING (Full Fine-Tuning)
-# ==========================================
-# User requested to train EVERYTHING, similar to standard fine-tuning, 
-# but with our Soft Prompt injection active.
 
 for p in model.parameters():
     p.requires_grad = True
@@ -412,7 +415,7 @@ logging_steps = save_steps
 
 trainer = model.train_model(
     train_dataset=train_dataset,
-    eval_dataset=test_dataset,
+    eval_dataset=val_dataset,
     output_dir="models_short_label",
     learning_rate=5e-6,
     weight_decay=0.01,
