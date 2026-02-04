@@ -182,7 +182,7 @@ class SoftGlinerOptimizer(BaseTrainer):
 
 class SoftGlinerTrainer:
     def __init__(self, model, train_dataset, val_dataset, batch_size=8, num_epochs=3, 
-                 learning_rate=5e-5, prompt_encoder_lr=1e-4, others_lr=1e-6, freeze_backbone=True):
+                 learning_rate=1e-4, prompt_encoder_lr=5e-4, others_lr=1e-5, freeze_backbone=True):
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -191,20 +191,69 @@ class SoftGlinerTrainer:
                        "weight_decay": 0.01, "freeze_backbone": freeze_backbone}
 
     def _freeze_backbone(self):
+        """Congela solo token_rep_layer come Stefano, sbloccando rnn, span_rep_layer, etc."""
         if self.config["freeze_backbone"]:
-            print("\n❄️ FREEZING BACKBONE...")
-            for param in self.model.model.parameters(): param.requires_grad = False
+            print("\n" + "="*70)
+            print("PARAMETER FREEZING SUMMARY (Stefano-style)")
+            print("="*70)
             
-            # Con l'approccio wrapper, il prompt_encoder è nel wrapped_encoder
-            wrapped_encoder = self.model.model.token_rep_layer.labels_encoder.model
+            model = self.model.model
+            
+            # Congela SOLO token_rep_layer (come Stefano)
+            components_to_freeze = ['token_rep_layer']
+            
+            # Prima sblocca tutto
+            for param in model.parameters():
+                param.requires_grad = True
+            
+            # Poi congela solo i componenti specificati
+            for comp_name in components_to_freeze:
+                if hasattr(model, comp_name):
+                    comp = getattr(model, comp_name)
+                    for param in comp.parameters():
+                        param.requires_grad = False
+                    print(f"  ❄️ FROZEN: {comp_name}")
+            
+            # Sblocca il prompt_encoder nel wrapper
+            wrapped_encoder = model.token_rep_layer.labels_encoder.model
             if hasattr(wrapped_encoder, 'prompt_encoder'):
-                for param in wrapped_encoder.prompt_encoder.parameters(): param.requires_grad = True
-                print("🔥 Prompt Encoder: UNFROZEN")
-            else:
-                print("⚠️ WARNING: prompt_encoder non trovato nel wrapper!")
+                for param in wrapped_encoder.prompt_encoder.parameters():
+                    param.requires_grad = True
+                print(f"  🔥 UNFROZEN: prompt_encoder (in wrapper)")
             
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            print(f"Trainable Params: {trainable:,}")
+            # Statistiche per componente (come Stefano)
+            print("\n" + "-"*70)
+            print("Component-wise Breakdown:")
+            print(f"  {'Component':<25} {'Total':<15} {'Trainable':<15} {'% Trainable'}")
+            print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
+            
+            components = {
+                'token_rep_layer': getattr(model, 'token_rep_layer', None),
+                'rnn': getattr(model, 'rnn', None),
+                'span_rep_layer': getattr(model, 'span_rep_layer', None),
+                'prompt_rep_layer': getattr(model, 'prompt_rep_layer', None),
+                'prompt_encoder': wrapped_encoder.prompt_encoder if hasattr(wrapped_encoder, 'prompt_encoder') else None,
+            }
+            
+            total_params = 0
+            trainable_params = 0
+            
+            for comp_name, comp in components.items():
+                if comp is None:
+                    continue
+                comp_total = sum(p.numel() for p in comp.parameters())
+                comp_trainable = sum(p.numel() for p in comp.parameters() if p.requires_grad)
+                comp_pct = (comp_trainable / comp_total * 100) if comp_total > 0 else 0
+                
+                status = "🔥" if comp_trainable > 0 else "❄️"
+                print(f"  {status} {comp_name:<23} {comp_total:>13,}  {comp_trainable:>13,}  {comp_pct:>10.2f}%")
+                
+                total_params += comp_total
+                trainable_params += comp_trainable
+            
+            print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
+            print(f"  {'TOTAL':<25} {total_params:>13,}  {trainable_params:>13,}  {trainable_params/total_params*100:>10.2f}%")
+            print("="*70 + "\n")
 
     def train(self):
         self._freeze_backbone()
@@ -480,7 +529,7 @@ print("="*50)
 
 trainer_wrapper = SoftGlinerTrainer(
     model=model, train_dataset=train_dataset, val_dataset=val_dataset,
-    batch_size=8, num_epochs=5, learning_rate=5e-2, prompt_encoder_lr=5e-2, others_lr=1e-6, freeze_backbone=True
+    batch_size=8, num_epochs=5, learning_rate=1e-4, prompt_encoder_lr=5e-4, others_lr=1e-5, freeze_backbone=True
 )
 
 print("Starting training...")
