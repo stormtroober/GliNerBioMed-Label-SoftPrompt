@@ -257,6 +257,27 @@ class SoftGlinerTrainer:
 
     def train(self):
         self._freeze_backbone()
+        
+        # Calcola steps per epoca per logging
+        num_samples = len(self.train_dataset)
+        steps_per_epoch = num_samples // self.config["batch_size"]
+        logging_steps = max(1, steps_per_epoch // 4)  # Log ~4 volte per epoca
+        save_steps = steps_per_epoch  # Salva ogni epoca
+        
+        print(f"\n⏱️ TRAINING TIMING INFO:")
+        print(f"  Samples: {num_samples}")
+        print(f"  Batch size: {self.config['batch_size']}")
+        print(f"  Steps per epoch: {steps_per_epoch}")
+        print(f"  Logging every: {logging_steps} steps")
+        print(f"  Saving every: {save_steps} steps (1 epoch)")
+        print(f"  Total epochs: {self.config['num_epochs']}")
+        print(f"  Total steps: {steps_per_epoch * self.config['num_epochs']}\n")
+        
+        # Detect CUDA/bf16/fp16
+        use_cuda = torch.cuda.is_available()
+        use_bf16 = use_cuda and torch.cuda.is_bf16_supported()
+        use_fp16 = use_cuda and not use_bf16
+        
         training_args = SoftGlinerTrainingArguments(
             output_dir="models_soft_prompt",
             learning_rate=self.config["learning_rate"],
@@ -266,16 +287,40 @@ class SoftGlinerTrainer:
             per_device_eval_batch_size=self.config["batch_size"],
             num_train_epochs=self.config["num_epochs"],
             weight_decay=self.config["weight_decay"],
-            eval_strategy="steps", save_strategy="steps", save_total_limit=2,
-            load_best_model_at_end=True, use_cpu=not torch.cuda.is_available(), report_to="none"
+            logging_steps=logging_steps,
+            # Salva e valuta ogni epoca, mantieni solo il best
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            save_total_limit=1,  # Solo il best model
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",  # Usa loss per scegliere il best
+            greater_is_better=False,  # Loss più bassa = meglio
+            use_cpu=not use_cuda,
+            bf16=use_bf16,
+            fp16=use_fp16,
+            report_to="none"
         )
+        
         import gliner.training
         original_trainer_cls = gliner.training.Trainer
         gliner.training.Trainer = SoftGlinerOptimizer
+        
+        import time
+        start_time = time.time()
+        
         try:
             trainer = self.model.train_model(train_dataset=self.train_dataset, eval_dataset=self.val_dataset, training_args=training_args)
         finally:
             gliner.training.Trainer = original_trainer_cls
+        
+        total_time = time.time() - start_time
+        time_per_epoch = total_time / self.config["num_epochs"]
+        
+        print(f"\n⏱️ TRAINING COMPLETE:")
+        print(f"  Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
+        print(f"  Time per epoch: {time_per_epoch:.2f}s ({time_per_epoch/60:.2f} min)")
+        print(f"  Time per step: {total_time / (steps_per_epoch * self.config['num_epochs']):.2f}s\n")
+        
         return trainer
 
 # ==========================================
