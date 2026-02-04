@@ -583,42 +583,7 @@ print("Starting training...")
 trainer_wrapper.train()
 
 # ==========================================
-# 5. SALVATAGGIO SELETTIVO (SOLO PROMPT ENCODER)
-# ==========================================
-from typing import Set
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-save_dir = Path(f"best_soft_model_{timestamp}")
-save_dir.mkdir(parents=True, exist_ok=True)
-
-print(f"\n💾 Salvataggio del miglior Prompt Encoder in {save_dir}...")
-
-# 1. Salva solo lo state_dict del Prompt Encoder (super leggero) con TIMESTAMP
-prompt_encoder_filename = f"prompt_encoder_{timestamp}.pt"
-# Con l'approccio wrapper, il prompt_encoder è nel wrapped_encoder
-wrapped_encoder = model.model.token_rep_layer.labels_encoder.model
-torch.save(wrapped_encoder.prompt_encoder.state_dict(), save_dir / prompt_encoder_filename)
-
-# 2. Salva Iperparametri
-metadata = {
-    "hyperparameters": trainer_wrapper.config,
-    "dataset_info": {
-        "train_size": len(train_dataset),
-        "val_size": len(val_dataset),
-        "test_size": len(test_dataset),
-        "labels": label_list
-    },
-    "backbone": MODEL_NAME,
-    "timestamp": timestamp,
-    "model_filename": prompt_encoder_filename
-}
-
-with open(save_dir / f"metadata_prompt_tuning_{timestamp}.json", "w") as f:
-    json.dump(metadata, f, indent=4)
-    
-print("✅ Salvataggio completato.")
-
-# ==========================================
-# 6. TESTING FINALE (POST-TRAINING) - Usando GLiNER evaluate() come in validazione
+# 5. TESTING FINALE (POST-TRAINING)
 # ==========================================
 
 print("\n" + "="*50)
@@ -626,37 +591,61 @@ print("🧪 FINAL EVALUATION (Post-Training)")
 print("="*50)
 model.eval()
 
-# Usa lo stesso metodo di valutazione usato durante il training!
-output_str, f1_score = model.evaluate(
-    test_data=test_dataset,
-    flat_ner=True,
-    multi_label=False,
-    threshold=0.5,
-    batch_size=8
-)
+# Usa calculate_metrics per output formattato con Macro/Micro
+metrics = calculate_metrics(test_dataset, model, batch_size=8)
 
-print(f"\n📊 Risultati Test Set:")
-print(output_str)
-print(f"F1 Score: {f1_score:.4f}")
+# ==========================================
+# 6. SALVATAGGIO SELETTIVO (TUTTO IN UN UNICO .pt)
+# ==========================================
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+save_dir = Path("savings")
+save_dir.mkdir(parents=True, exist_ok=True)
 
-# Salva metriche
-import re
-pattern = r'P:\s*([\d.]+)%\s*R:\s*([\d.]+)%\s*F1:\s*([\d.]+)%'
-match = re.search(pattern, output_str)
+print(f"\n💾 Salvataggio del Prompt Encoder con metadati in {save_dir}...")
 
-if match:
-    metrics = {
-        "precision": float(match.group(1)) / 100.0,
-        "recall": float(match.group(2)) / 100.0,
-        "f1": float(match.group(3)) / 100.0
-    }
-else:
-    metrics = {"f1": f1_score, "raw_output": output_str}
+# Prepara checkpoint con tutti i metadati inclusi
+wrapped_encoder = model.model.token_rep_layer.labels_encoder.model
 
-metrics_filename = f"test_metrics_{timestamp}.json"
-with open(save_dir / metrics_filename, "w") as f:
-    json.dump(metrics, f, indent=4)
+checkpoint = {
+    # State dict del prompt encoder
+    "state_dict": wrapped_encoder.prompt_encoder.state_dict(),
+    
+    # Architettura prompt encoder
+    "architecture": {
+        "backbone_hidden_size": prompt_encoder.backbone_hidden_size,
+        "num_labels": prompt_encoder.num_labels,
+    },
+    
+    # Iperparametri di training
+    "hyperparameters": trainer_wrapper.config,
+    
+    # Info dataset
+    "dataset_info": {
+        "train_size": len(train_dataset),
+        "val_size": len(val_dataset),
+        "test_size": len(test_dataset),
+        "labels": label_list
+    },
+    
+    # Modello backbone usato
+    "backbone": MODEL_NAME,
+    
+    # Timestamp
+    "timestamp": timestamp,
+    
+    # Metriche del test
+    "test_metrics": metrics,
+    
+    # Baseline F1 pre-training
+    "baseline_f1": baseline_f1,
+}
 
+# Salva tutto in un unico file .pt
+checkpoint_filename = f"prompt_encoder_{timestamp}.pt"
+torch.save(checkpoint, save_dir / checkpoint_filename)
+
+print("✅ Salvataggio completato.")
 print(f"\n✅ Script terminato.")
 print(f"📁 Directory Output: {save_dir}")
-print(f"📄 Metriche salvate in: {metrics_filename}")
+print(f"📄 Checkpoint salvato in: {checkpoint_filename}")
+print(f"   Contenuto: state_dict, architecture, hyperparameters, dataset_info, backbone, timestamp, test_metrics, baseline_f1")
