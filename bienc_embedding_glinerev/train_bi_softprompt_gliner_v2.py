@@ -191,15 +191,15 @@ class SoftGlinerTrainer:
                        "weight_decay": 0.01, "freeze_backbone": freeze_backbone}
 
     def _freeze_backbone(self):
-        """Congela solo token_rep_layer come Stefano, sbloccando rnn, span_rep_layer, etc."""
+        """Congela solo token_rep_layer, sbloccando rnn, span_rep_layer, etc."""
         if self.config["freeze_backbone"]:
             print("\n" + "="*70)
-            print("PARAMETER FREEZING SUMMARY (Stefano-style)")
+            print("PARAMETER FREEZING SUMMARY")
             print("="*70)
             
             model = self.model.model
             
-            # Congela SOLO token_rep_layer (come Stefano)
+            # Congela SOLO token_rep_layer
             components_to_freeze = ['token_rep_layer']
             
             # Prima sblocca tutto
@@ -221,7 +221,7 @@ class SoftGlinerTrainer:
                     param.requires_grad = True
                 print(f"  🔥 UNFROZEN: prompt_encoder (in wrapper)")
             
-            # Statistiche per componente (come Stefano)
+            # Statistiche per componente
             print("\n" + "-"*70)
             print("Component-wise Breakdown:")
             print(f"  {'Component':<25} {'Total':<15} {'Trainable':<15} {'% Trainable'}")
