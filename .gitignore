@@ -15,7 +15,7 @@
 /hardprompting/testresults/
 embedding_injection_monoenc/test_results/
 embedding_injection_bienc/test_results/
-bienc_embedding_glinerev/test_results/
+bienc_embedding_glinerev/results/
 bienc_embedding_glinerev/models_short_label/
 
 finetune/test/results/
