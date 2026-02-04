@@ -17,8 +17,6 @@ from tqdm import tqdm
 
 # Imports GLiNER e Transformers
 from gliner import GLiNER
-from gliner.modeling.base import BiEncoderSpanModel
-from gliner.modeling.utils import extract_word_embeddings
 from gliner.training import Trainer as BaseTrainer
 from gliner.training import TrainingArguments as BaseTrainingArguments
 
@@ -100,120 +98,59 @@ class PromptEncoder(nn.Module):
             )
         return modified_embeddings
 
-class CustomBiEncoderSpanModel(BiEncoderSpanModel):
-    def __init__(self, config: Any, from_pretrained: bool = False, cache_dir: Optional[Union[str, Path]] = None, 
-                 prompt_encoder: Optional[Any] = None, fixed_labels: Optional[list] = None) -> None:
-        super().__init__(config, from_pretrained, cache_dir)
-        if prompt_encoder is not None:
-            self.prompt_encoder = prompt_encoder
-        self.fixed_labels = fixed_labels
+# ==========================================
+# 1.5. LABEL ENCODER WRAPPER (approccio v1 che funziona)
+# ==========================================
+
+class SoftPromptLabelEncoderWrapper(nn.Module):
+    """Wrapper che intercetta le chiamate al label encoder e inietta soft prompts.
+    
+    Questo approccio mantiene il modello GLiNER intatto e modifica solo
+    il punto di iniezione delle embeddings.
+    """
+    def __init__(self, original_encoder, prompt_encoder, tokenizer=None):
+        super().__init__()
+        self.original_encoder = original_encoder
+        self.prompt_encoder = prompt_encoder
+        self.tokenizer = tokenizer
         self._debug_printed = False
         
-        # --- CACCIA AL TESORO: TROVA IL LAYER DI PROIEZIONE ---
-        self.projection_layer = None
-        
-        # Tentativo 1: Nome standard
-        if hasattr(self.token_rep_layer, 'projection'):
-            self.projection_layer = self.token_rep_layer.projection
-            print("✅ Projection Layer trovato (metodo standard).")
-        else:
-            # Tentativo 2: Cerca tra i moduli figli un Linear 384->768
-            print("⚠️ Projection Layer 'projection' non trovato. Cerco manualmente...")
-            found = False
-            for name, module in self.token_rep_layer.named_children():
-                if isinstance(module, nn.Linear):
-                    # Verifica le dimensioni
-                    if module.in_features == 384 and module.out_features == 768:
-                        self.projection_layer = module
-                        print(f"✅ Projection Layer trovato: '{name}' ({module})")
-                        found = True
-                        break
-            
-            if not found:
-                print("❌ CRITICAL: Nessun Projection Layer 384->768 trovato! Il modello crasherà.")
-
-    def _create_position_mask_for_labels(self, label_input_ids: torch.Tensor) -> torch.Tensor:
+    def _create_position_mask(self, input_ids):
+        """Crea mask per identificare i token delle label (escludendo special tokens)."""
         BOS_TOKEN, EOS_TOKEN, PAD_TOKEN = 101, 102, 0
-        position_mask = torch.zeros_like(label_input_ids, dtype=torch.long)
-        mask = (label_input_ids != BOS_TOKEN) & (label_input_ids != EOS_TOKEN) & (label_input_ids != PAD_TOKEN)
-        position_mask[mask] = 1
-        return position_mask
-
-    def get_representations(
-        self, input_ids=None, attention_mask=None, labels_embeds=None, labels_input_ids=None, 
-        labels_attention_mask=None, text_lengths=None, words_mask=None, **kwargs
-    ):
-        # 1. Text Encode
-        token_embeds = self.token_rep_layer.encode_text(input_ids, attention_mask, **kwargs)
-
-        # 2. Label Encode
-        labels_encoder = self.token_rep_layer.labels_encoder
-        labels_position_mask = self._create_position_mask_for_labels(labels_input_ids)
+        mask = (input_ids != BOS_TOKEN) & (input_ids != EOS_TOKEN) & (input_ids != PAD_TOKEN)
+        return mask.long()
         
-        # 2b. Raw Embeddings (384)
-        raw_labels_embeds = labels_encoder.model.embeddings(labels_input_ids) 
-
-        # 2c. Soft Prompt (384 -> 384)
-        if hasattr(self, 'prompt_encoder'):
-            labels_embeds = self.prompt_encoder(raw_labels_embeds, labels_position_mask)
-        else:
-            labels_embeds = raw_labels_embeds
-
-        # 2d. Transformer (384 -> 384)
-        labels_out = labels_encoder.model(inputs_embeds=labels_embeds)
-        labels_embeds = labels_out.last_hidden_state[:, 0, :] # Pooling [CLS]
+    def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, **kwargs):
+        # Se già abbiamo embeddings, usa quelle
+        if inputs_embeds is None and input_ids is not None:
+            # 1. Ottieni embeddings originali
+            raw_embeds = self.original_encoder.embeddings(input_ids)
+            
+            # 2. Crea position mask
+            position_mask = self._create_position_mask(input_ids)
+            
+            # 3. Applica soft prompt
+            inputs_embeds = self.prompt_encoder(raw_embeds, position_mask)
+            
+            # Debug
+            if not self._debug_printed:
+                print(f"\n[WRAPPER DEBUG]")
+                print(f"  Input IDs shape: {input_ids.shape}")
+                print(f"  Raw embeds shape: {raw_embeds.shape}")
+                print(f"  Soft embeds shape: {inputs_embeds.shape}")
+                self._debug_printed = True
         
-        # 2e. PROJECTION (384 -> 768) - USIAMO QUELLO TROVATO IN INIT
-        if self.projection_layer is not None:
-             labels_embeds = self.projection_layer(labels_embeds)
+        # 4. Passa al transformer encoder originale
+        return self.original_encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
 
-        # DEBUG PRINTS
-        if not self._debug_printed:
-            print(f"\n[DEBUG SHAPES]")
-            print(f"Raw Label Emb: {raw_labels_embeds.shape}")
-            print(f"Projected Label: {labels_embeds.shape} (TARGET: 768)")
-            print(f"Text Emb: {token_embeds.shape}")
-            self._debug_printed = True
-
-        # 3. Output packaging
-        batch_size, _, embed_dim = token_embeds.shape
-        max_text_length = text_lengths.max()
-        words_embedding, mask = extract_word_embeddings(
-            token_embeds, words_mask, attention_mask, batch_size, max_text_length, embed_dim, text_lengths
-        )
-        labels_embeds = labels_embeds.unsqueeze(0).expand(batch_size, -1, -1)
-        labels_mask = torch.ones(labels_embeds.shape[:-1], dtype=attention_mask.dtype, device=attention_mask.device)
-        labels_embeds = labels_embeds.to(words_embedding.dtype)
-
-        return labels_embeds, labels_mask, words_embedding, mask
-
-class SoftBiGliner(GLiNER):
-    @classmethod
-    def from_pretrained(cls, model_id, prompt_encoder_cls=None, fixed_labels=None, **kwargs):
-        instance = super().from_pretrained(model_id, **kwargs)
-        if not hasattr(instance.model, 'token_rep_layer') or not hasattr(instance.model.token_rep_layer, 'labels_encoder'):
-            raise ValueError("Il modello non è un Bi-Encoder.")
-
-        # RILEVAMENTO DIMENSIONE REALE (384)
+    def __getattr__(self, name):
+        """Delega tutti gli altri attributi all'encoder originale."""
         try:
-            label_emb_layer = instance.model.token_rep_layer.labels_encoder.model.embeddings.word_embeddings
-            label_embedding_dim = label_emb_layer.weight.shape[1]
-            print(f"✅ Label Dim: {label_embedding_dim}")
+            return super().__getattr__(name)
         except AttributeError:
-            label_embedding_dim = instance.model.token_rep_layer.labels_encoder.config.hidden_size
-            print(f"⚠️ Config Dim: {label_embedding_dim}")
+            return getattr(self.original_encoder, name)
 
-        prompt_encoder = None
-        if prompt_encoder_cls is not None and fixed_labels is not None:
-            # INIZIALIZZAZIONE CORRETTA A 384
-            prompt_encoder = prompt_encoder_cls(backbone_hidden_size=label_embedding_dim, num_labels=len(fixed_labels))
-            print(f"✅ PromptEncoder inizializzato a dim: {label_embedding_dim}")
-
-        old_model = instance.model
-        instance.model = CustomBiEncoderSpanModel(old_model.config, prompt_encoder=prompt_encoder, fixed_labels=fixed_labels)
-        instance.model.load_state_dict(old_model.state_dict(), strict=False)
-        instance.model.to(instance.device)
-        return instance
 
 # ==========================================
 # 2. TRAINER & UTILS
@@ -257,9 +194,15 @@ class SoftGlinerTrainer:
         if self.config["freeze_backbone"]:
             print("\n❄️ FREEZING BACKBONE...")
             for param in self.model.model.parameters(): param.requires_grad = False
-            if hasattr(self.model.model, 'prompt_encoder'):
-                for param in self.model.model.prompt_encoder.parameters(): param.requires_grad = True
+            
+            # Con l'approccio wrapper, il prompt_encoder è nel wrapped_encoder
+            wrapped_encoder = self.model.model.token_rep_layer.labels_encoder.model
+            if hasattr(wrapped_encoder, 'prompt_encoder'):
+                for param in wrapped_encoder.prompt_encoder.parameters(): param.requires_grad = True
                 print("🔥 Prompt Encoder: UNFROZEN")
+            else:
+                print("⚠️ WARNING: prompt_encoder non trovato nel wrapper!")
+            
             trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             print(f"Trainable Params: {trainable:,}")
 
@@ -331,14 +274,213 @@ label_list = sorted(list(all_labels))
 print(f"Labels found: {len(label_list)}")
 
 # ==========================================
-# 4. EXECUTION
+# 3.5. DEFINIZIONE FUNZIONE METRICHE (prima del training)
 # ==========================================
-print("INITIALIZING SOFT BI-GLINER")
-model = SoftBiGliner.from_pretrained(MODEL_NAME, prompt_encoder_cls=PromptEncoder, fixed_labels=label_list)
+from collections import defaultdict
+
+def calculate_metrics(dataset, model, batch_size=1):
+    """Funzione di valutazione robusta dalla v1"""
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # Gather all labels from dataset (already converted to short labels)
+    all_labels = set()
+    for d in dataset:
+        for x in d['ner']: 
+            all_labels.add(x[2])
+    
+    # Ensure 'O' is not in the label list
+    if 'O' in all_labels:
+        all_labels.remove('O')
+        
+    label_list = sorted(list(all_labels))
+    
+    print(f"\nEvaluating on {len(dataset)} samples with {len(label_list)} labels")
+    
+    tp = defaultdict(int)
+    fp = defaultdict(int)
+    fn = defaultdict(int)
+    support = defaultdict(int)
+    
+    # Process in batches
+    debug_counter = 0
+    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
+        batch_items = dataset[i:i+batch_size]
+        batch_texts = [" ".join(d['tokenized_text']) for d in batch_items]
+        
+        with torch.no_grad():
+            if hasattr(model, 'inference'):
+                 batch_preds = model.inference(batch_texts, label_list, threshold=0.5)
+            elif hasattr(model, 'batch_predict_entities'):
+                 batch_preds = model.batch_predict_entities(batch_texts, label_list, threshold=0.5)
+            else:
+                 batch_preds = [model.predict_entities(t, label_list, threshold=0.5) for t in batch_texts]
+
+        for idx, item in enumerate(batch_items):
+            # Ground Truth Spans
+            gt_spans = set()
+            for s, e, l in item['ner']:
+                if l != 'O': # Ignore O class
+                    gt_spans.add((l, s, e)) 
+                    support[l] += 1
+            
+            preds = batch_preds[idx]
+            
+            # Map character spans to token spans
+            tokens = item['tokenized_text']
+            char_to_token = {}
+            cursor = 0
+            for t_i, token in enumerate(tokens):
+                start = cursor
+                end = cursor + len(token)
+                for c in range(start, end):
+                    char_to_token[c] = t_i
+                cursor = end + 1 # +1 for space
+            
+            pred_spans = set()
+            for p in preds:
+                label = p['label']
+                if label == 'O': continue # Explicitly ignore predicted O just in case
+
+                p_start = p['start']
+                p_end = p['end'] 
+                
+                if p_start in char_to_token and (p_end - 1) in char_to_token:
+                    t_start = char_to_token[p_start]
+                    t_end = char_to_token[p_end - 1]
+                    pred_spans.add((label, t_start, t_end))
+            
+            # 🐛 DEBUG: Stampa primi 3 esempi
+            if debug_counter < 3:
+                print(f"\n🐛 DEBUG Sample {debug_counter + 1}:")
+                print(f"  Text: {' '.join(tokens[:20])}...")
+                print(f"  GT Spans: {list(gt_spans)[:5]}")
+                print(f"  Raw Preds: {preds[:5]}")
+                print(f"  Pred Spans (token): {list(pred_spans)[:5]}")
+                debug_counter += 1
+            
+            # Compare
+            tps = pred_spans.intersection(gt_spans)
+            fps = pred_spans - gt_spans
+            fns = gt_spans - pred_spans
+            
+            for l, s, e in tps: tp[l] += 1
+            for l, s, e in fps: fp[l] += 1
+            for l, s, e in fns: fn[l] += 1
+
+    # Calculate Global Metrics
+    p_s, r_s, f1_s = [], [], []
+    valid_labels = [l for l in label_list if support[l] > 0 or fp[l] > 0] 
+    
+    # 🐛 DEBUG: Stampa statistiche
+    print(f"\n🐛 DEBUG METRICS:")
+    print(f"  Total TP: {sum(tp.values())}")
+    print(f"  Total FP: {sum(fp.values())}")
+    print(f"  Total FN: {sum(fn.values())}")
+    print(f"  Total Support (GT entities): {sum(support.values())}")
+    print(f"  Valid Labels: {len(valid_labels)}")
+    
+    for l in valid_labels:
+        t = tp[l]
+        f_p = fp[l]
+        f_n = fn[l]
+        p = t / (t + f_p) if (t + f_p) > 0 else 0.0
+        r = t / (t + f_n) if (t + f_n) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        p_s.append(p)
+        r_s.append(r)
+        f1_s.append(f1)
+        
+    macro_p = np.mean(p_s) if p_s else 0.0
+    macro_r = np.mean(r_s) if r_s else 0.0
+    macro_f1 = np.mean(f1_s) if f1_s else 0.0
+    
+    total_tp = sum(tp.values())
+    total_fp = sum(fp.values())
+    total_fn = sum(fn.values())
+    
+    micro_p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
+    
+    print("\n## 📈 Global Metrics (Label2ID Mode, EXCLUDING O)\n")
+    print(f"### Performance Summary")
+    print(f"| Average Type | Precision | Recall | F1-Score |")
+    print(f"|:-------------|----------:|-------:|---------:|")
+    print(f"| **Macro**    | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |")
+    print(f"| **Micro**    | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |")
+    
+    return {
+        "macro_precision": macro_p,
+        "macro_recall": macro_r,
+        "macro_f1": macro_f1,
+        "micro_precision": micro_p,
+        "micro_recall": micro_r,
+        "micro_f1": micro_f1
+    }
+
+# ==========================================
+# 4. EXECUTION - Usando wrapper approach (come v1)
+# ==========================================
+print("INITIALIZING SOFT BI-GLINER (Wrapper Approach)")
+
+# 4.1. Carica modello GLiNER base
+model = GLiNER.from_pretrained(MODEL_NAME)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+print(f"✅ Model loaded on {device}")
+
+# 4.2. Verifica che sia bi-encoder
+if not hasattr(model.model, 'token_rep_layer') or not hasattr(model.model.token_rep_layer, 'labels_encoder'):
+    raise ValueError("Il modello non è un Bi-Encoder!")
+
+# 4.3. Ottieni dimensioni e crea PromptEncoder
+lbl_enc_model = model.model.token_rep_layer.labels_encoder.model
+original_embeddings = lbl_enc_model.embeddings.word_embeddings
+embed_dim = original_embeddings.embedding_dim
+print(f"✅ Label Embedding Dim: {embed_dim}")
+
+# 4.4. Crea PromptEncoder
+prompt_encoder = PromptEncoder(
+    backbone_hidden_size=embed_dim,
+    num_labels=len(label_list)
+).to(device)
+print(f"✅ PromptEncoder creato con dim={embed_dim}, num_labels={len(label_list)}")
+
+# 4.5. Crea wrapper e inietta nel modello
+wrapped_encoder = SoftPromptLabelEncoderWrapper(lbl_enc_model, prompt_encoder)
+model.model.token_rep_layer.labels_encoder.model = wrapped_encoder
+print("✅ SoftPromptLabelEncoderWrapper iniettato nel modello!")
+
+# 4.6. Verifica device
+print(f"🖥️ Device: {device}")
+print(f"🖥️ CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"🖥️ GPU: {torch.cuda.get_device_name(0)}")
+
+# ==========================================
+# 4.5. BASELINE TEST (PRE-TRAINING) - Usando GLiNER evaluate()
+# ==========================================
+print("\n" + "="*50)
+print("🔬 BASELINE EVALUATION (Pre-Training)")
+print("="*50)
+model.eval()
+baseline_output, baseline_f1 = model.evaluate(
+    test_data=test_dataset,
+    flat_ner=True,
+    multi_label=False,
+    threshold=0.5,
+    batch_size=8
+)
+print(f"Baseline Results:\n{baseline_output}")
+print(f"Baseline F1: {baseline_f1:.4f}")
+print("="*50)
 
 trainer_wrapper = SoftGlinerTrainer(
     model=model, train_dataset=train_dataset, val_dataset=val_dataset,
-    batch_size=8, num_epochs=1, learning_rate=1e-4, prompt_encoder_lr=5e-4, others_lr=1e-6, freeze_backbone=True
+    batch_size=8, num_epochs=5, learning_rate=5e-2, prompt_encoder_lr=5e-2, others_lr=1e-6, freeze_backbone=True
 )
 
 print("Starting training...")
@@ -358,7 +500,9 @@ print(f"\n💾 Salvataggio del miglior Prompt Encoder in {save_dir}...")
 
 # 1. Salva solo lo state_dict del Prompt Encoder (super leggero) con TIMESTAMP
 prompt_encoder_filename = f"prompt_encoder_{timestamp}.pt"
-torch.save(model.model.prompt_encoder.state_dict(), save_dir / prompt_encoder_filename)
+# Con l'approccio wrapper, il prompt_encoder è nel wrapped_encoder
+wrapped_encoder = model.model.token_rep_layer.labels_encoder.model
+torch.save(wrapped_encoder.prompt_encoder.state_dict(), save_dir / prompt_encoder_filename)
 
 # 2. Salva Iperparametri
 metadata = {
@@ -380,144 +524,45 @@ with open(save_dir / f"metadata_prompt_tuning_{timestamp}.json", "w") as f:
 print("✅ Salvataggio completato.")
 
 # ==========================================
-# 6. TESTING E CALCOLO METRICHE (AGGIORNATO)
+# 6. TESTING FINALE (POST-TRAINING) - Usando GLiNER evaluate() come in validazione
 # ==========================================
-print("\n🧪 Esecuzione Test Set con conversione Caratteri -> Token...")
 
+print("\n" + "="*50)
+print("🧪 FINAL EVALUATION (Post-Training)")
+print("="*50)
 model.eval()
 
-def convert_char_to_token_spans(char_entities: List[Dict], tokens: List[str]) -> List[Tuple[int, int, str]]:
-    """Helper per convertire output GLiNER (caratteri) in formato Dataset (token)"""
-    char_to_token = []
-    
-    for token_idx, token in enumerate(tokens):
-        for _ in range(len(token)):
-            char_to_token.append(token_idx)
-        if token_idx < len(tokens) - 1:
-            char_to_token.append(token_idx)
-            
-    token_spans = []
-    for entity in char_entities:
-        start_char = entity['start']
-        end_char = entity['end'] - 1 
-        label = entity['label']
+# Usa lo stesso metodo di valutazione usato durante il training!
+output_str, f1_score = model.evaluate(
+    test_data=test_dataset,
+    flat_ner=True,
+    multi_label=False,
+    threshold=0.5,
+    batch_size=8
+)
 
-        if start_char < len(char_to_token) and end_char < len(char_to_token):
-            start_token = char_to_token[start_char]
-            end_token = char_to_token[end_char]
-            token_spans.append((start_token, end_token, label))
-            
-    return token_spans
+print(f"\n📊 Risultati Test Set:")
+print(output_str)
+print(f"F1 Score: {f1_score:.4f}")
 
-def evaluate_token_level(model, dataset, labels):
-    results = []
-    for sample in tqdm(dataset, desc="Valutazione Test Set"):
-        text = " ".join(sample['tokenized_text'])
-        preds_char = model.predict_entities(text, labels=labels, threshold=0.5, flat_ner=True)
-        preds_token = convert_char_to_token_spans(preds_char, sample['tokenized_text'])
-        
-        results.append({
-            "text": text,
-            "truth": sample['ner'], # [start, end, label]
-            "pred": preds_token
-        })
-    return results
+# Salva metriche
+import re
+pattern = r'P:\s*([\d.]+)%\s*R:\s*([\d.]+)%\s*F1:\s*([\d.]+)%'
+match = re.search(pattern, output_str)
 
-def compute_span_metrics(results: List[Dict], ignore_labels: Set[str] = None):
-    """Calcola Micro e Macro F1 ignorando specifiche etichette (es. 'O')"""
-    if ignore_labels is None:
-        ignore_labels = {"O"}
-
-    # Contatori Globali (Micro)
-    g_tp, g_fp, g_fn = 0, 0, 0
-    # Contatori per Classe (Macro)
-    class_stats = {}
-
-    for item in results:
-        # Convertiamo in set di tuple (start, end, label) filtrando 'O'
-        true_spans = set(tuple(x) for x in item['truth'] if x[2] not in ignore_labels)
-        pred_spans = set(tuple(x) for x in item['pred'] if x[2] not in ignore_labels)
-
-        # Calcolo intersezioni
-        tp_spans = true_spans & pred_spans
-        fp_spans = pred_spans - true_spans
-        fn_spans = true_spans - pred_spans
-
-        # Aggiornamento Micro
-        g_tp += len(tp_spans)
-        g_fp += len(fp_spans)
-        g_fn += len(fn_spans)
-
-        # --- CORREZIONE QUI SOTTO ---
-        # Estraiamo le classi uniche presenti in questo documento
-        # Usiamo le parentesi graffe {} per creare direttamente dei SET, non liste []
-        true_classes = {x[2] for x in true_spans}
-        pred_classes = {x[2] for x in pred_spans}
-        
-        # Ora possiamo usare l'operatore | perché sono entrambi set
-        all_classes = true_classes | pred_classes
-        # ----------------------------
-
-        for cls in all_classes:
-            if cls not in class_stats: class_stats[cls] = {'tp': 0, 'fp': 0, 'fn': 0}
-            class_stats[cls]['tp'] += sum(1 for x in tp_spans if x[2] == cls)
-            class_stats[cls]['fp'] += sum(1 for x in fp_spans if x[2] == cls)
-            class_stats[cls]['fn'] += sum(1 for x in fn_spans if x[2] == cls)
-
-    # Calcolo Micro Metrics
-    micro_prec = g_tp / (g_tp + g_fp) if (g_tp + g_fp) > 0 else 0.0
-    micro_rec = g_tp / (g_tp + g_fn) if (g_tp + g_fn) > 0 else 0.0
-    micro_f1 = 2 * (micro_prec * micro_rec) / (micro_prec + micro_rec) if (micro_prec + micro_rec) > 0 else 0.0
-
-    # Calcolo Macro Metrics
-    macro_f1_scores = []
-    for cls, stats in class_stats.items():
-        tp, fp, fn = stats['tp'], stats['fp'], stats['fn']
-        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0.0
-        macro_f1_scores.append(f1)
-    
-    macro_f1 = sum(macro_f1_scores) / len(macro_f1_scores) if macro_f1_scores else 0.0
-
-    return {
-        "micro_precision": round(micro_prec, 4),
-        "micro_recall": round(micro_rec, 4),
-        "micro_f1": round(micro_f1, 4),
-        "macro_f1": round(macro_f1, 4),
-        "global_tp": g_tp,
-        "global_fp": g_fp,
-        "global_fn": g_fn
+if match:
+    metrics = {
+        "precision": float(match.group(1)) / 100.0,
+        "recall": float(match.group(2)) / 100.0,
+        "f1": float(match.group(3)) / 100.0
     }
+else:
+    metrics = {"f1": f1_score, "raw_output": output_str}
 
-# 1. Esegui Predizioni
-test_results = evaluate_token_level(model, test_dataset, label_list)
-
-# 2. Calcola Metriche
-metrics = compute_span_metrics(test_results, ignore_labels={"O"})
-
-# 3. Stampa Report
-print("\n" + "="*30)
-print(f"📊 RISULTATI TEST SET (No 'O')")
-print("="*30)
-print(f"Micro Precision: {metrics['micro_precision']}")
-print(f"Micro Recall:    {metrics['micro_recall']}")
-print(f"Micro F1:        {metrics['micro_f1']}")
-print("-" * 20)
-print(f"Macro F1:        {metrics['macro_f1']}")
-print("="*30)
-
-# 4. Salva Risultati Completi e Metriche
-results_filename = f"test_results_{timestamp}.json"
 metrics_filename = f"test_metrics_{timestamp}.json"
-
-with open(save_dir / results_filename, "w") as f:
-    json.dump(test_results, f, indent=2)
-
 with open(save_dir / metrics_filename, "w") as f:
     json.dump(metrics, f, indent=4)
 
 print(f"\n✅ Script terminato.")
 print(f"📁 Directory Output: {save_dir}")
 print(f"📄 Metriche salvate in: {metrics_filename}")
-print(f"📄 Risultati dettagliati in: {results_filename}")
