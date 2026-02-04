@@ -20,6 +20,8 @@ bienc_embedding_glinerev/models_short_label/
 
 finetune/test/results/
 
+thesismaterial/
+
 *.code-workspace
 
 .directory
