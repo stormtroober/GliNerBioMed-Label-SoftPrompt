@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 DATASET_FOLDER = "dataset"  # or "dataset_bc5cdr" for BC5CDR dataset
 
 if is_running_on_kaggle():
-    path = "/kaggle/input/jnlpa15k/"
+    path = "/kaggle/input/jnlpa-6-2k5-1-2-complete/"
     train_path = path + "dataset_span_mono.json"
     val_path = path + "val_dataset_span_mono.json"
     test_path = path + "test_dataset_span_mono.json"
