@@ -1,4 +1,6 @@
 
+#Time per epoch: 133.13s (2.22 min)
+
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 def is_running_on_kaggle():
@@ -6,6 +8,8 @@ def is_running_on_kaggle():
 
 import json 
 import random
+import time
+from datetime import datetime
 from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
@@ -21,34 +25,26 @@ random.seed(RANDOM_SEED)
 # CONFIGURATION
 # ==========================================
 
+# Dataset Configuration (choose one)
+# For JNLPA dataset
+DATASET_FOLDER = "dataset"  # or "dataset_bc5cdr" for BC5CDR dataset
+
 if is_running_on_kaggle():
-    path = "/kaggle/input/jnlpa15k/"
+    path = "/kaggle/input/jnlpa-18-5k15-3-5-complete/"
+    train_path = path + "dataset_span_bi.json"
+    val_path = path + "val_dataset_span_bi.json"
+    test_path = path + "test_dataset_span_bi.json"
+    label2id_path = path + "label2id.json"
 else:
-    path = "finetune/"
-
-train_path = path + "jnlpa_train.json"
-test_path = path + "jnlpa_test.json"
-label2id_path = path + "label2id.json"
-
-# ==========================================
-# VALIDATION CONFIGURATION
-# ==========================================
-# 🔄 Flag per gestione validation:
-# - True: usa file di validation separato
-# - False: split del training set (80% train, 20% val)
-USE_SEPARATE_VAL_FILE = False
-VAL_SPLIT_RATIO = 0.2  # Usato solo se USE_SEPARATE_VAL_FILE = False
-
-# Path validation (usato solo se USE_SEPARATE_VAL_FILE = True)
-if USE_SEPARATE_VAL_FILE:
-    if is_running_on_kaggle():
-        val_path = "/kaggle/input/jnlpa15k/jnlpa_val.json"
-    else:
-        val_path = path + "jnlpa_val.json"
+    # Local paths with configurable dataset folder
+    train_path = f"{DATASET_FOLDER}/dataset_span_bi.json"
+    val_path = f"{DATASET_FOLDER}/val_dataset_span_bi.json"
+    test_path = f"{DATASET_FOLDER}/test_dataset_span_bi.json"
+    label2id_path = f"{DATASET_FOLDER}/label2id.json"
 
 # Training Configuration
 target_steps = None       # Se impostato, il training si fermerà esattamente a questi step
-target_epochs = 5         # Usato solo se target_steps è None
+target_epochs = 10         # Usato solo se target_steps è None
 batch_size = 32
 
 # ==========================================
@@ -175,8 +171,16 @@ def calculate_metrics(dataset, model, batch_size=1):
 # ==========================================
 
 print("Loading datasets and mappings...")
+print(f"\nDataset folder: {DATASET_FOLDER if not is_running_on_kaggle() else 'Kaggle'}")
+print(f"Train path: {train_path}")
+print(f"Validation path: {val_path}")
+print(f"Test path: {test_path}")
+
 with open(train_path, "r") as f:
     train_dataset = json.load(f)
+
+with open(val_path, "r") as f:
+    val_dataset = json.load(f)
 
 with open(test_path, "r") as f:
     test_dataset = json.load(f)
@@ -184,10 +188,6 @@ with open(test_path, "r") as f:
 with open(label2id_path, "r") as f:
     label2id = json.load(f)
 
-# Create reverse mapping: ID -> Label Name
-# Ensure keys in map are strings because JSON keys are strings, 
-# but values in label2id are ints. 
-# The dataset has IDs as strings (from my previous edit).
 id2label = {str(v): k for k, v in label2id.items()}
 
 def convert_ids_to_labels(dataset, id_map):
@@ -230,24 +230,11 @@ def convert_ids_to_labels(dataset, id_map):
 print("\nConverting Training Dataset IDs to Labels...")
 train_dataset = convert_ids_to_labels(train_dataset, id2label)
 
+print("\nConverting Validation Dataset IDs to Labels...")
+val_dataset = convert_ids_to_labels(val_dataset, id2label)
+
 print("\nConverting Test Dataset IDs to Labels...")
 test_dataset = convert_ids_to_labels(test_dataset, id2label)
-
-# ==========================================
-# VALIDATION SPLIT
-# ==========================================
-if USE_SEPARATE_VAL_FILE:
-    print(f"\n📚 Loading validation dataset from separate file: {val_path}")
-    with open(val_path, "r") as f:
-        val_dataset = json.load(f)
-    print("Converting Validation Dataset IDs to Labels...")
-    val_dataset = convert_ids_to_labels(val_dataset, id2label)
-else:
-    print(f"\n📊 Splitting training set ({int((1-VAL_SPLIT_RATIO)*100)}% train, {int(VAL_SPLIT_RATIO*100)}% val)...")
-    random.shuffle(train_dataset)
-    val_size = int(len(train_dataset) * VAL_SPLIT_RATIO)
-    val_dataset = train_dataset[:val_size]
-    train_dataset = train_dataset[val_size:]
 
 print(f'\nFinal Train dataset size: {len(train_dataset)}')
 print(f'Final Validation dataset size: {len(val_dataset)}')
@@ -295,11 +282,23 @@ use_fp16 = use_cuda and not use_bf16
 save_steps = 100
 logging_steps = save_steps
 
+print(f"\n⏱️ TRAINING TIMING INFO:")
+print(f"  Samples: {data_size}")
+print(f"  Batch size: {batch_size}")
+print(f"  Steps per epoch: {num_batches_per_epoch}")
+print(f"  Logging every: {logging_steps} steps")
+print(f"  Saving every: {save_steps} steps")
+print(f"  Total epochs: {num_train_epochs}")
+print(f"  Total steps: {total_steps}\n")
+
+# Start timing
+start_time = time.time()
+
 trainer = model.train_model(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,  # ✅ Usa validation set, NON test set
     output_dir="models_short_label",
-    learning_rate=5e-6,
+    learning_rate=9.96554625802328e-05,
     weight_decay=0.01,
     others_lr=1e-5,
     others_weight_decay=0.01,
@@ -308,7 +307,7 @@ trainer = model.train_model(
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
     focal_loss_alpha=0.75,
-    focal_loss_gamma=2,
+    focal_loss_gamma=4.414064315327594,
     num_train_epochs=num_train_epochs,
     max_steps=max_steps,
     save_steps=save_steps,
@@ -323,15 +322,76 @@ trainer = model.train_model(
     report_to="none",
     )
 
+# Calculate and display timing statistics
+total_time = time.time() - start_time
+time_per_epoch = total_time / num_train_epochs
+time_per_step = total_time / total_steps
+
+print(f"\n⏱️ TRAINING COMPLETE:")
+print(f"  Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
+print(f"  Time per epoch: {time_per_epoch:.2f}s ({time_per_epoch/60:.2f} min)")
+print(f"  Time per step: {time_per_step:.2f}s\n")
+
 # Save the best model
 best_model_path = "models_short_label/best_model"
 model.save_pretrained(best_model_path)
 print(f"Best model saved to {best_model_path}")
 
-# Zip it
-zip_name = "best_model_short_label_archive"
-shutil.make_archive(zip_name, 'zip', best_model_path)
-print(f"Best model zipped to {os.path.abspath(zip_name + '.zip')}")
+# Create timestamp for checkpoint
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Create a comprehensive checkpoint dictionary (same format as monoenc)
+checkpoint = {
+    "model_state_dict": model.state_dict(),
+    "config": model.config,
+    "training_metadata": {
+        "base_model_name": MODEL_NAME,
+        "encoder_type": "bi-encoder",
+        "dataset_name": DATASET_FOLDER if not is_running_on_kaggle() else "jnlpa-18-5k15-3-5-complete",
+        "train_dataset_size": len(train_dataset),
+        "val_dataset_size": len(val_dataset),
+        "test_dataset_size": len(test_dataset),
+        "num_epochs": num_train_epochs,
+        "batch_size": batch_size,
+        "learning_rate": 9.96554625802328e-05,
+        "weight_decay": 0.01,
+        "others_lr": 1e-5,
+        "others_weight_decay": 0.01,
+        "lr_scheduler_type": "linear",
+        "warmup_ratio": 0.1,
+        "focal_loss_alpha": 0.75,
+        "focal_loss_gamma": 4.414064315327594,
+        "max_steps": max_steps,
+        "save_steps": save_steps,
+        "logging_steps": logging_steps,
+        "random_seed": RANDOM_SEED,
+        "total_time_seconds": total_time,
+        "time_per_epoch_seconds": time_per_epoch,
+        "time_per_step_seconds": time_per_step,
+        "total_steps": total_steps,
+        "exclude_O_class": True,
+        "timestamp": timestamp
+    }
+}
+
+# Save the complete checkpoint as .pt file
+checkpoint_filename = f"finetune_bienc_{timestamp}.pt"
+checkpoint_path = os.path.join("models_short_label", checkpoint_filename)
+
+if not os.path.exists("models_short_label"):
+    os.makedirs("models_short_label")
+
+torch.save(checkpoint, checkpoint_path)
+print(f"Best model checkpoint (.pt) saved to {checkpoint_path}")
+
+# Also save metadata as JSON for easy reading
+json_filename = f"metadata_{timestamp}.json"
+json_path = os.path.join("models_short_label", json_filename)
+metadata_json = checkpoint["training_metadata"].copy()
+metadata_json["label2id"] = label2id
+with open(json_path, "w") as f:
+    json.dump(metadata_json, f, indent=2)
+print(f"Metadata JSON saved to {json_path}")
 
 # Load and Evaluate
 trained_model = GLiNER.from_pretrained(best_model_path).to(device)

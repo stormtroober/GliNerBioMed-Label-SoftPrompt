@@ -332,6 +332,7 @@ checkpoint = {
     "config": model.config, 
     "training_metadata": {
         "base_model_name": MODEL_NAME,
+        "encoder_type": "mono-encoder",
         "train_dataset_size": len(train_dataset),
         "test_dataset_size": len(test_dataset),
         "num_epochs": num_train_epochs,

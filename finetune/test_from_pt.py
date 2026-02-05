@@ -155,10 +155,24 @@ def convert_ids_to_labels(dataset, id_map):
 
 def main():
     parser = argparse.ArgumentParser(description="Test GLiNER model from a .pt checkpoint.")
-    parser.add_argument("--pt_path", type=str, default="models/", help="Path to the model .pt file.")
-    parser.add_argument("--test_data", type=str, default="../dataset/test_dataset_span_mono.json", help="Path to test dataset.")
-    parser.add_argument("--label2id", type=str, default="../dataset/label2id.json", help="Path to label2id mapping.")
+    parser.add_argument("--pt_path", type=str, default="savings", help="Path to the model .pt file or directory containing .pt files.")
+    parser.add_argument("--encoder_type", type=str, required=True, choices=["bi", "mono"], 
+                        help="Type of encoder: 'bi' for bi-encoder or 'mono' for mono-encoder.")
+    parser.add_argument("--test_data", type=str, default=None, 
+                        help="Path to test dataset. If not specified, auto-selects based on encoder type.")
+    parser.add_argument("--label2id", type=str, default="../dataset/label2id.json", 
+                        help="Path to label2id mapping.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation.")
+    
+    args = parser.parse_args()
+    
+    # Auto-select test data based on encoder type if not specified
+    if args.test_data is None:
+        if args.encoder_type == "bi":
+            args.test_data = "../dataset/test_dataset_span_bi.json"
+        else:  # mono
+            args.test_data = "../dataset/test_dataset_span_mono.json"
+        print(f"Auto-selected test dataset for {args.encoder_type}-encoder: {args.test_data}")
     
     args = parser.parse_args()
     
@@ -195,7 +209,15 @@ def main():
         print(f"{k}: {v}")
     print("="*50 + "\n")
     
-    MODEL_NAME = "urchade/gliner_small-v2.1"
+    # Select base model based on encoder type
+    if args.encoder_type == "bi":
+        MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
+        FALLBACK_MODEL = "Ihor/gliner-biomed-bi-small-v1.0"
+    else:  # mono
+        MODEL_NAME = "urchade/gliner_small-v2.1"
+        FALLBACK_MODEL = "urchade/gliner_small-v2.1"
+    
+    print(f"Using {args.encoder_type}-encoder base model: {MODEL_NAME}")
     
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     
@@ -213,9 +235,9 @@ def main():
         
     except Exception as e:
         print(f"Error loading model: {e}")
-        print("Attempting to load 'urchade/gliner_small-v2.1' as fallback base...")
+        print(f"Attempting to load '{FALLBACK_MODEL}' as fallback base...")
         try:
-            model = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
+            model = GLiNER.from_pretrained(FALLBACK_MODEL)
             model.load_state_dict(checkpoint["model_state_dict"])
             model.to(device)
             model.eval()
@@ -243,7 +265,7 @@ def main():
     TEST_RESULTS_DIR = "test/results"
     os.makedirs(TEST_RESULTS_DIR, exist_ok=True)
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"{TEST_RESULTS_DIR}/eval_from_pt_{timestamp}.md"
+    filename = f"{TEST_RESULTS_DIR}/eval_{args.encoder_type}enc_from_pt_{timestamp}.md"
     
     with open(filename, "w", encoding="utf-8") as f:
         # Config Section
