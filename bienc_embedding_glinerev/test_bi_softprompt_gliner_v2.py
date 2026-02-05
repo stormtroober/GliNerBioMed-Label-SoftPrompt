@@ -297,8 +297,8 @@ def find_v2_checkpoint_interactive():
     """Find v2 checkpoint files with interactive selection."""
     savings_dir = Path("savings")
     
-    # Look for prompt_encoder_*.pt files directly in savings/
-    v2_files = list(savings_dir.glob("prompt_encoder_*.pt"))
+    # Look for both new (model_soft_tuned) and old (prompt_encoder) files
+    v2_files = list(savings_dir.glob("model_soft_tuned_*.pt")) + list(savings_dir.glob("prompt_encoder_*.pt"))
     
     if not v2_files:
         return None
@@ -314,12 +314,18 @@ def find_v2_checkpoint_interactive():
         info = ""
         try:
             ckpt = torch.load(f, map_location='cpu', weights_only=False)
-            if isinstance(ckpt, dict) and 'hyperparameters' in ckpt:
-                hyper = ckpt.get('hyperparameters', {})
-                epochs = hyper.get('num_epochs', '?')
-                lr = hyper.get('learning_rate', '?')
-                prompt_lr = hyper.get('prompt_encoder_lr', '?')
-                info = f" | epochs={epochs}, lr={lr}, prompt_lr={prompt_lr}"
+            if isinstance(ckpt, dict):
+                if 'trainable_params' in ckpt:
+                    info += " [FULL MODEL]"
+                elif 'state_dict' in ckpt:
+                    info += " [PROMPT ONLY]"
+                    
+                if 'hyperparameters' in ckpt: 
+                    hyper = ckpt.get('hyperparameters', {})
+                    epochs = hyper.get('num_epochs', '?')
+                    lr = hyper.get('learning_rate', '?')
+                    prompt_lr = hyper.get('prompt_encoder_lr', '?')
+                    info += f" | epochs={epochs}, lr={lr}, prompt_lr={prompt_lr}"
         except:
             pass
         print(f" [{idx}] {f.name}{info}")
@@ -368,7 +374,7 @@ def main():
     checkpoint_path = find_v2_checkpoint_interactive()
     
     if checkpoint_path is None:
-        raise FileNotFoundError("No V2 checkpoint found. Looking for files named 'prompt_encoder_*.pt' in savings/")
+        raise FileNotFoundError("No V2 checkpoint found. Looking for files in savings/")
     
     print(f"📁 Checkpoint: {checkpoint_path}")
     
@@ -378,7 +384,7 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Extract metadata from checkpoint
-    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+    if isinstance(checkpoint, dict) and ('state_dict' in checkpoint or 'trainable_params' in checkpoint):
         # New format: checkpoint contains embedded metadata
         config = {
             'hyperparameters': checkpoint.get('hyperparameters', {}),
@@ -389,13 +395,11 @@ def main():
             'test_metrics': checkpoint.get('test_metrics', {}),
             'baseline_f1': checkpoint.get('baseline_f1', 'N/A'),
         }
-        prompt_state_dict = checkpoint['state_dict']
         print(f"\n📋 Loaded config from checkpoint:")
         print(json.dumps(config, indent=2))
     else:
         # Old format: checkpoint is just the state_dict
         config = {}
-        prompt_state_dict = checkpoint
         print("\n⚠️ Old checkpoint format detected (no embedded metadata)")
     
     # Get label list from config or fallback
@@ -415,7 +419,6 @@ def main():
     test_dataset = convert_ids_to_labels(test_dataset, id2label)
 
     # 2. Init Base Model Structure
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Initializing base architecture {model_name} on {device}...")
     
     try:
@@ -444,10 +447,30 @@ def main():
     model.model.token_rep_layer.labels_encoder.model = wrapped_encoder
     print("✅ SoftPromptLabelEncoderWrapper injected.")
 
-    # 6. Load Prompt Encoder Weights (already loaded above)
-    print(f"\nLoading prompt encoder weights...")
-    wrapped_encoder.prompt_encoder.load_state_dict(prompt_state_dict)
-    print("✅ Prompt encoder weights loaded.")
+    # 6. Load Weights (Supports both Full Model Tuned and Partial Prompt Only)
+    print(f"\nLoading weights...")
+    
+    if isinstance(checkpoint, dict) and 'trainable_params' in checkpoint:
+        # --- CASO 1: Checkpoint Nuovo (Full Tuned: RNN + SpanRep + PromptEncoder) ---
+        print("📥 Loading FULL tuned parameters (RNN, SpanRep, PromptEncoder)...")
+        # Usiamo strict=False perché nel checkpoint ci sono solo i params allenabili (mancano embeddings congelati)
+        keys = checkpoint['trainable_params'].keys()
+        print(f"   Keys found: {len(keys)} (e.g. {list(keys)[:3]}...)")
+        
+        missing, unexpected = model.model.load_state_dict(checkpoint['trainable_params'], strict=False)
+        print(f"✅ Weights loaded. Missing (expected frozen): {len(missing)}. Unexpected: {len(unexpected)}")
+        
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        # --- CASO 2: Checkpoint Intermedio (Solo Prompt Encoder) ---
+        print("📥 Loading ONLY Prompt Encoder (Legacy/Partial Checkpoint)...")
+        wrapped_encoder.prompt_encoder.load_state_dict(checkpoint['state_dict'])
+        print("✅ Prompt encoder weights loaded.")
+        
+    else:
+        # --- CASO 3: Checkpoint Vecchio (Solo state dict crudo) ---
+        print("📥 Loading Raw State Dict (Legacy)...")
+        wrapped_encoder.prompt_encoder.load_state_dict(checkpoint)
+        print("✅ Prompt encoder weights loaded.")
 
     # 7. Evaluate
     print("\n" + "="*50)

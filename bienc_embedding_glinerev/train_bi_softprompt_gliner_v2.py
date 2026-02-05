@@ -604,11 +604,16 @@ save_dir.mkdir(parents=True, exist_ok=True)
 print(f"\n💾 Salvataggio del Prompt Encoder con metadati in {save_dir}...")
 
 # Prepara checkpoint con tutti i metadati inclusi
-wrapped_encoder = model.model.token_rep_layer.labels_encoder.model
+# Prepara checkpoint con TUTTI i parametri allenati (non solo prompt encoder)
+trainable_params = {n: p.cpu() for n, p in model.model.named_parameters() if p.requires_grad}
+print(f"📦 Collected {len(trainable_params)} trainable parameters to save.")
 
 checkpoint = {
-    # State dict del prompt encoder
-    "state_dict": wrapped_encoder.prompt_encoder.state_dict(),
+    # Dizionario completo dei parametri allenati (RNN, SpanRep, PromptEncoder, etc.)
+    "trainable_params": trainable_params,
+    
+    # Old key per retrocompatibilità (solo prompt encoder) - opzionale
+    "prompt_encoder_state_dict": wrapped_encoder.prompt_encoder.state_dict(),
     
     # Architettura prompt encoder
     "architecture": {
@@ -641,7 +646,7 @@ checkpoint = {
 }
 
 # Salva tutto in un unico file .pt
-checkpoint_filename = f"prompt_encoder_{timestamp}.pt"
+checkpoint_filename = f"model_soft_tuned_{timestamp}.pt"
 torch.save(checkpoint, save_dir / checkpoint_filename)
 
 print("✅ Salvataggio completato.")
