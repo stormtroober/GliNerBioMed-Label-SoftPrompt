@@ -10,7 +10,16 @@ from collections import defaultdict
 from gliner import GLiNER
 
 # ==========================================
-# METRICS UTIL (Reused)
+# CONFIGURATION
+# ==========================================
+MODELS_DIR = "./models"
+DATASET_DIRS = {
+    "jnlpba": "../dataset",
+    "bc5cdr": "../dataset_bc5cdr"
+}
+
+# ==========================================
+# METRICS UTIL (Reused) - Without considering 'O' class
 # ==========================================
 def calculate_metrics(dataset, model, batch_size=8):
     import gc
@@ -153,52 +162,250 @@ def convert_ids_to_labels(dataset, id_map):
         new_dataset.append(item)
     return new_dataset
 
+
+def list_pt_files(models_dir):
+    """List all .pt files in the models directory."""
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir, exist_ok=True)
+        print(f"Created models directory: {models_dir}")
+        return []
+    
+    pt_files = [f for f in os.listdir(models_dir) if f.endswith('.pt')]
+    # Sort by modification time, newest first
+    pt_files.sort(key=lambda x: os.path.getmtime(os.path.join(models_dir, x)), reverse=True)
+    return pt_files
+
+
+def extract_model_metadata(fpath):
+    """Extract metadata from a .pt checkpoint file."""
+    try:
+        checkpoint = torch.load(fpath, map_location=torch.device('cpu'), weights_only=False)
+        metadata = checkpoint.get("training_metadata", {})
+        
+        # Try to extract encoder type
+        encoder_type = metadata.get("encoder_type", None)
+        if encoder_type is None:
+            # Infer from filename
+            fname = os.path.basename(fpath).lower()
+            if "bienc" in fname or "_bi_" in fname:
+                encoder_type = "bi"
+            elif "monoenc" in fname or "_mono_" in fname:
+                encoder_type = "mono"
+            else:
+                encoder_type = "?"
+        
+        # Try to extract dataset info
+        dataset_name = metadata.get("dataset_name", metadata.get("dataset", None))
+        dataset_size = metadata.get("dataset_size", metadata.get("train_size", None))
+        
+        return {
+            "encoder_type": encoder_type,
+            "dataset_name": dataset_name,
+            "dataset_size": dataset_size,
+            "metadata": metadata
+        }
+    except Exception as e:
+        return {
+            "encoder_type": "?",
+            "dataset_name": None,
+            "dataset_size": None,
+            "error": str(e)
+        }
+
+
+def interactive_select_model(models_dir):
+    """Interactively select a model from the models directory."""
+    pt_files = list_pt_files(models_dir)
+    
+    if not pt_files:
+        print(f"\n❌ No .pt files found in {models_dir}")
+        print("Please add your model checkpoints to the 'models' directory.")
+        return None
+    
+    print("\n" + "="*80)
+    print("📁 AVAILABLE MODELS")
+    print("="*80)
+    print("Loading metadata from checkpoints...")
+    
+    model_info = []
+    for idx, fname in enumerate(pt_files, 1):
+        fpath = os.path.join(models_dir, fname)
+        mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+        size_mb = os.path.getsize(fpath) / (1024 * 1024)
+        
+        # Extract metadata
+        meta = extract_model_metadata(fpath)
+        model_info.append((fname, fpath, mod_time, size_mb, meta))
+    
+    print("-"*80)
+    for idx, (fname, fpath, mod_time, size_mb, meta) in enumerate(model_info, 1):
+        enc_type = meta.get("encoder_type", "?")
+        dataset_name = meta.get("dataset_name")
+        dataset_size = meta.get("dataset_size")
+        
+        # Format encoder display
+        enc_display = f"{'bi-enc' if enc_type == 'bi' else 'mono-enc' if enc_type == 'mono' else '?'}"
+        
+        # Format dataset display
+        if dataset_name:
+            dataset_display = dataset_name
+        elif dataset_size:
+            dataset_display = f"size={dataset_size}"
+        else:
+            dataset_display = "?"
+        
+        print(f"  [{idx}] {fname}")
+        print(f"      📦 {size_mb:.1f} MB | 🔧 Encoder: {enc_display} | 📊 Dataset: {dataset_display}")
+        print(f"      📅 Modified: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
+    
+    print("="*80)
+    
+    while True:
+        try:
+            choice = input(f"\nSelect model [1-{len(pt_files)}] (or 'q' to quit): ").strip()
+            if choice.lower() == 'q':
+                return None
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(pt_files):
+                selected = pt_files[choice_idx]
+                print(f"✅ Selected: {selected}")
+                return os.path.join(models_dir, selected)
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(pt_files)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number or 'q' to quit.")
+
+
+def interactive_select_encoder():
+    """Interactively select encoder type."""
+    print("\n" + "="*60)
+    print("🔧 ENCODER TYPE")
+    print("="*60)
+    print("  [1] bi     - Bi-Encoder (gliner-biomed-bi-small-v1.0)")
+    print("  [2] mono   - Mono-Encoder (gliner_small-v2.1)")
+    print("="*60)
+    
+    while True:
+        choice = input("Select encoder type [1-2]: ").strip()
+        if choice == '1':
+            return 'bi'
+        elif choice == '2':
+            return 'mono'
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
+
+def interactive_select_dataset():
+    """Interactively select dataset type."""
+    print("\n" + "="*60)
+    print("📊 DATASET")
+    print("="*60)
+    print("  [1] jnlpba  - JNLPBA dataset (../dataset)")
+    print("  [2] bc5cdr  - BC5CDR dataset (../dataset_bc5cdr)")
+    print("="*60)
+    
+    while True:
+        choice = input("Select dataset [1-2]: ").strip()
+        if choice == '1':
+            return 'jnlpba'
+        elif choice == '2':
+            return 'bc5cdr'
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test GLiNER model from a .pt checkpoint.")
-    parser.add_argument("--pt_path", type=str, default="savings", help="Path to the model .pt file or directory containing .pt files.")
-    parser.add_argument("--encoder_type", type=str, required=True, choices=["bi", "mono"], 
+    parser.add_argument("--pt_path", type=str, default=None, 
+                        help="Path to the model .pt file. If not specified, interactive selection is used.")
+    parser.add_argument("--encoder_type", type=str, default=None, choices=["bi", "mono"], 
                         help="Type of encoder: 'bi' for bi-encoder or 'mono' for mono-encoder.")
-    parser.add_argument("--test_data", type=str, default=None, 
-                        help="Path to test dataset. If not specified, auto-selects based on encoder type.")
-    parser.add_argument("--label2id", type=str, default="../dataset/label2id.json", 
-                        help="Path to label2id mapping.")
+    parser.add_argument("--dataset", type=str, default=None, choices=["jnlpba", "bc5cdr"],
+                        help="Dataset to use: 'jnlpba' or 'bc5cdr'.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation.")
+    parser.add_argument("--list", action="store_true", help="List available models and exit.")
     
     args = parser.parse_args()
     
-    # Auto-select test data based on encoder type if not specified
-    if args.test_data is None:
-        if args.encoder_type == "bi":
-            args.test_data = "../dataset/test_dataset_span_bi.json"
-        else:  # mono
-            args.test_data = "../dataset/test_dataset_span_mono.json"
-        print(f"Auto-selected test dataset for {args.encoder_type}-encoder: {args.test_data}")
+    # Get script directory for relative paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(script_dir, MODELS_DIR)
     
-    args = parser.parse_args()
+    # List mode
+    if args.list:
+        pt_files = list_pt_files(models_dir)
+        if pt_files:
+            print(f"\n📁 Available models in {models_dir}:")
+            for f in pt_files:
+                print(f"  - {f}")
+        else:
+            print(f"\n❌ No .pt files found in {models_dir}")
+        return
     
-    # Handle directory input for pt_path
-    if os.path.isdir(args.pt_path):
-        print(f"Searching for .pt files in {args.pt_path}...")
-        pt_files = [f for f in os.listdir(args.pt_path) if f.endswith('.pt')]
-        if not pt_files:
-            print(f"Error: No .pt file found in {args.pt_path}")
+    # Interactive or CLI model selection
+    if args.pt_path is None:
+        pt_path = interactive_select_model(models_dir)
+        if pt_path is None:
+            print("Exiting.")
             return
-        # Sort by modification time, newest first
-        pt_files.sort(key=lambda x: os.path.getmtime(os.path.join(args.pt_path, x)), reverse=True)
+    else:
+        # If relative path provided, check if it exists in models dir
+        if not os.path.isabs(args.pt_path):
+            pt_path = os.path.join(models_dir, args.pt_path)
+        else:
+            pt_path = args.pt_path
         
-        print(f"Found {len(pt_files)} checkpoints. Using the latest one:")
-        for idx, f in enumerate(pt_files[:3]):
-            print(f"  - {f}")
-            
-        args.pt_path = os.path.join(args.pt_path, pt_files[0])
-        print(f"Selected checkpoint: {args.pt_path}")
-
-    if not os.path.exists(args.pt_path):
-        print(f"Error: .pt file not found at {args.pt_path}")
+        if not os.path.exists(pt_path):
+            print(f"❌ Error: .pt file not found at {pt_path}")
+            return
+    
+    # Interactive or CLI encoder selection
+    if args.encoder_type is None:
+        encoder_type = interactive_select_encoder()
+    else:
+        encoder_type = args.encoder_type
+    
+    # Interactive or CLI dataset selection
+    if args.dataset is None:
+        dataset_name = interactive_select_dataset()
+    else:
+        dataset_name = args.dataset
+    
+    # Build paths
+    dataset_dir = os.path.join(script_dir, DATASET_DIRS[dataset_name])
+    
+    if encoder_type == "bi":
+        test_data_path = os.path.join(dataset_dir, "test_dataset_span_bi.json")
+    else:
+        test_data_path = os.path.join(dataset_dir, "test_dataset_span_mono.json")
+    
+    label2id_path = os.path.join(dataset_dir, "label2id.json")
+    
+    # Summary
+    print("\n" + "="*60)
+    print("📋 TEST CONFIGURATION")
+    print("="*60)
+    print(f"  Model:        {os.path.basename(pt_path)}")
+    print(f"  Encoder:      {encoder_type}")
+    print(f"  Dataset:      {dataset_name}")
+    print(f"  Test file:    {test_data_path}")
+    print(f"  Label2id:     {label2id_path}")
+    print(f"  Batch size:   {args.batch_size}")
+    print("="*60)
+    
+    # Confirm
+    confirm = input("\nProceed with testing? [Y/n]: ").strip().lower()
+    if confirm not in ['', 'y', 'yes']:
+        print("Aborted.")
         return
 
-    print(f"Loading checkpoint from: {args.pt_path}")
-    checkpoint = torch.load(args.pt_path, map_location=torch.device('cpu'), weights_only=False) # Load keys first
+    if not os.path.exists(pt_path):
+        print(f"❌ Error: .pt file not found at {pt_path}")
+        return
+
+    print(f"\nLoading checkpoint from: {pt_path}")
+    checkpoint = torch.load(pt_path, map_location=torch.device('cpu'), weights_only=False)
     
     # Extract Metadata
     metadata = checkpoint.get("training_metadata", {})
@@ -210,23 +417,21 @@ def main():
     print("="*50 + "\n")
     
     # Select base model based on encoder type
-    if args.encoder_type == "bi":
+    if encoder_type == "bi":
         MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
         FALLBACK_MODEL = "Ihor/gliner-biomed-bi-small-v1.0"
     else:  # mono
         MODEL_NAME = "urchade/gliner_small-v2.1"
         FALLBACK_MODEL = "urchade/gliner_small-v2.1"
     
-    print(f"Using {args.encoder_type}-encoder base model: {MODEL_NAME}")
+    print(f"Using {encoder_type}-encoder base model: {MODEL_NAME}")
     
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     
     try:
         print(f"Initializing base model: {MODEL_NAME}")
-        # Initialize model structure
         model = GLiNER.from_pretrained(MODEL_NAME)
         
-        # Load State Dict
         print("Loading state dict from checkpoint...")
         model.load_state_dict(checkpoint["model_state_dict"])
         model.to(device)
@@ -246,12 +451,12 @@ def main():
              return
 
     # Load Data
-    print(f"Loading test data from {args.test_data}...")
-    with open(args.test_data, "r") as f:
+    print(f"Loading test data from {test_data_path}...")
+    with open(test_data_path, "r") as f:
         test_dataset = json.load(f)
         
-    print(f"Loading label map from {args.label2id}...")
-    with open(args.label2id, "r") as f:
+    print(f"Loading label map from {label2id_path}...")
+    with open(label2id_path, "r") as f:
         label2id = json.load(f)
     id2label = {str(v): k for k, v in label2id.items()}
     
@@ -262,32 +467,43 @@ def main():
     macro_f1, micro_f1, report_str = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
     
     # Export Results
-    TEST_RESULTS_DIR = "test/results"
+    TEST_RESULTS_DIR = os.path.join(script_dir, "test/results")
     os.makedirs(TEST_RESULTS_DIR, exist_ok=True)
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"{TEST_RESULTS_DIR}/eval_{args.encoder_type}enc_from_pt_{timestamp}.md"
+    model_name = os.path.basename(pt_path).replace('.pt', '')
+    filename = f"{TEST_RESULTS_DIR}/eval_{model_name}_{dataset_name}_{encoder_type}enc_{timestamp}.md"
     
     with open(filename, "w", encoding="utf-8") as f:
-        # Config Section
-        f.write("## 🔧 Training Configuration\n")
+        # Test Configuration Section
+        f.write("## 🔍 Test Configuration\n")
         f.write("| Parameter | Value |\n|---|---|\n")
-        # Sort keys for consistency
+        f.write(f"| **Model File** | `{os.path.basename(pt_path)}` |\n")
+        f.write(f"| **Encoder Type** | `{encoder_type}` |\n")
+        f.write(f"| **Dataset** | `{dataset_name}` |\n")
+        f.write(f"| **Test File** | `{os.path.basename(test_data_path)}` |\n")
+        f.write(f"| **Batch Size** | `{args.batch_size}` |\n")
+        f.write(f"| **Base Model** | `{MODEL_NAME}` |\n")
+        f.write("\n")
+        
+        # Training Metadata Section
+        f.write("## 🔧 Training Configuration (from checkpoint)\n")
+        f.write("| Parameter | Value |\n|---|---|\n")
         for k in sorted(metadata.keys()):
              f.write(f"| **{k}** | `{metadata[k]}` |\n")
         f.write("\n")
         
         # Metrics Section
-        f.write("## Metriche Chiave\n")
+        f.write("## 📊 Metriche Chiave\n")
         f.write("| Metric | Value |\n|---|---|\n")
         f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
         f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
         
         # Report Section
-        f.write("## Report\n```\n")
+        f.write("## 📝 Report\n```\n")
         f.write(report_str)
         f.write("\n```\n")
         
-    print(f"💾 Saved to {filename}")
+    print(f"\n💾 Results saved to: {filename}")
 
 if __name__ == "__main__":
     main()
