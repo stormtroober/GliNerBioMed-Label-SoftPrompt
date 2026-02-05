@@ -20,35 +20,37 @@ random.seed(RANDOM_SEED)
 # CONFIGURATION
 # ==========================================
 
+# Dataset Configuration
+DATASET_FOLDER = "dataset"
+
 if is_running_on_kaggle():
     path = "/kaggle/input/spanbi16k/"
+    train_path = path + "dataset_span_mono.json"
+    val_path = path + "val_dataset_span_mono.json"
+    test_path = path + "test_dataset_span_mono.json"
+    label2id_path = path + "label2id.json"
 else:
-    path = "finetune/"
+    # Local paths
+    train_path = f"{DATASET_FOLDER}/dataset_span_mono.json"
+    val_path = f"{DATASET_FOLDER}/val_dataset_span_mono.json"
+    test_path = f"{DATASET_FOLDER}/test_dataset_span_mono.json"
+    label2id_path = f"{DATASET_FOLDER}/label2id.json"
 
-train_path = path + "jnlpa_train.json"
-test_path = path + "jnlpa_test.json"
-label2id_path = path + "label2id.json"
-
-# ==========================================
-# VALIDATION CONFIGURATION
-# ==========================================
-# 🔄 Flag per gestione validation:
-# - True: usa file di validation separato
-# - False: split del training set (80% train, 20% val)
-USE_SEPARATE_VAL_FILE = False
-VAL_SPLIT_RATIO = 0.2  # Usato solo se USE_SEPARATE_VAL_FILE = False
-
-# Path validation (usato solo se USE_SEPARATE_VAL_FILE = True)
-if USE_SEPARATE_VAL_FILE:
-    if is_running_on_kaggle():
-        val_path = "/kaggle/input/spanbi16k/jnlpa_val.json"
-    else:
-        val_path = path + "jnlpa_val.json"
+# Training Hyperparameters
+LEARNING_RATE = 8.366666437568032e-05
+WEIGHT_DECAY = 0.01
+OTHERS_LR = 1e-5
+OTHERS_WEIGHT_DECAY = 0.01
+LR_SCHEDULER_TYPE = "linear"
+WARMUP_RATIO = 0.1
+FOCAL_LOSS_ALPHA = 0.75
+FOCAL_LOSS_GAMMA = 3.3646469953227394
+BATCH_SIZE = 32
 
 # Training Configuration
 target_steps = None       # Se impostato, il training si fermerà esattamente a questi step
 target_epochs = 10         # Usato solo se target_steps è None
-batch_size = 32
+batch_size = BATCH_SIZE
 
 # ==========================================
 # METRICS FUNCTION
@@ -229,24 +231,17 @@ def convert_ids_to_labels(dataset, id_map):
 print("\nConverting Training Dataset IDs to Labels...")
 train_dataset = convert_ids_to_labels(train_dataset, id2label)
 
+print(f"Validation path: {val_path}")
+with open(val_path, "r") as f:
+    val_dataset = json.load(f)
+
+print("\nConverting Validation Dataset IDs to Labels...")
+val_dataset = convert_ids_to_labels(val_dataset, id2label)
+
 print("\nConverting Test Dataset IDs to Labels...")
 test_dataset = convert_ids_to_labels(test_dataset, id2label)
 
-# ==========================================
-# VALIDATION SPLIT
-# ==========================================
-if USE_SEPARATE_VAL_FILE:
-    print(f"\n📚 Loading validation dataset from separate file: {val_path}")
-    with open(val_path, "r") as f:
-        val_dataset = json.load(f)
-    print("Converting Validation Dataset IDs to Labels...")
-    val_dataset = convert_ids_to_labels(val_dataset, id2label)
-else:
-    print(f"\n📊 Splitting training set ({int((1-VAL_SPLIT_RATIO)*100)}% train, {int(VAL_SPLIT_RATIO*100)}% val)...")
-    random.shuffle(train_dataset)
-    val_size = int(len(train_dataset) * VAL_SPLIT_RATIO)
-    val_dataset = train_dataset[:val_size]
-    train_dataset = train_dataset[val_size:]
+
 
 print(f'\nFinal Train dataset size: {len(train_dataset)}')
 print(f'Final Validation dataset size: {len(val_dataset)}')
@@ -298,16 +293,16 @@ trainer = model.train_model(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,  # ✅ Usa validation set, NON test set
     output_dir="models_mono_noO",
-    learning_rate=7.746915067305043e-05,
-    weight_decay=0.01,
-    others_lr=1e-5,
-    others_weight_decay=0.01,
-    lr_scheduler_type="constant_with_warmup",
-    warmup_ratio=0.1,
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    others_lr=OTHERS_LR,
+    others_weight_decay=OTHERS_WEIGHT_DECAY,
+    lr_scheduler_type=LR_SCHEDULER_TYPE,
+    warmup_ratio=WARMUP_RATIO,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
-    focal_loss_alpha=0.40551794519885276,
-    focal_loss_gamma=2.83001777615741,
+    focal_loss_alpha=FOCAL_LOSS_ALPHA,
+    focal_loss_gamma=FOCAL_LOSS_GAMMA,
     num_train_epochs=num_train_epochs,
     max_steps=max_steps,
     save_steps=save_steps,
@@ -333,14 +328,23 @@ checkpoint = {
     "training_metadata": {
         "base_model_name": MODEL_NAME,
         "encoder_type": "mono-encoder",
+        "dataset_name": path if is_running_on_kaggle() else DATASET_FOLDER,
         "train_dataset_size": len(train_dataset),
+        "val_dataset_size": len(val_dataset),
         "test_dataset_size": len(test_dataset),
         "num_epochs": num_train_epochs,
         "batch_size": batch_size,
-        "learning_rate": 7.746915067305043e-05, 
-        "weight_decay": 0.01,
-        "focal_loss_alpha": 0.40551794519885276,
-        "focal_loss_gamma": 2.83001777615741,
+        "learning_rate": LEARNING_RATE, 
+        "weight_decay": WEIGHT_DECAY,
+        "others_lr": OTHERS_LR,
+        "others_weight_decay": OTHERS_WEIGHT_DECAY,
+        "lr_scheduler_type": LR_SCHEDULER_TYPE,
+        "warmup_ratio": WARMUP_RATIO,
+        "focal_loss_alpha": FOCAL_LOSS_ALPHA,
+        "save_steps": save_steps,
+        "logging_steps": logging_steps,
+        "random_seed": RANDOM_SEED,
+        "focal_loss_gamma": FOCAL_LOSS_GAMMA,
         "timestamp": timestamp
     }
 }

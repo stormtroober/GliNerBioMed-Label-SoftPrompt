@@ -296,7 +296,7 @@ start_time = time.time()
 
 trainer = model.train_model(
     train_dataset=train_dataset,
-    eval_dataset=val_dataset,  # ✅ Usa validation set, NON test set
+    eval_dataset=val_dataset,
     output_dir="models_short_label",
     learning_rate=9.96554625802328e-05,
     weight_decay=0.01,
@@ -347,12 +347,13 @@ checkpoint = {
     "training_metadata": {
         "base_model_name": MODEL_NAME,
         "encoder_type": "bi-encoder",
-        "dataset_name": DATASET_FOLDER if not is_running_on_kaggle() else "jnlpa-18-5k15-3-5-complete",
+        "dataset_name": path if is_running_on_kaggle() else DATASET_FOLDER,
         "train_dataset_size": len(train_dataset),
         "val_dataset_size": len(val_dataset),
         "test_dataset_size": len(test_dataset),
         "num_epochs": num_train_epochs,
         "batch_size": batch_size,
+        #TODO: togli questo hardcode
         "learning_rate": 9.96554625802328e-05,
         "weight_decay": 0.01,
         "others_lr": 1e-5,
