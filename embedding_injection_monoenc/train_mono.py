@@ -1,3 +1,5 @@
+#2 minuti a epoca con 6k
+#1 minuto per bc5dr
 # -*- coding: utf-8 -*-
 import json
 import torch
@@ -5,6 +7,7 @@ import torch.nn.functional as F
 import os
 import numpy as np
 import math
+import time
 import gc
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
@@ -45,19 +48,21 @@ POOLING_MODE = "conv1d"
 GAMMA_FOCAL_LOSS = 5.0
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
-VALIDATION_RATIO = 0.1
+
 EARLY_STOPPING_PATIENCE = 5
 
 # Paths
 if is_running_on_kaggle():
     input_dir = "/kaggle/input/standard16600/"
-    DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+    TRAIN_PATH = input_dir + "dataset_tknlvl_mono.json"
+    VAL_PATH = input_dir + "val_dataset_tknlvl_mono.json"
     LABEL2DESC_PATH = input_dir + "label2desc.json"
     LABEL2ID_PATH = input_dir + "label2id.json"
     MODEL_NAME = '/kaggle/input/gliner2-1small/'
 else:
     input_dir = "../" 
-    DATASET_PATH = input_dir + "dataset/dataset_tokenlevel_simple.json"
+    TRAIN_PATH = input_dir + "dataset/dataset_tknlvl_mono.json"
+    VAL_PATH = input_dir + "dataset/val_dataset_tknlvl_mono.json"
     LABEL2DESC_PATH = input_dir + "label2desc.json"
     LABEL2ID_PATH = input_dir + "label2id.json"
     MODEL_NAME = "urchade/gliner_small-v2.1"
@@ -308,14 +313,12 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
     return weights
 
 print("📊 Loading Dataset...")
-full_ds = TokenJsonDataset(DATASET_PATH, tokenizer, max_len=MAX_TEXT_LEN)
-val_size = int(len(full_ds) * VALIDATION_RATIO)
-train_size = len(full_ds) - val_size
-train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=torch.Generator().manual_seed(RANDOM_SEED))
+train_ds = TokenJsonDataset(TRAIN_PATH, tokenizer, max_len=MAX_TEXT_LEN)
+val_ds = TokenJsonDataset(VAL_PATH, tokenizer, max_len=MAX_TEXT_LEN)
 
-print(f"🔪 Split: Train={len(train_ds)} | Valid={len(val_ds)}")
+print(f"🔪 Train size: {len(train_ds)} | Valid size: {len(val_ds)}")
 
-class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
+class_weights = get_cb_weights(TRAIN_PATH, label2id, DEVICE, beta=CB_BETA)
 ce_loss = FocalLoss(alpha=class_weights, gamma=GAMMA_FOCAL_LOSS, ignore_index=-100)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda b: collate_batch(b, tokenizer.pad_token_id))
@@ -341,6 +344,7 @@ patience_counter = 0
 print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP}")
 
 for epoch in range(1, EPOCHS + 1):
+    start_time = time.time()
     # TRAIN
     prompt_encoder.train()
     total_train_loss = 0
@@ -483,7 +487,10 @@ for epoch in range(1, EPOCHS + 1):
             total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+    
+    end_time = time.time()
+    epoch_mins, epoch_secs = divmod(end_time - start_time, 60)
+    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Time: {int(epoch_mins)}m {int(epoch_secs)}s")
     
     # Save & Early Stopping (Structure Updated)
     if avg_val_loss < best_loss:
@@ -495,7 +502,9 @@ for epoch in range(1, EPOCHS + 1):
             'config': {
                 'batch_size': BATCH_SIZE,
                 'epochs': EPOCHS,
-                'dataset_size': len(full_ds),
+                'input_dir': input_dir,
+                'dataset_size_train': len(train_ds),
+                'dataset_size_val': len(val_ds),
                 'train_size': len(train_ds),
                 'val_size': len(val_ds),
                 'random_seed': RANDOM_SEED,
@@ -508,8 +517,7 @@ for epoch in range(1, EPOCHS + 1):
                 'weight_strategy': WEIGHT_STRATEGY,
                 'gamma_focal_loss': GAMMA_FOCAL_LOSS,
                 'cb_beta': CB_BETA,
-                'validation_split': True,
-                'validation_ratio': VALIDATION_RATIO,
+                'validation_split': False,
                 'prompt_len': PROMPT_LEN,
                 'pooling_mode': POOLING_MODE,
                 'max_text_len': MAX_TEXT_LEN,
