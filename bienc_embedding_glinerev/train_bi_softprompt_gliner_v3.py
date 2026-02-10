@@ -1,4 +1,3 @@
-# https://www.kaggle.com/code/alessandrobecci/finetuneglinerbiembeddv2
 import os
 import json
 import random
@@ -66,16 +65,144 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # ==========================================
-# 1. ARCHITETTURA (PROMPT 384 -> PROJECTION 768)
+# 1. PROMPT POOLER (from train_mlp_focal_cb_val.py)
+# ==========================================
+
+class PromptPooler(nn.Module):
+    """Riduce la sequenza da (B, seq_len, dim) a (B, prompt_len, dim)"""
+    
+    def __init__(self, embed_dim, prompt_len, mode="adaptive_avg", max_seq_len=512):
+        super().__init__()
+        self.prompt_len = prompt_len
+        self.mode = mode
+        
+        if mode == "adaptive_avg":
+            self.pooler = nn.AdaptiveAvgPool1d(prompt_len)
+        elif mode == "adaptive_max":
+            self.pooler = nn.AdaptiveMaxPool1d(prompt_len)
+        elif mode == "attention":
+            # Learnable query tokens che estraggono PROMPT_LEN rappresentazioni
+            self.queries = nn.Parameter(torch.randn(1, prompt_len, embed_dim) * 0.02)
+            self.attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
+            self.norm = nn.LayerNorm(embed_dim)
+        elif mode == "conv1d":
+            # Conv1D downsampling: apprende come comprimere la sequenza
+            self.conv_layers = nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            )
+            self.adaptive_pool = nn.AdaptiveAvgPool1d(prompt_len)
+            self.norm = nn.LayerNorm(embed_dim)
+        elif mode == "conv1d_strided":
+            # Versione più aggressiva con gating mechanism
+            self.conv = nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2)
+            self.adaptive_pool = nn.AdaptiveAvgPool1d(prompt_len)
+            self.norm = nn.LayerNorm(embed_dim)
+            self.gate = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.Sigmoid()
+            )
+        else:
+            raise ValueError(f"Unknown pooling mode: {mode}")
+    
+    def forward(self, x, attention_mask=None):
+        """
+        Args:
+            x: (B, seq_len, dim)
+            attention_mask: (B, seq_len) - 1 per token validi, 0 per padding
+        Returns:
+            (B, prompt_len, dim)
+        """
+        B, seq_len, dim = x.shape
+        
+        if self.mode in ["adaptive_avg", "adaptive_max"]:
+            # AdaptivePool lavora su ultima dim, quindi permute
+            # (B, seq_len, dim) -> (B, dim, seq_len)
+            x_t = x.transpose(1, 2)
+            
+            # Applica mask se presente (sostituisci padding con 0 per avg, -inf per max)
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(1).float()  # (B, 1, seq_len)
+                if self.mode == "adaptive_avg":
+                    x_t = x_t * mask_expanded
+                else:  # adaptive_max
+                    x_t = x_t.masked_fill(mask_expanded == 0, float('-inf'))
+            
+            # (B, dim, seq_len) -> (B, dim, prompt_len)
+            pooled = self.pooler(x_t)
+            # (B, dim, prompt_len) -> (B, prompt_len, dim)
+            return pooled.transpose(1, 2)
+        
+        elif self.mode == "attention":
+            # Queries apprese: (1, prompt_len, dim) -> (B, prompt_len, dim)
+            queries = self.queries.expand(B, -1, -1)
+            
+            # Key padding mask per attention (True = ignore)
+            key_padding_mask = None
+            if attention_mask is not None:
+                key_padding_mask = (attention_mask == 0)
+            
+            # Cross-attention: queries attendono a x
+            attn_out, _ = self.attn(queries, x, x, key_padding_mask=key_padding_mask)
+            return self.norm(attn_out + queries)  # Residual
+        
+        elif self.mode == "conv1d":
+            # Applica mask prima della convoluzione
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = x * mask_expanded
+            
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
+            conv_out = self.conv_layers(x_t)  # (B, dim, seq_len)
+            pooled = self.adaptive_pool(conv_out)  # (B, dim, prompt_len)
+            pooled = pooled.transpose(1, 2)  # (B, prompt_len, dim)
+            return self.norm(pooled)
+        
+        elif self.mode == "conv1d_strided":
+            # Versione con gating mechanism
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = x * mask_expanded
+            
+            x_t = x.transpose(1, 2)  # (B, dim, seq_len)
+            conv_out = self.conv(x_t)  # (B, dim, seq_len)
+            pooled = self.adaptive_pool(conv_out)  # (B, dim, prompt_len)
+            pooled = pooled.transpose(1, 2)  # (B, prompt_len, dim)
+            
+            # Gating: permette al modello di decidere quanto "fidarsi" della convoluzione
+            gate = self.gate(pooled)
+            pooled = pooled * gate
+            
+            return self.norm(pooled)
+
+# ==========================================
+# 2. PROMPT ENCODER (v3 with Pooling)
 # ==========================================
 
 class PromptEncoder(nn.Module):
-    def __init__(self, backbone_hidden_size: int, num_labels: int, soft_prompt_length: int = 1, mid_dim: int = None):
+    def __init__(self, backbone_hidden_size: int, num_labels: int, 
+                 soft_prompt_length: int = 1, mid_dim: int = None,
+                 prompt_len: int = None, pooling_mode: str = "adaptive_avg"):
         super().__init__()
         self.backbone_hidden_size = backbone_hidden_size
         self.num_labels = num_labels
+        self.prompt_len = prompt_len
+        self.pooling_mode = pooling_mode
+        
+        # MLP originale
         self.mlp = nn.Linear(self.backbone_hidden_size, self.backbone_hidden_size)
         self.norm = nn.LayerNorm(self.backbone_hidden_size)
+        
+        # Pooler opzionale
+        self.pooler = None
+        if prompt_len is not None:
+            self.pooler = PromptPooler(
+                embed_dim=backbone_hidden_size,
+                prompt_len=prompt_len,
+                mode=pooling_mode
+            )
+        
         self._initialize_weights()
     
     def _initialize_weights(self):
@@ -85,22 +212,39 @@ class PromptEncoder(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def forward(self, batch_embeddings: torch.Tensor, position_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, batch_embeddings: torch.Tensor, position_mask: torch.Tensor, 
+                attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            batch_embeddings: (num_labels, seq_len, dim)
+            position_mask: (num_labels, seq_len) - 1 per token delle label
+            attention_mask: (num_labels, seq_len) - 1 per token validi, 0 per padding
+        Returns:
+            modified_embeddings: (num_labels, prompt_len, dim) se pooler attivo,
+                                 altrimenti (num_labels, seq_len, dim)
+        """
         modified_embeddings = batch_embeddings.clone()
         num_labels = batch_embeddings.shape[0]
 
+        # Applica soft prompt per ogni label
         for label_idx in range(num_labels):
             label_positions = (position_mask[label_idx] == 1).nonzero(as_tuple=True)[0]
-            if len(label_positions) == 0: continue
+            if len(label_positions) == 0: 
+                continue
             label_embeddings = batch_embeddings[label_idx, label_positions, :] 
             soft_prompt_embeddings = self.mlp(label_embeddings)
             modified_embeddings[label_idx, label_positions, :] = self.norm(
                 label_embeddings + soft_prompt_embeddings
             )
+        
+        # Applica pooling se configurato
+        if self.pooler is not None:
+            modified_embeddings = self.pooler(modified_embeddings, attention_mask)
+        
         return modified_embeddings
 
 # ==========================================
-# 1.5. LABEL ENCODER WRAPPER (approccio v1 che funziona)
+# 3. LABEL ENCODER WRAPPER
 # ==========================================
 
 class SoftPromptLabelEncoderWrapper(nn.Module):
@@ -121,6 +265,11 @@ class SoftPromptLabelEncoderWrapper(nn.Module):
         BOS_TOKEN, EOS_TOKEN, PAD_TOKEN = 101, 102, 0
         mask = (input_ids != BOS_TOKEN) & (input_ids != EOS_TOKEN) & (input_ids != PAD_TOKEN)
         return mask.long()
+    
+    def _create_attention_mask(self, input_ids):
+        """Crea attention mask (1 per token validi, 0 per padding)."""
+        PAD_TOKEN = 0
+        return (input_ids != PAD_TOKEN).long()
         
     def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, **kwargs):
         # Se già abbiamo embeddings, usa quelle
@@ -131,18 +280,36 @@ class SoftPromptLabelEncoderWrapper(nn.Module):
             # 2. Crea position mask
             position_mask = self._create_position_mask(input_ids)
             
-            # 3. Applica soft prompt
-            inputs_embeds = self.prompt_encoder(raw_embeds, position_mask)
+            # 3. Crea attention mask se non fornita
+            if attention_mask is None:
+                attention_mask = self._create_attention_mask(input_ids)
+            
+            # 4. Applica soft prompt + pooling
+            inputs_embeds = self.prompt_encoder(raw_embeds, position_mask, attention_mask)
+            
+            # 5. Aggiorna attention_mask se pooling è attivo
+            if self.prompt_encoder.pooler is not None:
+                # After pooling, la sequenza è ridotta a prompt_len
+                # Crea una nuova attention mask (tutto 1s per i token pooled)
+                num_labels = inputs_embeds.shape[0]
+                pooled_len = inputs_embeds.shape[1]
+                attention_mask = torch.ones(num_labels, pooled_len, 
+                                           dtype=torch.long, 
+                                           device=inputs_embeds.device)
             
             # Debug
             if not self._debug_printed:
-                print(f"\n[WRAPPER DEBUG]")
+                print(f"\n[WRAPPER DEBUG v3 - with Pooling]")
                 print(f"  Input IDs shape: {input_ids.shape}")
                 print(f"  Raw embeds shape: {raw_embeds.shape}")
                 print(f"  Soft embeds shape: {inputs_embeds.shape}")
+                print(f"  Pooling active: {self.prompt_encoder.pooler is not None}")
+                if self.prompt_encoder.pooler is not None:
+                    print(f"  Pooling mode: {self.prompt_encoder.pooling_mode}")
+                    print(f"  Prompt length: {self.prompt_encoder.prompt_len}")
                 self._debug_printed = True
         
-        # 4. Passa al transformer encoder originale
+        # 6. Passa al transformer encoder originale
         return self.original_encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
 
     def __getattr__(self, name):
@@ -154,7 +321,7 @@ class SoftPromptLabelEncoderWrapper(nn.Module):
 
 
 # ==========================================
-# 2. TRAINER & UTILS
+# 4. TRAINER & UTILS
 # ==========================================
 
 @dataclass
@@ -280,7 +447,7 @@ class SoftGlinerTrainer:
         use_fp16 = use_cuda and not use_bf16
         
         training_args = SoftGlinerTrainingArguments(
-            output_dir="models_soft_prompt",
+            output_dir="models_soft_prompt_v3",
             learning_rate=self.config["learning_rate"],
             prompt_encoder_lr=self.config["prompt_encoder_lr"],
             others_lr=self.config["others_lr"],
@@ -325,7 +492,7 @@ class SoftGlinerTrainer:
         return trainer
 
 # ==========================================
-# 3. DATA LOADING
+# 5. DATA LOADING
 # ==========================================
 if is_running_on_kaggle():
     MODEL_NAME = '/kaggle/input/glinerbismall2/'
@@ -369,7 +536,7 @@ label_list = sorted(list(all_labels))
 print(f"Labels found: {len(label_list)}")
 
 # ==========================================
-# 3.5. DEFINIZIONE FUNZIONE METRICHE (prima del training)
+# 6. METRICHE
 # ==========================================
 from collections import defaultdict
 
@@ -517,46 +684,57 @@ def calculate_metrics(dataset, model, batch_size=1):
     }
 
 # ==========================================
-# 4. EXECUTION - Usando wrapper approach (come v1)
+# 7. EXECUTION - V3 con POOLING
 # ==========================================
-print("INITIALIZING SOFT BI-GLINER (Wrapper Approach)")
+print("INITIALIZING SOFT BI-GLINER V3 (Wrapper Approach + Pooling)")
 
-# 4.1. Carica modello GLiNER base
+# CONFIGURAZIONE POOLING
+PROMPT_LEN = 32  # Lunghezza target dopo pooling (None = nessun pooling)
+POOLING_MODE = "conv1d"  # "adaptive_avg", "adaptive_max", "attention", "conv1d", "conv1d_strided"
+
+print(f"\n🎯 POOLING CONFIG:")
+print(f"  Prompt Length: {PROMPT_LEN if PROMPT_LEN else 'No Pooling'}")
+print(f"  Pooling Mode: {POOLING_MODE if PROMPT_LEN else 'N/A'}\n")
+
+# 7.1. Carica modello GLiNER base
 model = GLiNER.from_pretrained(MODEL_NAME)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 print(f"✅ Model loaded on {device}")
 
-# 4.2. Verifica che sia bi-encoder
+# 7.2. Verifica che sia bi-encoder
 if not hasattr(model.model, 'token_rep_layer') or not hasattr(model.model.token_rep_layer, 'labels_encoder'):
     raise ValueError("Il modello non è un Bi-Encoder!")
 
-# 4.3. Ottieni dimensioni e crea PromptEncoder
+# 7.3. Ottieni dimensioni e crea PromptEncoder
 lbl_enc_model = model.model.token_rep_layer.labels_encoder.model
 original_embeddings = lbl_enc_model.embeddings.word_embeddings
 embed_dim = original_embeddings.embedding_dim
 print(f"✅ Label Embedding Dim: {embed_dim}")
 
-# 4.4. Crea PromptEncoder
+# 7.4. Crea PromptEncoder con pooling
 prompt_encoder = PromptEncoder(
     backbone_hidden_size=embed_dim,
-    num_labels=len(label_list)
+    num_labels=len(label_list),
+    prompt_len=PROMPT_LEN,
+    pooling_mode=POOLING_MODE
 ).to(device)
 print(f"✅ PromptEncoder creato con dim={embed_dim}, num_labels={len(label_list)}")
+print(f"   Pooling: {'ENABLED' if PROMPT_LEN else 'DISABLED'}")
 
-# 4.5. Crea wrapper e inietta nel modello
+# 7.5. Crea wrapper e inietta nel modello
 wrapped_encoder = SoftPromptLabelEncoderWrapper(lbl_enc_model, prompt_encoder)
 model.model.token_rep_layer.labels_encoder.model = wrapped_encoder
 print("✅ SoftPromptLabelEncoderWrapper iniettato nel modello!")
 
-# 4.6. Verifica device
+# 7.6. Verifica device
 print(f"🖥️ Device: {device}")
 print(f"🖥️ CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"🖥️ GPU: {torch.cuda.get_device_name(0)}")
 
 # ==========================================
-# 4.5. BASELINE TEST (PRE-TRAINING) - Usando GLiNER evaluate()
+# 8. BASELINE TEST (PRE-TRAINING)
 # ==========================================
 print("\n" + "="*50)
 print("🔬 BASELINE EVALUATION (Pre-Training)")
@@ -579,12 +757,10 @@ trainer_wrapper = SoftGlinerTrainer(
 )
 
 print("Starting training...")
-# Nota: load_best_model_at_end=True nel trainer assicura che alla fine 
-# 'model' contenga i pesi della miglior epoca di validazione.
 trainer_wrapper.train()
 
 # ==========================================
-# 5. TESTING FINALE (POST-TRAINING)
+# 9. TESTING FINALE (POST-TRAINING)
 # ==========================================
 
 print("\n" + "="*50)
@@ -596,7 +772,7 @@ model.eval()
 metrics = calculate_metrics(test_dataset, model, batch_size=8)
 
 # ==========================================
-# 6. SALVATAGGIO SELETTIVO (TUTTO IN UN UNICO .pt)
+# 10. SALVATAGGIO SELETTIVO
 # ==========================================
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 save_dir = Path("savings")
@@ -604,22 +780,22 @@ save_dir.mkdir(parents=True, exist_ok=True)
 
 print(f"\n💾 Salvataggio del Prompt Encoder con metadati in {save_dir}...")
 
-# Prepara checkpoint con tutti i metadati inclusi
-# Prepara checkpoint con TUTTI i parametri allenati (non solo prompt encoder)
 trainable_params = {n: p.cpu() for n, p in model.model.named_parameters() if p.requires_grad}
 print(f"📦 Collected {len(trainable_params)} trainable parameters to save.")
 
 checkpoint = {
-    # Dizionario completo dei parametri allenati (RNN, SpanRep, PromptEncoder, etc.)
+    # Dizionario completo dei parametri allenati
     "trainable_params": trainable_params,
     
-    # Old key per retrocompatibilità (solo prompt encoder) - opzionale
+    # Old key per retrocompatibilità
     "prompt_encoder_state_dict": wrapped_encoder.prompt_encoder.state_dict(),
     
     # Architettura prompt encoder
     "architecture": {
         "backbone_hidden_size": prompt_encoder.backbone_hidden_size,
         "num_labels": prompt_encoder.num_labels,
+        "prompt_len": PROMPT_LEN,
+        "pooling_mode": POOLING_MODE,
     },
     
     # Iperparametri di training
@@ -644,14 +820,17 @@ checkpoint = {
     
     # Baseline F1 pre-training
     "baseline_f1": baseline_f1,
+    
+    # Version info
+    "version": "v3-pooling",
 }
 
 # Salva tutto in un unico file .pt
-checkpoint_filename = f"model_soft_tuned_{timestamp}.pt"
+checkpoint_filename = f"model_soft_tuned_v3_pooling_{timestamp}.pt"
 torch.save(checkpoint, save_dir / checkpoint_filename)
 
 print("✅ Salvataggio completato.")
-print(f"\n✅ Script terminato.")
+print(f"\n✅ Script V3 terminato.")
 print(f"📁 Directory Output: {save_dir}")
 print(f"📄 Checkpoint salvato in: {checkpoint_filename}")
-print(f"   Contenuto: state_dict, architecture, hyperparameters, dataset_info, backbone, timestamp, test_metrics, baseline_f1")
+print(f"   Contenuto: trainable_params, architecture (with pooling config), hyperparameters, metrics")

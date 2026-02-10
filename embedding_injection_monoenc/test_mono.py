@@ -22,9 +22,15 @@ import datetime
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset/test_dataset_tokenlevel.json"
-LABEL2DESC_PATH = "../label2desc.json"
-LABEL2ID_PATH = "../label2id.json"
+
+
+DATASET = '../dataset_bc5cdr/'
+#DATASET = '../dataset/'
+
+
+TEST_PATH = DATASET + 'test_dataset_tknlvl_mono.json'
+LABEL2DESC_PATH = DATASET + 'label2desc.json'
+LABEL2ID_PATH = DATASET + 'label2id.json'
 MODEL_NAME = "urchade/gliner_small-v2.1"
 SAVINGS_DIR = "savings"
 TEST_RESULTS_DIR = "test_results"
@@ -228,12 +234,29 @@ with torch.no_grad():
         tokens = rec["tokens"]
         labels = rec["labels"]
         
-        # Truncate to Max Text Len
-        if len(tokens) > MAX_TEXT_LEN:
-            tokens = tokens[:MAX_TEXT_LEN]
-            labels = labels[:MAX_TEXT_LEN]
-            
+        # Convert tokens to IDs first
         inp_ids = tokenizer.convert_tokens_to_ids(tokens)
+        
+        # CLEANUP SPECIAL TOKENS (CRITICAL: Must match train_mono.py preprocessing!)
+        # The dataset contains [CLS] ... [SEP] because generated with add_special_tokens=True.
+        # The training loop constructs manually: [CLS] [PROMPT] [SEP] [TEXT] [SEP].
+        # We must remove special tokens from loaded text to avoid duplicates.
+        if len(inp_ids) > 0 and inp_ids[0] == tokenizer.cls_token_id:
+            inp_ids = inp_ids[1:]
+            labels = labels[1:]
+        
+        if len(inp_ids) > 0 and inp_ids[-1] == tokenizer.sep_token_id:
+            inp_ids = inp_ids[:-1]
+            labels = labels[:-1]
+        
+        # Truncate to Max Text Len (AFTER removing special tokens)
+        if len(inp_ids) > MAX_TEXT_LEN:
+            inp_ids = inp_ids[:MAX_TEXT_LEN]
+            labels = labels[:MAX_TEXT_LEN]
+        
+        if len(inp_ids) == 0:
+            continue
+            
         input_tensor = torch.tensor([inp_ids], device=DEVICE) # (1, SeqLen)
         attn_mask = torch.ones_like(input_tensor) # (1, SeqLen)
         

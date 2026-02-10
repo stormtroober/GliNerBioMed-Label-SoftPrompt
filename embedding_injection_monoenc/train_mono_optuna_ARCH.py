@@ -2,8 +2,8 @@
 """
 Training Mono-Encoder - OPTUNA ARCHITECTURE SEARCH
 - Obiettivo: Trovare la migliore architettura del PromptEncoder
-- Parametri: Prompt Length, Pooling Mode, Hidden Ratio, Dropout
-- Training veloce (5 epoche) per valutare la convergenza strutturale
+- Parametri: Prompt Length, Pooling Mode
+- Training veloce (10 epoche) per valutare la convergenza strutturale
 """
 
 import json
@@ -40,7 +40,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 🔧 CONFIGURAZIONE BASE (Fissa per Architecture Search)
 # ==========================================================
 BATCH_SIZE = 8
-EPOCHS = 5  # Epoche ridotte per architecture search
+EPOCHS = 10  # Epoche ridotte per architecture search
 LR_MLP = 1e-4 # LR ragionevole medio per valutare architetture
 WEIGHT_DECAY = 0.01
 TEMPERATURE = 0.05
@@ -53,9 +53,13 @@ GAMMA_FOCAL_LOSS = 5.0
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
+# Parametri Architetturali Fissi
+HIDDEN_DIM_RATIO = 4
+DROPOUT = 0.1
+
 # Paths
 if is_running_on_kaggle():
-    input_dir = "/kaggle/input/standard16600/"
+    input_dir = "/kaggle/input/jnlpa-6-2k5-1-2-complete/"
     TRAIN_PATH = input_dir + "dataset_tknlvl_mono.json"
     VAL_PATH = input_dir + "val_dataset_tknlvl_mono.json"
     LABEL2DESC_PATH = input_dir + "label2desc.json"
@@ -63,8 +67,8 @@ if is_running_on_kaggle():
     MODEL_NAME = '/kaggle/input/gliner2-1small/'
 else:
     input_dir = "../" 
-    TRAIN_PATH = input_dir + "dataset/dataset_tknlvl_mono.json" # MODIFICATO!
-    VAL_PATH = input_dir + "dataset/val_dataset_tknlvl_mono.json" # MODIFICATO!
+    TRAIN_PATH = input_dir + "dataset/dataset_tknlvl_mono.json"
+    VAL_PATH = input_dir + "dataset/val_dataset_tknlvl_mono.json"
     LABEL2DESC_PATH = input_dir + "label2desc.json"
     LABEL2ID_PATH = input_dir + "label2id.json"
     MODEL_NAME = "urchade/gliner_small-v2.1"
@@ -272,19 +276,14 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
 def objective(trial):
     # --- 1. SPUNTA PARAMETRI ARCHITETTURALI ---
     
+
     # Lunghezza Prompt: Valutiamo corti, medi e lunghi
     prompt_len = trial.suggest_categorical("prompt_len", [16, 32, 64])
     
     # Pooling Strategy: Come comprimere il prompt
     pooling_mode = trial.suggest_categorical("pooling_mode", ["adaptive_avg", "attention", "conv1d"])
     
-    # Complessità MLP interno: Rapporto hidden dim (es. 2x o 4x embed_dim)
-    hidden_dim_ratio = trial.suggest_int("hidden_dim_ratio", 2, 8, step=2)
-    
-    # Dropout (Regolarizzazione strutturale)
-    dropout = trial.suggest_float("dropout", 0.1, 0.3, step=0.1)
-    
-    print(f"\n🧪 TRIAL {trial.number} | Struct: Len={prompt_len}, Pool={pooling_mode}, Ratio={hidden_dim_ratio}x, Drop={dropout}")
+    print(f"\n🧪 TRIAL {trial.number} | Struct: Len={prompt_len}, Pool={pooling_mode} | Fixed: Ratio={HIDDEN_DIM_RATIO}x, Drop={DROPOUT}")
 
     # --- 2. CONFIGURAZIONE DINAMICA DEGLI INPUT ---
     # Max Text Length dipende dalla Prompt Length scelta!
@@ -319,10 +318,10 @@ def objective(trial):
         original_word_embeddings, 
         vocab_size, 
         embed_dim, 
-        dropout=dropout, # Ottimizzato
+        dropout=DROPOUT, # Fisso
         prompt_len=prompt_len, # Ottimizzato
         pooling_mode=pooling_mode, # Ottimizzato
-        hidden_dim_ratio=hidden_dim_ratio, # Ottimizzato
+        hidden_dim_ratio=HIDDEN_DIM_RATIO, # Fisso
     ).to(DEVICE)
     
     optimizer = optim.AdamW(prompt_encoder.parameters(), lr=LR_MLP, weight_decay=WEIGHT_DECAY)
@@ -447,13 +446,13 @@ def objective(trial):
 # 🚀 MAIN
 # ==========================================================
 if __name__ == "__main__":
-    print(f"\n🏗️ Inizio Architecture Search (30 Trials, 5 Epoche)")
+    print(f"\n🏗️ Inizio Architecture Search (9 Trials, 10 Epoche)")
     
     # Pruning aggressivo (salva tempo su architetture scarse)
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5)
     
     study = optuna.create_study(direction="minimize", pruner=pruner)
-    study.optimize(objective, n_trials=30)
+    study.optimize(objective, n_trials=9)
     
     print("\n🏆 BEST ARCHITECTURE:")
     print(study.best_params)
@@ -484,7 +483,7 @@ if __name__ == "__main__":
 
     # PLOTS
     try:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         
         # 1. Parallel Coordinate (Params overview)
         # Semplificato custom plot
@@ -493,27 +492,15 @@ if __name__ == "__main__":
         
         # Prompt Len vs Loss
         lens = [t.params['prompt_len'] for t in complete_trials]
-        axes[0,0].boxplot([[v for l,v in zip(lens, vals) if l==x] for x in [16,32,64]], labels=[16,32,64])
-        axes[0,0].set_title("Prompt Length Impact")
-        axes[0,0].set_ylabel("Val Loss")
+        axes[0].boxplot([[v for l,v in zip(lens, vals) if l==x] for x in [16,32,64]], labels=[16,32,64])
+        axes[0].set_title("Prompt Length Impact")
+        axes[0].set_ylabel("Val Loss")
 
         # Pooling Mode vs Loss
         modes = sorted(list(set([t.params['pooling_mode'] for t in complete_trials])))
         data_modes = [[v for m,v in zip([t.params['pooling_mode'] for t in complete_trials], vals) if m==x] for x in modes]
-        axes[0,1].boxplot(data_modes, labels=modes)
-        axes[0,1].set_title("Pooling Strategy Impact")
-        
-        # Dropout vs Loss (Scatter)
-        drops = [t.params['dropout'] for t in complete_trials]
-        axes[1,0].scatter(drops, vals, c='blue', alpha=0.6)
-        axes[1,0].set_title("Dropout Correlation")
-        axes[1,0].set_xlabel("Dropout Rate")
-        axes[1,0].set_ylabel("Val Loss")
-
-        # Hidden Ratio vs Loss
-        ratios = [t.params['hidden_dim_ratio'] for t in complete_trials]
-        axes[1,1].scatter(ratios, vals, c='green', alpha=0.6)
-        axes[1,1].set_title("MLP Hidden Size Ratio")
+        axes[1].boxplot(data_modes, labels=modes)
+        axes[1].set_title("Pooling Strategy Impact")
         
         plt.suptitle(f"Mono-Encoder Architecture Search - {timestamp}", fontsize=16)
         plt.tight_layout()
@@ -522,3 +509,8 @@ if __name__ == "__main__":
         
     except Exception as e:
         print(f"Errore plotting: {e}")
+
+# "best_params": {
+#     "prompt_len": 32,
+#     "pooling_mode": "conv1d"
+#   }

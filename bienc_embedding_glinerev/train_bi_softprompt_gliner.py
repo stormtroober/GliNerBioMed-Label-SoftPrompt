@@ -1,4 +1,10 @@
-
+#https://www.kaggle.com/code/alessandrobecci/finetuneglinerbiembedd-injectionintraingliner/
+# ### Performance Summary
+# | Average Type | Precision | Recall | F1-Score |
+# |:-------------|----------:|-------:|---------:|
+# | **Macro**    | 0.6542 | 0.7623 | **0.7018** |
+# | **Micro**    | 0.6873 | 0.8098 | **0.7436** |
+#ERA COL EVAL DATASET COL TEST (non dovrebbe cambiare nulla)
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 def is_running_on_kaggle():

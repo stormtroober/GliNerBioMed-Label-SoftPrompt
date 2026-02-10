@@ -3,10 +3,10 @@
 Training Mono-Encoder - OPTUNA HYPERPARAMETER SEARCH
 - Obiettivo: Trovare i migliori iperparametri di training per l'architettura scelta
 - Architettura Fissata (da studio precedente):
-    - Prompt Len: 64
+    - Prompt Len: 32 (CORRECTED from arch study)
     - Pooling: conv1d
     - Hidden Dim Ratio: 4
-    - Dropout: 0.2
+    - Dropout: 0.1 (CORRECTED from arch study)
 - Parametri Ottimizzati: LR, Temperature, Gamma Focal Loss, Beta Class Balanced
 """
 
@@ -44,17 +44,17 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 🔧 CONFIGURAZIONE BASE (Fissa)
 # ==========================================================
 BATCH_SIZE = 8
-EPOCHS = 10  # Più epoche per fine-tuning (10 vs 5 dello studio architetturale)
+EPOCHS = 10  
 WEIGHT_DECAY = 0.01
 GRAD_CLIP = 1.0
 WARMUP_RATIO = 0.1
 RANDOM_SEED = 42
 
 # --- ARCHITETTURA FISSATA (Da Optuna ARCH) ---
-FIXED_PROMPT_LEN = 64
+FIXED_PROMPT_LEN = 32
 FIXED_POOLING_MODE = "conv1d"
 FIXED_HIDDEN_RATIO = 4
-FIXED_DROPOUT = 0.2
+FIXED_DROPOUT = 0.1
 # ---------------------------------------------
 
 WEIGHT_STRATEGY = "ClassBalanced"
@@ -443,7 +443,7 @@ def objective(trial):
 # ==========================================================
 if __name__ == "__main__":
     print(f"\n🏗️ Inizio Hyperparam Search (20 Trials, 10 Epoche)")
-    print(f"🔒 Fixed Arch: Len={FIXED_PROMPT_LEN}, Poo={FIXED_POOLING_MODE}, Ratio={FIXED_HIDDEN_RATIO}, Drop={FIXED_DROPOUT}")
+    print(f"🔒 Fixed Arch: Len={FIXED_PROMPT_LEN}, Pool={FIXED_POOLING_MODE}, Ratio={FIXED_HIDDEN_RATIO}, Drop={FIXED_DROPOUT}")
     
     # Pruning standard
     pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
@@ -513,4 +513,3 @@ if __name__ == "__main__":
         plt.ylabel('Val Loss')
         plt.title('LR Impact')
         plt.savefig(os.path.join(output_dir, f"manual_lr_plot_{timestamp}.png"))
-

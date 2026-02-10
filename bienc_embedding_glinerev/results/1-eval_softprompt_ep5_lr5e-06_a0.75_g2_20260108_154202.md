@@ -18,3 +18,10 @@
 
 ## Detailed Metrics by Label
 The detailed per-label metrics are available in the console logs.
+
+https://www.kaggle.com/code/alessandrobecci/finetuneglinerbiembedd-injectionintraingliner
+### Performance Summary
+| Average Type | Precision | Recall | F1-Score |
+|:-------------|----------:|-------:|---------:|
+| **Macro**    | 0.6542 | 0.7623 | **0.7018** |
+| **Micro**    | 0.6873 | 0.8098 | **0.7436** |

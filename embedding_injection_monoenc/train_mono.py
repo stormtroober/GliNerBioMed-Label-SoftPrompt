@@ -1,5 +1,4 @@
-#2 minuti a epoca con 6k
-#1 minuto per bc5dr
+#https://www.kaggle.com/code/alessandrobecci/promptencoderglinermonoencodertraining/
 # -*- coding: utf-8 -*-
 import json
 import torch
@@ -29,14 +28,16 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 BATCH_SIZE = 8 
-EPOCHS = 2
+EPOCHS = 20
 
 # LEARNING RATES
-LR_MLP = 8.355496242968421e-05 
+#LR_MLP = 3e-4
+LR_MLP = 0.00017896280333089907
 LR_BACKBONE = 0.0 # Frozen by default
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.05 
+#0.05
+TEMPERATURE = 0.14792401166908015
 GRAD_CLIP = 1.0
 WARMUP_RATIO = 0.1
 RANDOM_SEED = 42
@@ -45,7 +46,9 @@ DROPOUT_RATE = 0.1
 PROMPT_LEN = 32
 POOLING_MODE = "conv1d"
 
-GAMMA_FOCAL_LOSS = 5.0
+GAMMA_FOCAL_LOSS = 5.893415878096565
+GAMMA_FOCAL_LOSS = 3.0
+#per bc5dr lo abbasso un pò 3e-4
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
 
@@ -53,7 +56,7 @@ EARLY_STOPPING_PATIENCE = 5
 
 # Paths
 if is_running_on_kaggle():
-    input_dir = "/kaggle/input/standard16600/"
+    input_dir = "/kaggle/input/jnlpa-18-5k15-3-5-complete/"
     TRAIN_PATH = input_dir + "dataset_tknlvl_mono.json"
     VAL_PATH = input_dir + "val_dataset_tknlvl_mono.json"
     LABEL2DESC_PATH = input_dir + "label2desc.json"
@@ -341,16 +344,22 @@ best_loss = float('inf')
 best_model_state = None
 patience_counter = 0
 
+# Timing tracking
+epoch_times = []  # List of dicts: {'epoch': int, 'train_time': float, 'val_time': float, 'total_time': float}
+
 print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP}")
 
 for epoch in range(1, EPOCHS + 1):
-    start_time = time.time()
+    epoch_start_time = time.time()
+    
     # TRAIN
+    train_start_time = time.time()
     prompt_encoder.train()
     total_train_loss = 0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [Train]")
+    print(f"Epoch {epoch}/{EPOCHS} [Train] started...")
+    # pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [Train]")
     
-    for batch in pbar:
+    for batch in train_loader:
         batch = {k: v.to(DEVICE) for k, v in batch.items()}
         optimizer.zero_grad()
         
@@ -434,11 +443,14 @@ for epoch in range(1, EPOCHS + 1):
         scheduler.step()
         
         total_train_loss += loss.item()
-        pbar.set_postfix({"loss": loss.item()})
+        # pbar.set_postfix({"loss": loss.item()})
         
     avg_train_loss = total_train_loss / len(train_loader)
+    train_end_time = time.time()
+    train_time = train_end_time - train_start_time
     
     # VALIDATION
+    val_start_time = time.time()
     prompt_encoder.eval()
     total_val_loss = 0
     with torch.no_grad():
@@ -487,10 +499,32 @@ for epoch in range(1, EPOCHS + 1):
             total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(val_loader)
+    val_end_time = time.time()
+    val_time = val_end_time - val_start_time
     
-    end_time = time.time()
-    epoch_mins, epoch_secs = divmod(end_time - start_time, 60)
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Time: {int(epoch_mins)}m {int(epoch_secs)}s")
+    epoch_end_time = time.time()
+    total_epoch_time = epoch_end_time - epoch_start_time
+    
+    # Store timing information
+    epoch_times.append({
+        'epoch': epoch,
+        'train_time': train_time,
+        'val_time': val_time,
+        'total_time': total_epoch_time
+    })
+    
+    # Print epoch summary with detailed timing
+    train_mins, train_secs = divmod(train_time, 60)
+    val_mins, val_secs = divmod(val_time, 60)
+    total_mins, total_secs = divmod(total_epoch_time, 60)
+    
+    print(f"\n{'='*80}")
+    print(f"Epoch {epoch}/{EPOCHS} Summary:")
+    print(f"  Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+    print(f"  Training Time:   {int(train_mins):2d}m {int(train_secs):02d}s")
+    print(f"  Validation Time: {int(val_mins):2d}m {int(val_secs):02d}s")
+    print(f"  Total Time:      {int(total_mins):2d}m {int(total_secs):02d}s")
+    print(f"{'='*80}\n")
     
     # Save & Early Stopping (Structure Updated)
     if avg_val_loss < best_loss:
@@ -539,6 +573,43 @@ for epoch in range(1, EPOCHS + 1):
             print(f"\n🛑 Early Stopping attivo! Nessun miglioramento per {EARLY_STOPPING_PATIENCE} epoche.")
             break
 
+# Print timing summary table
+print(f"\n{'='*80}")
+print(f"⏱️  TIMING SUMMARY")
+print(f"{'='*80}")
+print(f"{'Epoch':<8} {'Train Time':<15} {'Val Time':<15} {'Total Time':<15}")
+print(f"{'-'*8} {'-'*15} {'-'*15} {'-'*15}")
+
+for timing in epoch_times:
+    train_mins, train_secs = divmod(timing['train_time'], 60)
+    val_mins, val_secs = divmod(timing['val_time'], 60)
+    total_mins, total_secs = divmod(timing['total_time'], 60)
+    
+    print(f"{timing['epoch']:<8} "
+          f"{int(train_mins):2d}m {int(train_secs):02d}s{' '*7} "
+          f"{int(val_mins):2d}m {int(val_secs):02d}s{' '*7} "
+          f"{int(total_mins):2d}m {int(total_secs):02d}s")
+
+# Calculate and print averages
+if epoch_times:
+    avg_train_time = sum(t['train_time'] for t in epoch_times) / len(epoch_times)
+    avg_val_time = sum(t['val_time'] for t in epoch_times) / len(epoch_times)
+    avg_total_time = sum(t['total_time'] for t in epoch_times) / len(epoch_times)
+    total_training_time = sum(t['total_time'] for t in epoch_times)
+    
+    avg_train_mins, avg_train_secs = divmod(avg_train_time, 60)
+    avg_val_mins, avg_val_secs = divmod(avg_val_time, 60)
+    avg_total_mins, avg_total_secs = divmod(avg_total_time, 60)
+    total_mins, total_secs = divmod(total_training_time, 60)
+    
+    print(f"{'-'*8} {'-'*15} {'-'*15} {'-'*15}")
+    print(f"{'Average':<8} "
+          f"{int(avg_train_mins):2d}m {int(avg_train_secs):02d}s{' '*7} "
+          f"{int(avg_val_mins):2d}m {int(avg_val_secs):02d}s{' '*7} "
+          f"{int(avg_total_mins):2d}m {int(avg_total_secs):02d}s")
+    print(f"\n{'Total Training Time:':<25} {int(total_mins):3d}m {int(total_secs):02d}s")
+
+print(f"{'='*80}")
 print(f"\n✅ Training completato. Best Validation Loss: {best_loss:.4f}")
 
 # ==========================================================
@@ -561,3 +632,178 @@ if best_model_state is not None:
     print(f"💾 Modello salvato in {save_path}")
 else:
     print("⚠️ Nessun modello salvato (Loss mai migliorata?)")
+
+# ==========================================================
+# 7️⃣ TEST AUTOMATICO SUL MODELLO MIGLIORE
+# ==========================================================
+if best_model_state is not None:
+    print(f"\n{'='*80}")
+    print(f"🧪 AVVIO TEST AUTOMATICO SUL MODELLO MIGLIORE")
+    print(f"{'='*80}\n")
+    
+    # Determine test path
+    if is_running_on_kaggle():
+        TEST_PATH = input_dir + "test_dataset_tknlvl_mono.json"
+    else:
+        TEST_PATH = input_dir + "dataset/test_dataset_tknlvl_mono.json"
+    
+    # Check if test file exists
+    if not os.path.exists(TEST_PATH):
+        print(f"⚠️ File di test non trovato: {TEST_PATH}")
+        print("   Test automatico saltato.")
+    else:
+        # Import metrics
+        from sklearn.metrics import precision_recall_fscore_support, classification_report
+        
+        # Load best model state into prompt_encoder
+        prompt_encoder.load_state_dict(best_model_state['prompt_encoder'])
+        prompt_encoder.eval()
+        print(f"✅ Modello migliore caricato (Val Loss: {best_loss:.4f})")
+        
+        # Load test data
+        with open(TEST_PATH, 'r', encoding='utf-8') as f:
+            test_data = json.load(f)
+        print(f"📊 Caricati {len(test_data)} record di test\n")
+        
+        # Identify 'O' class to exclude from metrics
+        ignore_index = -1
+        for idx, name in enumerate(label_names):
+            if name == 'O':
+                ignore_index = idx
+                break
+        
+        all_label_ids = list(range(len(label_names)))
+        if ignore_index != -1:
+            relevant_label_ids = [i for i in all_label_ids if i != ignore_index]
+            relevant_label_names = [label_names[i] for i in relevant_label_ids]
+            print(f"ℹ️  Esclusione classe 'O' (ID: {ignore_index}) dalle metriche.\n")
+        else:
+            relevant_label_ids = all_label_ids
+            relevant_label_names = label_names
+        
+        # Pre-calculate prompt embeddings (already done earlier, but we'll recalculate for clarity)
+        with torch.no_grad():
+            soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
+            soft_prompts_flat = soft_prompts.view(-1, embed_dim)
+            prompts_len_total = soft_prompts_flat.shape[0]
+        
+        # Run inference
+        y_true = []
+        y_pred = []
+        
+        print("🔍 Esecuzione inferenza sul test set...")
+        with torch.no_grad():
+            for rec in tqdm(test_data, desc="Testing"):
+                tokens = rec["tokens"]
+                labels = rec["labels"]
+                
+                # Remove special tokens (same as train dataset preprocessing)
+                inp_ids = tokenizer.convert_tokens_to_ids(tokens)
+                
+                # Remove CLS if present
+                if len(inp_ids) > 0 and inp_ids[0] == tokenizer.cls_token_id:
+                    inp_ids = inp_ids[1:]
+                    labels = labels[1:]
+                
+                # Remove SEP if present
+                if len(inp_ids) > 0 and inp_ids[-1] == tokenizer.sep_token_id:
+                    inp_ids = inp_ids[:-1]
+                    labels = labels[:-1]
+                
+                # Truncate to max text length
+                if len(inp_ids) > MAX_TEXT_LEN:
+                    inp_ids = inp_ids[:MAX_TEXT_LEN]
+                    labels = labels[:MAX_TEXT_LEN]
+                
+                if len(inp_ids) == 0:
+                    continue
+                
+                input_tensor = torch.tensor([inp_ids], device=DEVICE)
+                attn_mask = torch.ones_like(input_tensor)
+                
+                # 1. Expand prompts for batch (batch=1)
+                batch_soft_prompts = soft_prompts_flat.unsqueeze(0)
+                
+                # 2. Text embeddings
+                text_embeds = backbone.embeddings(input_tensor)
+                
+                # 3. Concatenate: [CLS] Prompts [SEP] Text [SEP]
+                cls_token = torch.tensor([[tokenizer.cls_token_id]], device=DEVICE)
+                sep_token = torch.tensor([[tokenizer.sep_token_id]], device=DEVICE)
+                cls_embed = backbone.embeddings(cls_token)
+                sep_embed = backbone.embeddings(sep_token)
+                
+                inputs_embeds = torch.cat([cls_embed, batch_soft_prompts, sep_embed, text_embeds, sep_embed], dim=1)
+                
+                # Build attention mask
+                B = 1
+                full_mask = torch.cat([
+                    torch.ones((B, 1), device=DEVICE),           # CLS
+                    torch.ones((B, prompts_len_total), device=DEVICE),  # Prompts
+                    torch.ones((B, 1), device=DEVICE),           # SEP
+                    attn_mask,                                    # Text
+                    torch.ones((B, 1), device=DEVICE)            # SEP
+                ], dim=1)
+                
+                # 4. Forward through encoder
+                outputs = backbone.encoder(inputs_embeds, attention_mask=full_mask.unsqueeze(1).unsqueeze(2))
+                sequence_output = outputs.last_hidden_state
+                
+                # 5. Extract text representations
+                text_start = 1 + prompts_len_total + 1
+                text_end = text_start + len(inp_ids)
+                text_reps = sequence_output[:, text_start:text_end, :]
+                
+                # 6. Extract and pool prompt representations
+                prompt_reps_seq = sequence_output[:, 1:1+prompts_len_total, :]
+                prompt_reps_reshaped = prompt_reps_seq.view(1, num_labels, PROMPT_LEN, embed_dim)
+                prompt_vectors = prompt_reps_reshaped.mean(dim=2)
+                
+                # 7. Compute similarity
+                H_text = F.normalize(text_reps, dim=-1)
+                H_prompts = F.normalize(prompt_vectors, dim=-1)
+                logits = torch.bmm(H_text, H_prompts.transpose(1, 2))
+                
+                # 8. Get predictions
+                preds = logits.argmax(-1).squeeze(0).cpu().tolist()
+                
+                # 9. Store results
+                for p, t in zip(preds, labels):
+                    if t != -100:
+                        y_true.append(t)
+                        y_pred.append(p)
+        
+        # Calculate metrics
+        print(f"\n{'='*80}")
+        print(f"📊 RISULTATI TEST")
+        print(f"{'='*80}\n")
+        
+        if len(y_true) == 0:
+            print("⚠️ Nessun token valido trovato nel test set!")
+        else:
+            # Macro metrics
+            macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+                y_true, y_pred, labels=relevant_label_ids, average="macro", zero_division=0
+            )
+            # Micro metrics
+            micro_p, micro_r, micro_f1, _ = precision_recall_fscore_support(
+                y_true, y_pred, labels=relevant_label_ids, average="micro", zero_division=0
+            )
+            
+            print(f"🏆 METRICHE GLOBALI (senza classe 'O'):")
+            print(f"   • MACRO - Precision: {macro_p:.4f} | Recall: {macro_r:.4f} | F1: {macro_f1:.4f}")
+            print(f"   • MICRO - Precision: {micro_p:.4f} | Recall: {micro_r:.4f} | F1: {micro_f1:.4f}")
+            print(f"   • Tokens valutati: {len(y_true):,}\n")
+            
+            # Detailed classification report
+            class_report = classification_report(
+                y_true, y_pred, 
+                target_names=relevant_label_names, 
+                labels=relevant_label_ids, 
+                zero_division=0
+            )
+            print("📋 CLASSIFICATION REPORT:\n")
+            print(class_report)
+            
+            print(f"{'='*80}\n")
+
