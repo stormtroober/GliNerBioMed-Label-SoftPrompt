@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import os
 import numpy as np
+import time
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from collections import Counter
@@ -25,23 +26,22 @@ BATCH_SIZE = 128
 EPOCHS = 25
 
 # LEARNING RATES SEPARATI
-LR_MLP = 0.002
-LR_PROJ = 0.002
+LR_MLP = 0.0013511956477601783
+LR_PROJ = 0.0007885577807729545
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.011641058260782156
+TEMPERATURE = 0.011238596377369695
 GRAD_CLIP = 1.0
-WARMUP_RATIO = 0.10603059187238079
+WARMUP_RATIO = 0.1
 RANDOM_SEED = 42
 DROPOUT_RATE = 0.1
 
-PROMPT_LEN = 32
-POOLING_MODE = "conv1d"  # "adaptive_avg", "adaptive_max", "attention", "conv1d", "conv1d_strided"
+PROMPT_LEN = 64
+POOLING_MODE = "attention"  # "adaptive_avg", "adaptive_max", "attention", "conv1d", "conv1d_strided"
 
-GAMMA_FOCAL_LOSS = 5.0
+GAMMA_FOCAL_LOSS = 5.441268307277985
 CB_BETA = 0.9999
 WEIGHT_STRATEGY = "ClassBalanced"
-VALIDATION_RATIO = 0.1
 EARLY_STOPPING_PATIENCE = 5
 
 if is_running_on_kaggle():
@@ -52,6 +52,7 @@ else:
     MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+VAL_PATH = input_dir + "val_dataset_tknlvl_bi.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"    
 
@@ -366,22 +367,11 @@ def get_cb_weights(dataset_path, label2id, device, beta=0.9999):
     return weights
 
 # --- LOAD ---
-full_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
-dataset_size = len(full_ds)
-print(f"📊 Dimensione dataset totale: {dataset_size} esempi")
+train_ds = TokenJsonDataset(DATASET_PATH, txt_tok)
+val_ds = TokenJsonDataset(VAL_PATH, txt_tok)
 
-# SPLIT TRAIN/VALIDATION
-val_size = int(dataset_size * VALIDATION_RATIO)
-train_size = dataset_size - val_size
-
-# Si usa un generator con seed fisso per riproducibilità dello split
-generator = torch.Generator().manual_seed(RANDOM_SEED)
-train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=generator)
-
-print(f"🔪 Split Dataset: Train={len(train_ds)} | Valid={len(val_ds)}")
-
-# WARMUP_STEPS calculation moved to scheduler initialization per request
-# WARMUP_STEPS = round(math.ceil(dataset_size / BATCH_SIZE) * EPOCHS * WARMUP_PERCENTAGE)
+print(f"📊 Train Dataset: {len(train_ds)} esempi")
+print(f"� Validation Dataset: {len(val_ds)} esempi")
 
 class_weights = get_cb_weights(DATASET_PATH, label2id, DEVICE, beta=CB_BETA)
 
@@ -439,11 +429,19 @@ patience_counter = 0
 
 print(f"\n🚀 Inizio Training | MLP LR: {LR_MLP} | PROJ LR: {LR_PROJ if TRAIN_PROJECTION else 'N/A'}")
 print(f"🎯 Configurazione Loss: Class Balanced (Beta={CB_BETA}) + Focal (Gamma={GAMMA_FOCAL_LOSS})")
-print(f"🧐 Validazione attiva al {int(VALIDATION_RATIO*100)}%")
+print(f"🧐 Validazione con file separato: {VAL_PATH}")
+
+# Timing tracking
+epoch_times = []
+train_times = []
+val_times = []
 
 for epoch in range(1, EPOCHS + 1):
+    epoch_start_time = time.time()
+    print(f"\n⏰ Epoch {epoch}/{EPOCHS} - Start: {datetime.now().strftime('%H:%M:%S')}")
     
     # --- TRAINING PHASE ---
+    train_start_time = time.time()
     prompt_encoder.train()
     if TRAIN_PROJECTION: proj.train()
     
@@ -508,8 +506,12 @@ for epoch in range(1, EPOCHS + 1):
         pbar.set_postfix({"t_loss": loss.item()})
         
     avg_train_loss = total_train_loss / len(train_loader)
+    train_end_time = time.time()
+    train_duration = train_end_time - train_start_time
+    train_times.append(train_duration)
     
     # --- VALIDATION PHASE ---
+    val_start_time = time.time()
     prompt_encoder.eval()
     if TRAIN_PROJECTION: proj.eval()
     
@@ -551,8 +553,17 @@ for epoch in range(1, EPOCHS + 1):
             total_val_loss += v_loss.item()
             
     avg_val_loss = total_val_loss / len(val_loader)
+    val_end_time = time.time()
+    val_duration = val_end_time - val_start_time
+    val_times.append(val_duration)
+    
+    # Epoch timing
+    epoch_end_time = time.time()
+    epoch_duration = epoch_end_time - epoch_start_time
+    epoch_times.append(epoch_duration)
     
     print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+    print(f"⏰ Epoch {epoch}/{EPOCHS} - End: {datetime.now().strftime('%H:%M:%S')} | Train: {train_duration:.2f}s | Val: {val_duration:.2f}s | Total: {epoch_duration:.2f}s")
     
     # Salva se migliora la VALIDATION loss (Early Stopping proxy)
     if avg_val_loss < best_loss:
@@ -563,7 +574,6 @@ for epoch in range(1, EPOCHS + 1):
                 # Parametri generali di training
                 'batch_size': BATCH_SIZE,
                 'epochs': EPOCHS,
-                'dataset_size': dataset_size,
                 'train_size': len(train_ds),
                 'val_size': len(val_ds),
                 'random_seed': RANDOM_SEED,
@@ -584,8 +594,7 @@ for epoch in range(1, EPOCHS + 1):
                 'cb_beta': CB_BETA,
 
                 # Parametri Validation
-                'validation_split': True,
-                'validation_ratio': VALIDATION_RATIO,
+                'validation_file': VAL_PATH,
 
                 #Parametri Prompt Pooling
                 'prompt_len': PROMPT_LEN,
@@ -615,11 +624,32 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\n✅ Training completato. Best Validation Loss: {best_loss:.4f}")
 
+# Final timing report
+if epoch_times:
+    total_time = sum(epoch_times)
+    total_train_time = sum(train_times)
+    total_val_time = sum(val_times)
+    avg_epoch_time = total_time / len(epoch_times)
+    avg_train_time = total_train_time / len(train_times)
+    avg_val_time = total_val_time / len(val_times)
+    
+    print(f"\n📊 TIMING REPORT:")
+    print(f"   Total Training Time: {total_time:.2f}s ({total_time/60:.2f}m)")
+    print(f"   Total Train Phase Time: {total_train_time:.2f}s ({total_train_time/60:.2f}m)")
+    print(f"   Total Validation Phase Time: {total_val_time:.2f}s ({total_val_time/60:.2f}m)")
+    print(f"   Average Epoch Time: {avg_epoch_time:.2f}s")
+    print(f"   Average Train Phase Time: {avg_train_time:.2f}s")
+    print(f"   Average Validation Phase Time: {avg_val_time:.2f}s")
+    print(f"   Min Epoch Time: {min(epoch_times):.2f}s")
+    print(f"   Max Epoch Time: {max(epoch_times):.2f}s")
+    print(f"   Completed Epochs: {len(epoch_times)}/{EPOCHS}")
+
 try:
     import google.colab # type: ignore
     IN_COLAB = True
 except:
     IN_COLAB = False
+
 
 
 from datetime import datetime, timedelta
@@ -644,3 +674,25 @@ if best_model_state is not None:
         
 else:
         print("⚠️ Nessun modello salvato.")
+
+# 📊 TIMING REPORT JNLPA:
+#    Total Training Time: 720.00s (12.00m)
+#    Total Train Phase Time: 576.82s (9.61m)
+#    Total Validation Phase Time: 143.18s (2.39m)
+#    Average Epoch Time: 40.00s
+#    Average Train Phase Time: 32.05s
+#    Average Validation Phase Time: 7.95s
+#    Min Epoch Time: 39.59s
+#    Max Epoch Time: 41.55s
+#    Completed Epochs: 18/25
+
+# 📊 TIMING REPORT BC5DR:
+#    Total Training Time: 313.85s (5.23m)
+#    Total Train Phase Time: 256.92s (4.28m)
+#    Total Validation Phase Time: 56.93s (0.95m)
+#    Average Epoch Time: 12.55s
+#    Average Train Phase Time: 10.28s
+#    Average Validation Phase Time: 2.28s
+#    Min Epoch Time: 12.23s
+#    Max Epoch Time: 12.82s
+#    Completed Epochs: 25/25

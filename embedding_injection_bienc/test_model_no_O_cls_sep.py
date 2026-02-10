@@ -22,7 +22,9 @@ import subprocess
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-prefix = "../dataset/"
+#prefix = "../dataset/"
+prefix = "../dataset_bc5cdr/"
+
 TEST_PATH = prefix + "test_dataset_tknlvl_bi.json"
 LABEL2DESC_PATH = prefix + "label2desc.json"
 LABEL2ID_PATH = prefix + "label2id.json"
