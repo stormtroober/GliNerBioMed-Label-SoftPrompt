@@ -133,14 +133,16 @@ def truncate_tokens_safe(tokens, tokenizer, max_len=None):
         return [tokens[0]] + tokens[1:max_len-1] + [tokens[-1]]
     return tokens[:max_len]
 
-def validate(val_records, txt_enc, txt_tok, soft_table, proj, device):
-    """Validation con Soft Table"""
+def validate(val_records, txt_enc, txt_tok, soft_table, proj, device, criterion, temperature):
+    """Validation con Soft Table - calcola loss e F1"""
     txt_enc.eval()
     soft_table.eval()
     proj.eval()
     
     y_true_all = []
     y_pred_all = []
+    total_loss = 0.0
+    num_batches = 0
     
     with torch.no_grad():
         label_vecs = proj(soft_table.weight)
@@ -162,12 +164,19 @@ def validate(val_records, txt_enc, txt_tok, soft_table, proj, device):
             
             input_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+            labels_tensor = torch.tensor([labels], dtype=torch.long, device=device)
             
             out_txt = txt_enc(input_ids=input_ids, attention_mask=attention_mask)
             H = F.normalize(out_txt.last_hidden_state, dim=-1)
             
-            logits = torch.matmul(H, label_matrix.T).squeeze(0)
-            preds = logits.argmax(-1).cpu().numpy()
+            logits = torch.matmul(H, label_matrix.T) / temperature
+            
+            # Calcola loss
+            loss = criterion(logits.view(-1, label_matrix.size(0)), labels_tensor.view(-1))
+            total_loss += loss.item()
+            num_batches += 1
+            
+            preds = logits.squeeze(0).argmax(-1).cpu().numpy()
             
             for pred, true_label in zip(preds, labels):
                 if true_label != -100:
@@ -181,7 +190,9 @@ def validate(val_records, txt_enc, txt_tok, soft_table, proj, device):
         y_true_all, y_pred_all, average="micro", zero_division=0
     )[2]
     
-    return macro_f1, micro_f1
+    avg_val_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    return avg_val_loss, macro_f1, micro_f1
 
 class TokenJsonDataset(Dataset):
     def __init__(self, path_json, tokenizer):
@@ -304,7 +315,7 @@ print(f"✅ Training: {len(ds)} | Validation: {len(val_records)}")
 # OPTUNA OBJECTIVE FUNCTION
 # ==========================================================
 def objective(trial):
-    """Funzione obiettivo per Optuna - ritorna Macro F1 su validation"""
+    """Funzione obiettivo per Optuna - ritorna Validation Loss"""
     
     # ========== SAMPLING IPERPARAMETRI ==========
     lr_embed = trial.suggest_float("lr_embed", 1e-5, 1e-3, log=True)
@@ -360,7 +371,7 @@ def objective(trial):
     
     # ========== TRAINING LOOP ==========
     txt_enc.eval()
-    best_val_f1 = -float('inf')
+    best_val_loss = float('inf')
     
     for epoch in range(1, EPOCHS + 1):
         soft_table.train()
@@ -403,38 +414,39 @@ def objective(trial):
         avg_loss = total_loss / num_batches
         
         # VALIDATION
-        val_macro_f1, val_micro_f1 = validate(
-            val_records, txt_enc, txt_tok, soft_table, proj, DEVICE
+        val_loss, val_macro_f1, val_micro_f1 = validate(
+            val_records, txt_enc, txt_tok, soft_table, proj, DEVICE, criterion, temperature
         )
         
         # Fine epoca
-        print(f" Loss:{avg_loss:.4f} Val_F1_Macro:{val_macro_f1:.4f} Val_F1_Micro:{val_micro_f1:.4f}")
+        print(f" Loss:{avg_loss:.4f} Val_Loss:{val_loss:.4f} Val_F1_Macro:{val_macro_f1:.4f} Val_F1_Micro:{val_micro_f1:.4f}")
         
-        # Report intermediate value per pruning
-        trial.report(val_macro_f1, epoch)
+        # Report intermediate value per pruning (usa validation loss)
+        trial.report(val_loss, epoch)
         
         # Pruning: ferma trial non promettenti
         if trial.should_prune():
             print(f"  ✂️  Pruned at epoch {epoch}")
             raise optuna.TrialPruned()
         
-        # Track best
-        if val_macro_f1 > best_val_f1:
-            best_val_f1 = val_macro_f1
+        # Track best (minimizzazione)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
         
-        # Early stopping
-        is_improved = early_stopping(val_macro_f1)
+        # Early stopping (basato su loss - minimizzazione)
+        # Invertiamo il segno per usare la stessa logica di EarlyStopping
+        is_improved = early_stopping(-val_loss)
         if early_stopping.early_stop:
             print(f"  🛑 Early stopping")
             break
     
-    print(f"  ✅ Completed | Best Val F1: {best_val_f1:.4f}")
+    print(f"  ✅ Completed | Best Val Loss: {best_val_loss:.4f}")
     
     # Cleanup memory
     del soft_table, proj, optimizer, scheduler, train_loader
     torch.cuda.empty_cache()
     
-    return best_val_f1
+    return best_val_loss
 
 # ==========================================================
 # OPTUNA STUDY
@@ -443,13 +455,13 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("🔍 INIZIO OTTIMIZZAZIONE OPTUNA")
     print("="*70)
-    print(f"  Trials: {N_TRIALS} | Metric: Val Macro F1 | Epochs: {EPOCHS}")
+    print(f"  Trials: {N_TRIALS} | Metric: Validation Loss (minimize) | Epochs: {EPOCHS}")
     print("="*70 + "\n")
     
     # Crea study
     study = optuna.create_study(
         study_name=STUDY_NAME,
-        direction="maximize",
+        direction="minimize",
         pruner=optuna.pruners.MedianPruner(
             n_startup_trials=5,
             n_warmup_steps=3
@@ -479,7 +491,7 @@ if __name__ == "__main__":
     print(f"\n🥇 BEST TRIAL:")
     best_trial = study.best_trial
     print(f"  Trial number:       {best_trial.number}")
-    print(f"  Validation Macro F1: {best_trial.value:.4f}")
+    print(f"  Validation Loss: {best_trial.value:.4f}")
     print(f"\n  Parametri:")
     for key, value in best_trial.params.items():
         if 'lr' in key:
@@ -487,12 +499,12 @@ if __name__ == "__main__":
         else:
             print(f"    {key:12s}: {value}")
     
-    # Top 5 trials
-    print(f"\n📈 TOP 5 TRIALS:")
-    top_trials = sorted(study.trials, key=lambda t: t.value if t.value else -1, reverse=True)[:5]
+    # Top 5 trials (ordinati per loss crescente - migliori = loss più bassa)
+    print(f"\n📈 TOP 5 TRIALS (Best = Lowest Loss):")
+    top_trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else float('inf'))[:5]
     for i, trial in enumerate(top_trials, 1):
         if trial.value is not None:
-            print(f"  {i}. Trial {trial.number:2d} | F1: {trial.value:.4f} | "
+            print(f"  {i}. Trial {trial.number:2d} | Loss: {trial.value:.4f} | "
                   f"LR_Embed: {trial.params['lr_embed']:.6f} | "
                   f"Temp: {trial.params['temperature']:.3f} | "
                   f"Gamma: {trial.params['gamma']:.2f}")
@@ -519,7 +531,7 @@ if __name__ == "__main__":
         
         f.write(f"## Configuration\n")
         f.write(f"- **Trials:** {N_TRIALS}\n")
-        f.write(f"- **Metric:** Validation Macro F1 (maximize)\n")
+        f.write(f"- **Metric:** Validation Loss (minimize)\n")
         f.write(f"- **Epochs per trial:** {EPOCHS}\n")
         f.write(f"- **Early stopping patience:** {EARLY_STOPPING_PATIENCE}\n")
         f.write(f"- **Pruner:** MedianPruner\n\n")
@@ -542,10 +554,10 @@ if __name__ == "__main__":
         f.write(f"\n```\n\n")
         
         f.write(f"## Top 10 Trials\n")
-        f.write(f"| Rank | Trial | Macro F1 | LR_Embed | LR_Proj | Temp | Gamma | Beta |\n")
+        f.write(f"| Rank | Trial | Val Loss | LR_Embed | LR_Proj | Temp | Gamma | Beta |\n")
         f.write(f"|------|-------|----------|----------|---------|------|-------|------|\n")
         
-        top_10 = sorted(study.trials, key=lambda t: t.value if t.value else -1, reverse=True)[:10]
+        top_10 = sorted(study.trials, key=lambda t: t.value if t.value is not None else float('inf'))[:10]
         for i, trial in enumerate(top_10, 1):
             if trial.value is not None:
                 f.write(f"| {i} | {trial.number} | {trial.value:.4f} | "
@@ -591,128 +603,3 @@ if __name__ == "__main__":
         json.dump(results_json, f, indent=2)
     
     print(f"💾 JSON salvato in: {json_path}")
-    
-    # ==========================================================
-    # 📊 VISUALIZZAZIONI OPTUNA
-    # ==========================================================
-    print(f"\n{'='*70}")
-    print("📊 GENERAZIONE VISUALIZZAZIONI")
-    print(f"{'='*70}")
-    
-    try:
-        # 1. Optimization History
-        fig1 = optuna.visualization.plot_optimization_history(study)
-        fig1_path = f"optuna_results/optimization_history_{timestamp}.png"
-        fig1.write_image(fig1_path)
-        print(f"✅ Optimization History: {fig1_path}")
-    except Exception as e:
-        print(f"⚠️  Optimization History (plotly): {e}")
-        try:
-            # Fallback matplotlib
-            fig, ax = plt.subplots(figsize=(10, 6))
-            trial_numbers = [t.number for t in study.trials if t.value is not None]
-            values = [t.value for t in study.trials if t.value is not None]
-            ax.plot(trial_numbers, values, 'o-', linewidth=2, markersize=6)
-            ax.set_xlabel('Trial')
-            ax.set_ylabel('Validation Macro F1')
-            ax.set_title('Optimization History')
-            ax.grid(True, alpha=0.3)
-            fig1_path = f"optuna_results/optimization_history_{timestamp}.png"
-            plt.savefig(fig1_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"✅ Optimization History (matplotlib): {fig1_path}")
-        except Exception as e2:
-            print(f"❌ Matplotlib fallback failed: {e2}")
-    
-    try:
-        # 2. Parameter Importances
-        fig2 = optuna.visualization.plot_param_importances(study)
-        fig2_path = f"optuna_results/param_importances_{timestamp}.png"
-        fig2.write_image(fig2_path)
-        print(f"✅ Parameter Importances: {fig2_path}")
-    except Exception as e:
-        print(f"⚠️  Parameter Importances: {e}")
-    
-    try:
-        # 3. Parallel Coordinate
-        fig3 = optuna.visualization.plot_parallel_coordinate(study)
-        fig3_path = f"optuna_results/parallel_coordinate_{timestamp}.png"
-        fig3.write_image(fig3_path)
-        print(f"✅ Parallel Coordinate: {fig3_path}")
-    except Exception as e:
-        print(f"⚠️  Parallel Coordinate: {e}")
-    
-    try:
-        # 4. Contour plot (top 2 parameters)
-        fig4 = optuna.visualization.plot_contour(study, params=['lr_embed', 'temperature'])
-        fig4_path = f"optuna_results/contour_plot_{timestamp}.png"
-        fig4.write_image(fig4_path)
-        print(f"✅ Contour Plot: {fig4_path}")
-    except Exception as e:
-        print(f"⚠️  Contour Plot: {e}")
-    
-    try:
-        # 5. Slice plot
-        fig5 = optuna.visualization.plot_slice(study)
-        fig5_path = f"optuna_results/slice_plot_{timestamp}.png"
-        fig5.write_image(fig5_path)
-        print(f"✅ Slice Plot: {fig5_path}")
-    except Exception as e:
-        print(f"⚠️  Slice Plot: {e}")
-    
-    try:
-        # 6. Custom summary plot con matplotlib
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        
-        # Plot 1: F1 Score progression
-        completed_trials = [t for t in study.trials if t.value is not None]
-        trial_nums = [t.number for t in completed_trials]
-        f1_scores = [t.value for t in completed_trials]
-        
-        axes[0, 0].plot(trial_nums, f1_scores, 'o-', linewidth=2, markersize=6, color='#2E86DE')
-        axes[0, 0].axhline(y=study.best_value, color='r', linestyle='--', label=f'Best: {study.best_value:.4f}')
-        axes[0, 0].set_xlabel('Trial Number')
-        axes[0, 0].set_ylabel('Validation Macro F1')
-        axes[0, 0].set_title('Optimization History')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Plot 2: LR_embed vs F1
-        lr_embeds = [t.params['lr_embed'] for t in completed_trials]
-        axes[0, 1].scatter(lr_embeds, f1_scores, s=100, alpha=0.6, c=f1_scores, cmap='viridis')
-        axes[0, 1].set_xlabel('LR Embed (log scale)')
-        axes[0, 1].set_ylabel('Validation Macro F1')
-        axes[0, 1].set_title('LR Embed vs F1 Score')
-        axes[0, 1].set_xscale('log')
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Plot 3: Temperature vs F1
-        temps = [t.params['temperature'] for t in completed_trials]
-        axes[1, 0].scatter(temps, f1_scores, s=100, alpha=0.6, c=f1_scores, cmap='plasma')
-        axes[1, 0].set_xlabel('Temperature')
-        axes[1, 0].set_ylabel('Validation Macro F1')
-        axes[1, 0].set_title('Temperature vs F1 Score')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Plot 4: Gamma vs F1
-        gammas = [t.params['gamma'] for t in completed_trials]
-        axes[1, 1].scatter(gammas, f1_scores, s=100, alpha=0.6, c=f1_scores, cmap='coolwarm')
-        axes[1, 1].set_xlabel('Gamma')
-        axes[1, 1].set_ylabel('Validation Macro F1')
-        axes[1, 1].set_title('Gamma vs F1 Score')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.suptitle(f'Optuna Study Summary - {STUDY_NAME}', fontsize=16, fontweight='bold')
-        plt.tight_layout()
-        
-        summary_path = f"optuna_results/summary_{timestamp}.png"
-        plt.savefig(summary_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"✅ Summary Plot: {summary_path}")
-        
-    except Exception as e:
-        print(f"⚠️  Custom Summary Plot: {e}")
-    
-    print(f"\n{'='*70}")
-    print("✅ PROCESSO OPTUNA COMPLETATO!")
-    print(f"{'='*70}\n")
