@@ -301,7 +301,22 @@ def objective(trial):
     # Note: 'model' object is updated in-place by train_model wrapper usually, 
     # but load_best_model_at_end=True ensures it holds best weights at end.
     
-    metrics = calculate_metrics(val_dataset, model, batch_size=batch_size)
+    # Estrai la miglior validation loss dal trainer (salvata automaticamente grazie a load_best_model_at_end=True)
+    val_loss = trainer.state.best_metric if hasattr(trainer, 'state') and hasattr(trainer.state, 'best_metric') else None
+    
+    if val_loss is None:
+        # Fallback se best_metric non è disponibile (es. versioni vecchie di transformers)
+        print("⚠️ Warning: Could not extract best_metric from trainer state. Checking log history...")
+        if hasattr(trainer, 'state') and hasattr(trainer.state, 'log_history'):
+             for log in reversed(trainer.state.log_history):
+                 if 'eval_loss' in log:
+                     val_loss = log['eval_loss']
+                     break
+    
+    if val_loss is None:
+        val_loss = float('inf') # Should not happen if training succeeded
+        
+    print(f"   Best Validation Loss: {val_loss:.4f}")
     
     # Clean up artifacts to save space (Except maybe the best one? User might want to inspect)
     # For now we delete the checkpoints to avoid filling disk
@@ -310,7 +325,7 @@ def objective(trial):
     except:
         pass
     
-    return metrics['micro_f1']
+    return val_loss
 
 # Run Optimization with Pruning
 # MedianPruner stops unpromising trials after epoch 2 (n_startup_trials=5, n_warmup_steps=2)
@@ -321,7 +336,7 @@ pruner = optuna.pruners.MedianPruner(
 )
 
 study = optuna.create_study(
-    direction="maximize", 
+    direction="minimize", 
     study_name="gliner_mono_lr_scheduler_gamma_opt",
     pruner=pruner
 )
@@ -341,7 +356,7 @@ print("\n" + "="*50)
 print("OPTIMIZATION FINISHED")
 print("="*50)
 print(f"Best Trial: {study.best_trial.number}")
-print(f"Best Value (Micro F1): {study.best_value}")
+print(f"Best Value (Validation Loss): {study.best_value}")
 print(f"Best Params: {study.best_params}")
 
 # ==========================================
@@ -358,15 +373,15 @@ trial_values = [t.value for t in trials]
 
 ax1.scatter(trial_numbers, trial_values, alpha=0.6, s=50)
 ax1.set_xlabel('Trial', fontsize=12)
-ax1.set_ylabel('Micro F1', fontsize=12)
+ax1.set_ylabel('Validation Loss', fontsize=12)
 ax1.set_title('Optimization History (Mono-Encoder)', fontsize=14, fontweight='bold')
 ax1.grid(True, alpha=0.3)
 
-# Add best-so-far line
+# Add best-so-far line (minimization)
 best_so_far = []
-current_best = 0
+current_best = float('inf')
 for val in trial_values:
-    if val > current_best:
+    if val < current_best:
         current_best = val
     best_so_far.append(current_best)
 ax1.plot(trial_numbers, best_so_far, 'r-', linewidth=2, label='Best so far')
@@ -492,6 +507,6 @@ print(f"  • lr_scheduler_type: [linear, cosine, constant_with_warmup]")
 print(f"  • focal_loss_gamma: 2.0 → 5.0")
 print(f"\n📊 BEST RESULT:")
 print(f"  Trial #{study.best_trial.number}")
-print(f"  Micro F1: {study.best_value:.4f}")
+print(f"  Validation Loss: {study.best_value:.4f}")
 print(f"  Params: {study.best_params}")
 print("="*50)
