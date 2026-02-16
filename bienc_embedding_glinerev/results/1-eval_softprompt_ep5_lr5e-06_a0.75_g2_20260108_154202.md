@@ -20,6 +20,7 @@
 The detailed per-label metrics are available in the console logs.
 
 https://www.kaggle.com/code/alessandrobecci/finetuneglinerbiembedd-injectionintraingliner
+era il v1
 ### Performance Summary
 | Average Type | Precision | Recall | F1-Score |
 |:-------------|----------:|-------:|---------:|

@@ -454,21 +454,42 @@ def main():
         # --- CASO 1: Checkpoint Nuovo (Full Tuned: RNN + SpanRep + PromptEncoder) ---
         print("📥 Loading FULL tuned parameters (RNN, SpanRep, PromptEncoder)...")
         # Usiamo strict=False perché nel checkpoint ci sono solo i params allenabili (mancano embeddings congelati)
-        keys = checkpoint['trainable_params'].keys()
-        print(f"   Keys found: {len(keys)} (e.g. {list(keys)[:3]}...)")
+        trainable_keys = list(checkpoint['trainable_params'].keys())
+        print(f"   Total trainable params in checkpoint: {len(trainable_keys)}")
+        
+        # Mostra quali componenti sono presenti
+        components = {'rnn': [], 'span_rep': [], 'prompt_encoder': [], 'other': []}
+        for key in trainable_keys:
+            if 'rnn' in key.lower():
+                components['rnn'].append(key)
+            elif 'span_rep' in key.lower():
+                components['span_rep'].append(key)
+            elif 'prompt_encoder' in key.lower():
+                components['prompt_encoder'].append(key)
+            else:
+                components['other'].append(key)
+        
+        print(f"   Components found:")
+        for comp_name, comp_keys in components.items():
+            if comp_keys:
+                print(f"     - {comp_name}: {len(comp_keys)} params (e.g., {comp_keys[0]})")
         
         missing, unexpected = model.model.load_state_dict(checkpoint['trainable_params'], strict=False)
         print(f"✅ Weights loaded. Missing (expected frozen): {len(missing)}. Unexpected: {len(unexpected)}")
         
-    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+    elif isinstance(checkpoint, dict) and ('state_dict' in checkpoint or 'prompt_encoder_state_dict' in checkpoint):
         # --- CASO 2: Checkpoint Intermedio (Solo Prompt Encoder) ---
-        print("📥 Loading ONLY Prompt Encoder (Legacy/Partial Checkpoint)...")
-        wrapped_encoder.prompt_encoder.load_state_dict(checkpoint['state_dict'])
-        print("✅ Prompt encoder weights loaded.")
+        print("⚠️  Loading ONLY Prompt Encoder (Legacy/Partial Checkpoint)...")
+        print("    WARNING: RNN and SpanRep weights are NOT loaded - performance will be degraded!")
+        
+        state_dict_key = 'prompt_encoder_state_dict' if 'prompt_encoder_state_dict' in checkpoint else 'state_dict'
+        wrapped_encoder.prompt_encoder.load_state_dict(checkpoint[state_dict_key])
+        print(f"✅ Prompt encoder weights loaded from key '{state_dict_key}'.")
         
     else:
         # --- CASO 3: Checkpoint Vecchio (Solo state dict crudo) ---
-        print("📥 Loading Raw State Dict (Legacy)...")
+        print("⚠️  Loading Raw State Dict (Legacy)...")
+        print("    WARNING: This appears to be a raw state dict - RNN and SpanRep NOT loaded!")
         wrapped_encoder.prompt_encoder.load_state_dict(checkpoint)
         print("✅ Prompt encoder weights loaded.")
 

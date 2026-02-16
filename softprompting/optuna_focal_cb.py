@@ -3,7 +3,7 @@
 Training con OPTUNA - Ottimizzazione Iperparametri
 - 20 trial
 - Parametri: LR_EMBED, LR_PROJ, TEMPERATURE, GAMMA, BETA
-- Metrica: Validation Macro F1
+- Metrica: Validation Loss (minimize)
 """
 
 import os

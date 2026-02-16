@@ -602,12 +602,32 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 save_dir = Path("savings")
 save_dir.mkdir(parents=True, exist_ok=True)
 
-print(f"\n💾 Salvataggio del Prompt Encoder con metadati in {save_dir}...")
+print(f"\n💾 Salvataggio del modello completo con metadati in {save_dir}...")
 
 # Prepara checkpoint con tutti i metadati inclusi
 # Prepara checkpoint con TUTTI i parametri allenati (non solo prompt encoder)
 trainable_params = {n: p.cpu() for n, p in model.model.named_parameters() if p.requires_grad}
 print(f"📦 Collected {len(trainable_params)} trainable parameters to save.")
+
+# Mostra breakdown dei componenti salvati
+components = {'rnn': [], 'span_rep': [], 'prompt_encoder': [], 'other': []}
+for name in trainable_params.keys():
+    if 'rnn' in name.lower():
+        components['rnn'].append(name)
+    elif 'span_rep' in name.lower():
+        components['span_rep'].append(name)
+    elif 'prompt_encoder' in name.lower():
+        components['prompt_encoder'].append(name)
+    else:
+        components['other'].append(name)
+
+print(f"\n📋 Components being saved:")
+for comp_name, comp_params in components.items():
+    if comp_params:
+        print(f"  ✅ {comp_name}: {len(comp_params)} params (e.g., {comp_params[0]})")
+    else:
+        print(f"  ❌ {comp_name}: 0 params (NOT trained)")
+
 
 checkpoint = {
     # Dizionario completo dei parametri allenati (RNN, SpanRep, PromptEncoder, etc.)
@@ -654,4 +674,5 @@ print("✅ Salvataggio completato.")
 print(f"\n✅ Script terminato.")
 print(f"📁 Directory Output: {save_dir}")
 print(f"📄 Checkpoint salvato in: {checkpoint_filename}")
-print(f"   Contenuto: state_dict, architecture, hyperparameters, dataset_info, backbone, timestamp, test_metrics, baseline_f1")
+print(f"   Contenuto: trainable_params (RNN+SpanRep+PromptEncoder), architecture, hyperparameters, dataset_info, backbone, timestamp, test_metrics, baseline_f1")
+print(f"\n⚠️  IMPORTANTE: Per riprodurre i risultati, usa questo checkpoint che contiene TUTTI i parametri allenati!")
