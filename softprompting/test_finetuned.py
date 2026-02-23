@@ -21,8 +21,8 @@ import re
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-PATH_DATASET = "../dataset"
-#PATH_DATASET = "../dataset_bc5cdr"
+#PATH_DATASET = "../dataset"
+PATH_DATASET = "../dataset_bc5cdr"
 
 TEST_PATH = PATH_DATASET + "/test_dataset_tknlvl_bi.json"
 TEST_SPAN_PATH = PATH_DATASET + "/test_dataset_span_bi.json"
@@ -345,7 +345,16 @@ if __name__ == "__main__":
     span_fn = defaultdict(int)
     span_support = defaultdict(int)
     n_span_skipped = 0
-    
+
+    # Label IDs rilevanti (esclude 'O') per progress checkpoint
+    all_label_ids_pre = list(range(num_labels))
+    o_id_pre = label2id.get("O", -1)
+    relevant_label_ids = [i for i in all_label_ids_pre if i != o_id_pre]
+
+    total_records = len(test_records)
+    checkpoint_interval = max(1, total_records // 5)
+    print(f"\n📊 Mostro progress ogni {checkpoint_interval} record (~20%)")
+
     with torch.no_grad():
         label_matrix = compute_label_matrix_from_soft_table(soft_table, proj).to(DEVICE)
         
@@ -411,7 +420,22 @@ if __name__ == "__main__":
                         span_fn[span[2]] += 1
             else:
                 n_span_skipped += 1
-    
+
+            # Progress checkpoint ogni ~20% (come test_mono.py)
+            loop_idx = idx + 1
+            if loop_idx % checkpoint_interval == 0 or loop_idx == total_records:
+                if len(y_true_all) > 0:
+                    progress = (loop_idx / total_records) * 100
+                    _mf1 = precision_recall_fscore_support(
+                        y_true_all, y_pred_all, labels=relevant_label_ids,
+                        average="macro", zero_division=0
+                    )[2]
+                    _uf1 = precision_recall_fscore_support(
+                        y_true_all, y_pred_all, labels=relevant_label_ids,
+                        average="micro", zero_division=0
+                    )[2]
+                    print(f"\n [{progress:5.1f}%] Macro F1 (No-O): {_mf1:.4f} | Micro F1 (No-O): {_uf1:.4f} | Tokens: {len(y_true_all):,}")
+
     # 4. Report
     if n_span_skipped > 0:
         print(f"⚠️  {n_span_skipped} esempi saltati nella valutazione span (indice fuori range).")

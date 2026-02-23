@@ -26,8 +26,8 @@ import datetime
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-#DATASET = '../dataset_bc5cdr/'
-DATASET = '../dataset/'
+DATASET = '../dataset_bc5cdr/'
+#DATASET = '../dataset/'
 
 
 TEST_PATH = DATASET + 'test_dataset_tknlvl_mono.json'

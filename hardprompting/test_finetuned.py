@@ -25,10 +25,11 @@ from datetime import datetime
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TEST_PATH = "../dataset/test_dataset_tknlvl_bi.json"
-TEST_SPAN_PATH = "../dataset/test_dataset_span_bi.json"
-LABEL2DESC_PATH = "../dataset/label2desc.json"
-LABEL2ID_PATH = "../dataset/label2id.json"
+path = "../dataset_bc5cdr"
+TEST_PATH = path + "/test_dataset_tknlvl_bi.json"
+TEST_SPAN_PATH = path + "/test_dataset_span_bi.json"
+LABEL2DESC_PATH = path + "/label2desc.json"
+LABEL2ID_PATH = path + "/label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
 # Trova ultimo checkpoint salvato
@@ -235,13 +236,31 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
     y_true_all = []
     y_pred_all = []
 
-    # Span-based accumulatori
+    # Identifica classe 'O' e costruisce subset di label rilevanti (come test_mono.py)
     background_id = label2id.get("O", 5)
+    ignore_index = -1
+    for _idx, _name in enumerate(label_names):
+        if _name == 'O':
+            ignore_index = _idx
+            break
+    all_label_ids = list(range(len(label_names)))
+    if ignore_index != -1:
+        relevant_label_ids  = [i for i in all_label_ids if i != ignore_index]
+        relevant_label_names = [label_names[i] for i in relevant_label_ids]
+        print(f"ℹ️  Esclusione classe 'O' (ID: {ignore_index}) dalle metriche token-level.")
+    else:
+        relevant_label_ids  = all_label_ids
+        relevant_label_names = label_names
+
+    # Span-based accumulatori
     span_tp = defaultdict(int)
     span_fp = defaultdict(int)
     span_fn = defaultdict(int)
     span_support = defaultdict(int)
     n_span_skipped = 0
+
+    total_records = len(test_records)
+    checkpoint_interval = max(1, total_records // 5)
     
     with torch.no_grad():
         label_matrix = compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj).to(DEVICE)
@@ -306,23 +325,36 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
                 else:
                     n_span_skipped += 1
 
+            # Progress checkpoint ogni ~20% (come test_mono.py)
+            loop_idx = idx + 1
+            if loop_idx % checkpoint_interval == 0 or loop_idx == total_records:
+                if len(y_true_all) > 0:
+                    progress = (loop_idx / total_records) * 100
+                    _mf1 = precision_recall_fscore_support(
+                        y_true_all, y_pred_all, labels=relevant_label_ids,
+                        average="macro", zero_division=0
+                    )[2]
+                    _uf1 = precision_recall_fscore_support(
+                        y_true_all, y_pred_all, labels=relevant_label_ids,
+                        average="micro", zero_division=0
+                    )[2]
+                    print(f"\n [{progress:5.1f}%] Macro F1: {_mf1:.4f} | Micro F1: {_uf1:.4f} | Tokens: {len(y_true_all):,}")
+
     if span_records is not None and n_span_skipped > 0:
         print(f"⚠️  {n_span_skipped} esempi saltati nella valutazione span (indice fuori range).")
 
-    # Calcola metriche token-level
-    all_label_ids = list(range(len(label_names)))
-    
+    # Calcola metriche token-level (esclusa 'O' come in test_mono.py)
     prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
-        y_true_all, y_pred_all, average="macro", zero_division=0, labels=all_label_ids
+        y_true_all, y_pred_all, average="macro", zero_division=0, labels=relevant_label_ids
     )
     prec_micro, rec_micro, f1_micro, _ = precision_recall_fscore_support(
-        y_true_all, y_pred_all, average="micro", zero_division=0, labels=all_label_ids
+        y_true_all, y_pred_all, average="micro", zero_division=0, labels=relevant_label_ids
     )
     
     class_report = classification_report(
         y_true_all, y_pred_all, 
-        target_names=label_names,
-        labels=all_label_ids,
+        target_names=relevant_label_names,
+        labels=relevant_label_ids,
         zero_division=0
     )
     
@@ -331,7 +363,7 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
     print(f"📊 RISULTATI - {model_name}")
     print(f"{'='*60}")
     print(f"Totale token valutati: {len(y_true_all)}")
-    print(f"\n🎯 METRICHE TOKEN-LEVEL AGGREGATE:")
+    print(f"\n🎯 METRICHE TOKEN-LEVEL AGGREGATE (No 'O' class):")
     print(f"  Macro F1:  {f1_macro:.4f}")
     print(f"  Micro F1:  {f1_micro:.4f}")
     print(f"  Precision (macro): {prec_macro:.4f}")
@@ -417,7 +449,7 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         f.write(f"## Risultati Test\n\n")
         f.write(f"**Token valutati:** {len(y_true_all)}\n\n")
         
-        f.write(f"### Metriche Token-Level Aggregate\n\n")
+        f.write(f"### Metriche Token-Level Aggregate (No 'O' class)\n\n")
         f.write(f"| Metrica | Valore |\n")
         f.write(f"|---------|--------|\n")
         f.write(f"| Macro F1 | {f1_macro:.4f} |\n")
