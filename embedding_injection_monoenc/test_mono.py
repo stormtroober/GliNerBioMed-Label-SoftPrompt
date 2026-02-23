@@ -3,6 +3,7 @@
 TEST Mono-Encoder MLP Prompt Encoder (NO 'O' CLASS IN METRICS).
 Loads the best saved model and evaluates it on the token-level test dataset.
 Excludes 'O' class from F1 calculations.
+Includes span-based evaluation.
 """
 
 import json
@@ -12,7 +13,8 @@ from gliner import GLiNER
 from torch import nn
 from transformers import AutoTokenizer
 from sklearn.metrics import precision_recall_fscore_support, classification_report, confusion_matrix
-from collections import Counter
+from collections import Counter, defaultdict
+import numpy as np
 import os
 from tqdm import tqdm
 import subprocess
@@ -24,17 +26,18 @@ import datetime
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-DATASET = '../dataset_bc5cdr/'
-#DATASET = '../dataset/'
+#DATASET = '../dataset_bc5cdr/'
+DATASET = '../dataset/'
 
 
 TEST_PATH = DATASET + 'test_dataset_tknlvl_mono.json'
+TEST_SPAN_PATH = DATASET + 'test_dataset_span_mono.json'
 LABEL2DESC_PATH = DATASET + 'label2desc.json'
 LABEL2ID_PATH = DATASET + 'label2id.json'
 MODEL_NAME = "urchade/gliner_small-v2.1"
 SAVINGS_DIR = "savings"
 TEST_RESULTS_DIR = "test_results"
-SHELL_SCRIPT_NAME = "../embedding_injection/orderTests.sh" # Assumi che siamo in gliner2
+SHELL_SCRIPT_NAME = "../embedding_injection/orderTests.sh"
 
 # ==========================================================
 # 1️⃣ CLASSE MLP (Identica per caricare pesi)
@@ -127,7 +130,23 @@ def select_checkpoint_interactive():
     ckpts.sort(key=lambda x: os.path.getmtime(os.path.join(SAVINGS_DIR, x)), reverse=True)
     
     print("\n📦 CHECKPOINT DISPONIBILI:")
-    for i, c in enumerate(ckpts[:10]): print(f"{i+1}. {c}")
+    for i, c in enumerate(ckpts[:10]):
+        ckpt_path = os.path.join(SAVINGS_DIR, c)
+        try:
+            # Carica solo la configurazione su CPU
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            conf = checkpoint.get('config', {})
+            input_dir = conf.get('input_dir', 'sconosciuto')
+            # Pulisce un po' il path se è lungo (es. Kaggle)
+            if input_dir.startswith('/kaggle/input/'):
+                input_dir = input_dir.replace('/kaggle/input/', '')
+            elif input_dir == '../':
+                # dataset di default per i run locali
+                input_dir = 'dataset locale'
+            print(f"{i+1}. {c} | Dataset: {input_dir}")
+        except Exception as e:
+            print(f"{i+1}. {c} | Dataset: Errore lettura")
+            
     try:
         sel = int(input("\n👉 Scegli numero [1]: ") or 1) - 1
         return os.path.join(SAVINGS_DIR, ckpts[sel])
@@ -142,7 +161,7 @@ print(f"Loading: {ckpt_path}")
 checkpoint = torch.load(ckpt_path, map_location=DEVICE)
 train_config = checkpoint.get('config', {})
 
-PROMPT_LEN = train_config.get('prompt_len', 16) # Default from train_mono if missing
+PROMPT_LEN = train_config.get('prompt_len', 16)
 POOLING_MODE = train_config.get('pooling_mode', 'adaptive_avg')
 MAX_TEXT_LEN = train_config.get('max_text_len', 384)
 
@@ -157,7 +176,6 @@ model = model_wrapper.model
 tokenizer = model_wrapper.data_processor.transformer_tokenizer
 
 backbone = model.token_rep_layer.bert_layer.model
-# Freeze backbone
 for p in backbone.parameters(): p.requires_grad = False
 backbone.to(DEVICE).eval()
 
@@ -165,7 +183,6 @@ original_word_embeddings = backbone.embeddings.word_embeddings
 vocab_size = original_word_embeddings.num_embeddings
 embed_dim = original_word_embeddings.embedding_dim
 
-# Load Prompt Encoder
 prompt_encoder = MLPPromptEncoder(
     original_word_embeddings, 
     vocab_size, 
@@ -192,16 +209,118 @@ desc_inputs = tokenizer(desc_texts, return_tensors="pt", padding=True, truncatio
 desc_input_ids = desc_inputs["input_ids"].to(DEVICE)
 desc_attn_mask = desc_inputs["attention_mask"].to(DEVICE)
 
-# Pre-calculate Prompt Embeddings (Vector per Label)
 with torch.no_grad():
-    soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask) # (NumLabels, PLen, D)
+    soft_prompts = prompt_encoder(desc_input_ids, attention_mask=desc_attn_mask)
     soft_prompts_flat = soft_prompts.view(-1, embed_dim)
     prompts_len_total = soft_prompts_flat.shape[0]
 
 # ==========================================================
-# 5️⃣ TEST LOOP
+# 5️⃣ SPAN EVALUATION UTILITIES
+# ==========================================================
+def get_word_boundary_flags(subword_tokens):
+    """
+    Restituisce True per il primo subword di ogni parola word-level,
+    False per token speciali e continuazioni.
+    """
+    flags = []
+    for tok in subword_tokens:
+        if tok in ("[CLS]", "[SEP]", "<s>", "</s>", "<pad>"):
+            flags.append(False)
+        elif tok.startswith("▁") or tok.startswith("Ġ"):
+            flags.append(True)
+        elif not flags:
+            flags.append(True)
+        else:
+            flags.append(False)
+    return flags
+
+
+def subword_preds_to_word_preds(subword_tokens, subword_preds, subword_labels):
+    """
+    Mappa predizioni subword → word-level usando strategia 'first-subword'.
+    """
+    flags = get_word_boundary_flags(subword_tokens)
+    word_preds, word_trues = [], []
+    for flag, pred, true in zip(flags, subword_preds, subword_labels):
+        if flag and true != -100:
+            word_preds.append(pred)
+            word_trues.append(true)
+    return word_preds, word_trues
+
+
+def extract_spans_from_word_seq(word_labels, background_label_id):
+    """
+    Estrae span contigui dello stesso label (diverso da background)
+    come set di tuple (start, end, label_id). Indici 0-based inclusivi.
+    """
+    spans = set()
+    n = len(word_labels)
+    i = 0
+    while i < n:
+        lbl = word_labels[i]
+        if lbl != background_label_id:
+            j = i
+            while j < n and word_labels[j] == lbl:
+                j += 1
+            spans.add((i, j - 1, lbl))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def compute_span_metrics(tp_dict, fp_dict, fn_dict, support_dict, id2label, background_label_id):
+    """Calcola metriche span-based per label e aggregate (macro/micro)."""
+    all_ids = sorted(set(list(tp_dict.keys()) + list(fp_dict.keys()) + list(fn_dict.keys())))
+    all_ids = [lid for lid in all_ids if lid != background_label_id]
+
+    p_list, r_list, f1_list = [], [], []
+    report_lines = []
+    header = f"{'Label':<25} {'P':>8} {'R':>8} {'F1':>8} {'Support':>10}"
+    report_lines.append(header)
+    report_lines.append("-" * 65)
+
+    for lid in all_ids:
+        tp = tp_dict[lid]; fp = fp_dict[lid]; fn = fn_dict[lid]; sup = support_dict[lid]
+        p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        name = id2label.get(lid, str(lid))
+        p_list.append(p); r_list.append(r); f1_list.append(f1)
+        report_lines.append(f"{name:<25} {p:>8.4f} {r:>8.4f} {f1:>8.4f} {sup:>10}")
+
+    macro_p  = float(np.mean(p_list))  if p_list  else 0.0
+    macro_r  = float(np.mean(r_list))  if r_list  else 0.0
+    macro_f1 = float(np.mean(f1_list)) if f1_list else 0.0
+
+    total_tp = sum(tp_dict[l] for l in all_ids)
+    total_fp = sum(fp_dict[l] for l in all_ids)
+    total_fn = sum(fn_dict[l] for l in all_ids)
+    micro_p  = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_r  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
+
+    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_lines
+
+# ==========================================================
+# 6️⃣ CARICAMENTO TEST SET
 # ==========================================================
 with open(TEST_PATH) as f: test_data = json.load(f)
+print(f"\n📚 Caricati {len(test_data)} record token-level")
+
+span_data = None
+if os.path.exists(TEST_SPAN_PATH):
+    with open(TEST_SPAN_PATH) as f: span_data = json.load(f)
+    print(f"📚 Caricati {len(span_data)} record span-level")
+    if len(test_data) != len(span_data):
+        print(f"⚠️  Numero esempi diverso ({len(test_data)} vs {len(span_data)}). "
+              "La valutazione span potrebbe essere inaccurata.")
+else:
+    print(f"⚠️  File span non trovato in {TEST_SPAN_PATH}. Valutazione span saltata.")
+
+# ==========================================================
+# 7️⃣ TEST LOOP
+# ==========================================================
 print(f"\n🔍 Valutazione su {len(test_data)} record...")
 
 y_true = []
@@ -218,14 +337,21 @@ all_label_ids = list(range(len(label_names)))
 if ignore_index != -1:
     relevant_label_ids = [i for i in all_label_ids if i != ignore_index]
     relevant_label_names = [label_names[i] for i in relevant_label_ids]
-    print(f"ℹ️  Esclusione classe 'O' (ID: {ignore_index}) dalle metriche.")
+    print(f"ℹ️  Esclusione classe 'O' (ID: {ignore_index}) dalle metriche token-level.")
 else:
     relevant_label_ids = all_label_ids
     relevant_label_names = label_names
 
+# Span accumulatori
+background_id = label2id.get("O", ignore_index if ignore_index != -1 else 5)
+span_tp = defaultdict(int)
+span_fp = defaultdict(int)
+span_fn = defaultdict(int)
+span_support = defaultdict(int)
+n_span_skipped = 0
+
 total_records = len(test_data)
 checkpoint_interval = max(1, total_records // 5)
-
 print(f"\n📊 Mostro metriche ogni {checkpoint_interval} record (~20%)\n")
 
 print(f"Testing...")
@@ -234,13 +360,9 @@ with torch.no_grad():
         tokens = rec["tokens"]
         labels = rec["labels"]
         
-        # Convert tokens to IDs first
         inp_ids = tokenizer.convert_tokens_to_ids(tokens)
         
-        # CLEANUP SPECIAL TOKENS (CRITICAL: Must match train_mono.py preprocessing!)
-        # The dataset contains [CLS] ... [SEP] because generated with add_special_tokens=True.
-        # The training loop constructs manually: [CLS] [PROMPT] [SEP] [TEXT] [SEP].
-        # We must remove special tokens from loaded text to avoid duplicates.
+        # Rimuovi token speciali (CLS/SEP) già presenti nel dataset
         if len(inp_ids) > 0 and inp_ids[0] == tokenizer.cls_token_id:
             inp_ids = inp_ids[1:]
             labels = labels[1:]
@@ -249,25 +371,22 @@ with torch.no_grad():
             inp_ids = inp_ids[:-1]
             labels = labels[:-1]
         
-        # Truncate to Max Text Len (AFTER removing special tokens)
+        # Tronca al max text len
         if len(inp_ids) > MAX_TEXT_LEN:
             inp_ids = inp_ids[:MAX_TEXT_LEN]
             labels = labels[:MAX_TEXT_LEN]
         
         if len(inp_ids) == 0:
+            n_span_skipped += 1
             continue
             
-        input_tensor = torch.tensor([inp_ids], device=DEVICE) # (1, SeqLen)
-        attn_mask = torch.ones_like(input_tensor) # (1, SeqLen)
+        input_tensor = torch.tensor([inp_ids], device=DEVICE)
+        attn_mask = torch.ones_like(input_tensor)
         
-        # --- FORWARD PASS (Same as Train) ---
-        # 1. Expand Prompts for Batch (Batch=1)
-        batch_soft_prompts = soft_prompts_flat.unsqueeze(0) # (1, TotalPLen, D)
+        # --- FORWARD PASS ---
+        batch_soft_prompts = soft_prompts_flat.unsqueeze(0)
+        text_embeds = backbone.embeddings(input_tensor)
         
-        # 2. Text Embeddings
-        text_embeds = backbone.embeddings(input_tensor) # (1, TextLen, D)
-        
-        # 3. Conccat: [CLS] Prompts [SEP] Text [SEP]
         cls_token = torch.tensor([[tokenizer.cls_token_id]], device=DEVICE)
         sep_token = torch.tensor([[tokenizer.sep_token_id]], device=DEVICE)
         cls_embed = backbone.embeddings(cls_token)
@@ -275,42 +394,76 @@ with torch.no_grad():
         
         inputs_embeds = torch.cat([cls_embed, batch_soft_prompts, sep_embed, text_embeds, sep_embed], dim=1)
         
-        # Mask
         B = 1
         prompt_mask = torch.ones((B, prompts_len_total), device=DEVICE)
         cls_mask = torch.ones((B, 1), device=DEVICE)
         sep_mask = torch.ones((B, 1), device=DEVICE)
         full_mask = torch.cat([cls_mask, prompt_mask, sep_mask, attn_mask, sep_mask], dim=1)
         
-        # Encoder
         outputs = backbone.encoder(inputs_embeds, attention_mask=full_mask.unsqueeze(1).unsqueeze(2))
         sequence_output = outputs.last_hidden_state
         
-        # Extract Text Reps
+        # Estrai rappresentazioni testo
         text_start = 1 + prompts_len_total + 1
         text_end = text_start + len(inp_ids)
-        text_reps = sequence_output[:, text_start:text_end, :] # (1, TextLen, D)
+        text_reps = sequence_output[:, text_start:text_end, :]
         
-        # Extract Prompt Reps
+        # Estrai rappresentazioni prompt
         prompt_reps_seq = sequence_output[:, 1:1+prompts_len_total, :]
         prompt_reps_reshaped = prompt_reps_seq.view(1, num_labels, PROMPT_LEN, embed_dim)
-        prompt_vectors = prompt_reps_reshaped.mean(dim=2) # (1, NumLabels, D)
+        prompt_vectors = prompt_reps_reshaped.mean(dim=2)
         
-        # Similarity
         H_text = F.normalize(text_reps, dim=-1)
         H_prompts = F.normalize(prompt_vectors, dim=-1)
+        logits = torch.bmm(H_text, H_prompts.transpose(1, 2))
         
-        # Logits
-        logits = torch.bmm(H_text, H_prompts.transpose(1, 2)) # (1, TextLen, NumLabels)
+        preds = logits.argmax(-1).squeeze(0).cpu().tolist()
         
-        preds = logits.argmax(-1).squeeze(0).cpu().tolist() # (TextLen)
-        
-        # Store
+        # Token-level raccolta
         for p, t in zip(preds, labels):
             if t != -100:
                 y_true.append(t)
                 y_pred.append(p)
-        
+
+        # ---- Span-based evaluation ----
+        # Nota: tokens qui sono già stati privati di CLS/SEP iniziale,
+        # quindi usiamo i tokens troncati corrispondenti
+        rec_tokens_trimmed = tokens
+        # Rimuovi CLS/SEP anche dai tokens stringa per il boundary detection
+        if rec_tokens_trimmed and rec_tokens_trimmed[0] in ("[CLS]", "<s>"):
+            rec_tokens_trimmed = rec_tokens_trimmed[1:]
+        if rec_tokens_trimmed and rec_tokens_trimmed[-1] in ("[SEP]", "</s>"):
+            rec_tokens_trimmed = rec_tokens_trimmed[:-1]
+        rec_tokens_trimmed = rec_tokens_trimmed[:MAX_TEXT_LEN]
+
+        if span_data is not None:
+            rec_idx = idx - 1  # idx parte da 1 nel loop
+            if rec_idx < len(span_data):
+                span_rec = span_data[rec_idx]
+                gt_ner = span_rec.get("ner", [])
+
+                gt_spans = set()
+                for s, e, lbl_str in gt_ner:
+                    lbl_int = int(lbl_str)
+                    if lbl_int != background_id:
+                        gt_spans.add((s, e, lbl_int))
+                        span_support[lbl_int] += 1
+
+                word_preds, _ = subword_preds_to_word_preds(rec_tokens_trimmed, preds, labels)
+                pred_spans = extract_spans_from_word_seq(word_preds, background_id)
+
+                for span in pred_spans:
+                    if span in gt_spans:
+                        span_tp[span[2]] += 1
+                    else:
+                        span_fp[span[2]] += 1
+                for span in gt_spans:
+                    if span not in pred_spans:
+                        span_fn[span[2]] += 1
+            else:
+                n_span_skipped += 1
+
+        # Progress checkpoint
         if idx % checkpoint_interval == 0 or idx == total_records:
             if len(y_true) > 0:
                 progress = (idx / total_records) * 100
@@ -322,8 +475,11 @@ with torch.no_grad():
                 )[2]
                 print(f"\n [{progress:5.1f}%] Macro F1: {current_macro_f1:.4f} | Micro F1: {current_micro_f1:.4f} | Tokens: {len(y_true):,}")
 
+if n_span_skipped > 0:
+    print(f"⚠️  {n_span_skipped} record saltati nella valutazione span.")
+
 # ==========================================================
-# 6️⃣ METRICS & SAVING
+# 8️⃣ METRICS & SAVING
 # ==========================================================
 macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
     y_true, y_pred, labels=relevant_label_ids, average="macro", zero_division=0
@@ -332,7 +488,7 @@ micro_p, micro_r, micro_f1, _ = precision_recall_fscore_support(
     y_true, y_pred, labels=relevant_label_ids, average="micro", zero_division=0
 )
 
-print(f"\n🏆 GLOBAL METRICS (No O Class):")
+print(f"\n🏆 GLOBAL TOKEN-LEVEL METRICS (No O Class):")
 print(f"   • MACRO: F1={macro_f1:.4f}")
 print(f"   • MICRO: F1={micro_f1:.4f}")
 
@@ -341,33 +497,58 @@ class_report = classification_report(
 )
 print(class_report)
 
+# Span metrics
+span_macro_p = span_macro_r = span_macro_f1 = 0.0
+span_micro_p = span_micro_r = span_micro_f1 = 0.0
+span_report_lines = []
+
+if span_data is not None:
+    span_macro_p, span_macro_r, span_macro_f1, \
+    span_micro_p, span_micro_r, span_micro_f1, \
+    span_report_lines = compute_span_metrics(
+        span_tp, span_fp, span_fn, span_support, id2label, background_id
+    )
+    print(f"\n{'='*60}")
+    print(f"🎯 METRICHE SPAN-BASED (Exact Match, escluso 'O')")
+    print(f"{'='*60}")
+    print(f"  Macro P: {span_macro_p:.4f} | Macro R: {span_macro_r:.4f} | Macro F1: {span_macro_f1:.4f}")
+    print(f"  Micro P: {span_micro_p:.4f} | Micro R: {span_micro_r:.4f} | Micro F1: {span_micro_f1:.4f}")
+    print(f"\n📋 REPORT SPAN PER CLASSE:")
+    for line in span_report_lines:
+        print(line)
+
 # Export
 os.makedirs(TEST_RESULTS_DIR, exist_ok=True)
 timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 filename = f"{TEST_RESULTS_DIR}/eval_mono_{timestamp}.md"
 
-# Format Output for Shell Script Parser (**Macro F1** etc)
 with open(filename, "w", encoding="utf-8") as f:
-    
-    # Extract config
     config = checkpoint.get('config', {})
     
-    # Format Config Table
     config_table = "| Parameter | Value |\n|---|---|\n"
-    sorted_keys = sorted(config.keys())
-    for k in sorted_keys:
-        val = config[k]
-        config_table += f"| **{k}** | `{val}` |\n"
+    for k in sorted(config.keys()):
+        config_table += f"| **{k}** | `{config[k]}` |\n"
 
     f.write(f"## 🔧 Training Configuration\n")
     f.write(f"{config_table}\n\n")
 
-    f.write(f" ## Metriche Chiave\n")
+    f.write(f"## Metriche Chiave\n")
     f.write(f"| Metric | Value |\n|---|---|\n")
     f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
     f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
     
-    f.write(f"## Report\n```\n{class_report}\n```\n")
+    f.write(f"## Report Token-Level\n```\n{class_report}\n```\n")
+
+    if span_data is not None:
+        f.write(f"\n## Metriche Span-Based (Exact Match, escluso 'O')\n")
+        f.write(f"| Metric | Precision | Recall | F1 |\n")
+        f.write(f"|--------|-----------|--------|---------|\n")
+        f.write(f"| **Macro** | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")
+        f.write(f"| **Micro** | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |\n")
+        f.write(f"\n### Report Span per Classe\n```\n")
+        for line in span_report_lines:
+            f.write(line + "\n")
+        f.write("```\n")
 
 print(f"💾 Saved to {filename}")
 
@@ -380,7 +561,6 @@ if os.path.exists(SHELL_SCRIPT_NAME):
     except Exception as e:
         print(f"❌ Error running script: {e}")
 else:
-    # Try finding it in current dir or parent
     if os.path.exists("orderTests.sh"):
          subprocess.run(["bash", "orderTests.sh"], check=True)
     elif os.path.exists("../embedding_injection/orderTests.sh"):

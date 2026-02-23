@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
+from matplotlib.ticker import MaxNLocator
 
 
 def load_optuna_json(json_path: str) -> Dict[str, Any]:
@@ -32,10 +33,19 @@ def load_optuna_json(json_path: str) -> Dict[str, Any]:
     return data
 
 
+def get_trials(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Restituisce la lista di trial dal JSON, supportando sia 'all_trials' che 'trials' come chiave."""
+    if 'all_trials' in data:
+        return data['all_trials']
+    elif 'trials' in data:
+        return data['trials']
+    return []
+
+
 def extract_completed_trials(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Estrae solo i trial completati (non pruned)."""
     return [
-        trial for trial in data['all_trials']
+        trial for trial in get_trials(data)
         if trial['state'] == 'TrialState.COMPLETE' and trial['value'] is not None
     ]
 
@@ -103,6 +113,7 @@ def plot_optimization_history(ax, trials: List[Dict[str, Any]], best_value: floa
     ax.legend(loc='best', fontsize=16)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.tick_params(axis='both', which='major', labelsize=16)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
 
 def plot_hyperparameter_importance(ax, importance: Dict[str, float]):
@@ -112,10 +123,21 @@ def plot_hyperparameter_importance(ax, importance: Dict[str, float]):
     params = [p[0] for p in sorted_params]
     values = [p[1] for p in sorted_params]
     
+    # Determina dimensione font in base alla lunghezza massima dei nomi
+    max_param_length = max(len(p) for p in params) if params else 0
+    if max_param_length > 25:
+        param_fontsize = 10
+    elif max_param_length > 20:
+        param_fontsize = 11
+    elif max_param_length > 15:
+        param_fontsize = 13
+    else:
+        param_fontsize = 16
+    
     y_pos = np.arange(len(params))
     bars = ax.barh(y_pos, values, alpha=0.8, color='steelblue', edgecolor='navy', linewidth=1.5, height=0.7)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(params, fontsize=16)  # Nomi parametri grandi
+    ax.set_yticklabels(params, fontsize=param_fontsize)
     ax.set_xlabel('Importance', fontsize=18, fontweight='bold')
     ax.set_title('Hyperparameter Importance', fontsize=20, fontweight='bold', pad=20)
     ax.grid(True, alpha=0.3, axis='x', linestyle='--')
@@ -135,6 +157,20 @@ def plot_param_vs_objective(ax, trials: List[Dict[str, Any]], param_name: str,
     param_values = []
     objective_values = []
     is_boolean = False
+    is_categorical = False
+    categorical_mapping = {}
+    
+    # Prima passata: determina il tipo di parametro
+    sample_val = trials[0]['params'][param_name]
+    if isinstance(sample_val, str):
+        # Controlla se è booleano o categorico
+        unique_vals = set(trial['params'][param_name] for trial in trials)
+        if all(v.lower() in ['true', 'false'] for v in unique_vals):
+            is_boolean = True
+        else:
+            is_categorical = True
+            # Crea mapping per parametri categorici
+            categorical_mapping = {val: idx for idx, val in enumerate(sorted(unique_vals))}
     
     for trial in trials:
         val = trial['params'][param_name]
@@ -150,6 +186,10 @@ def plot_param_vs_objective(ax, trials: List[Dict[str, Any]], param_name: str,
                 is_boolean = True
                 param_values.append(1.0 if val.lower() == 'true' else 0.0)
                 objective_values.append(trial['value'])
+            elif is_categorical:
+                # Usa il mapping categorico
+                param_values.append(categorical_mapping[val])
+                objective_values.append(trial['value'])
             else:
                 try:
                     val = float(val)
@@ -162,8 +202,46 @@ def plot_param_vs_objective(ax, trials: List[Dict[str, Any]], param_name: str,
             objective_values.append(trial['value'])
     
     if not param_values:
-        ax.text(0.5, 0.5, f'No numeric data for {param_name}', 
-                ha='center', va='center', transform=ax.transAxes)
+        ax.text(0.5, 0.5, f'No data for {param_name}', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=16)
+        return
+    
+    # Gestisci parametri categorici con box plot
+    if is_categorical:
+        # Raggruppa i valori per categoria
+        category_data = {cat: [] for cat in categorical_mapping.keys()}
+        for trial in trials:
+            cat = trial['params'][param_name]
+            category_data[cat].append(trial['value'])
+        
+        # Crea box plot
+        categories = sorted(categorical_mapping.keys())
+        data_to_plot = [category_data[cat] for cat in categories]
+        
+        bp = ax.boxplot(data_to_plot, tick_labels=categories, patch_artist=True,
+                       widths=0.6, showmeans=True,
+                       boxprops=dict(facecolor='lightblue', alpha=0.7, linewidth=2),
+                       medianprops=dict(color='red', linewidth=3),
+                       meanprops=dict(marker='D', markerfacecolor='green', markersize=10),
+                       whiskerprops=dict(linewidth=2),
+                       capprops=dict(linewidth=2))
+        
+        # Aggiungi scatter plot sovrapposto
+        for i, cat in enumerate(categories):
+            y_vals = category_data[cat]
+            x_vals = [i + 1] * len(y_vals)
+            # Aggiungi jitter per visualizzare meglio i punti
+            x_jitter = np.random.normal(0, 0.04, len(x_vals))
+            ax.scatter(np.array(x_vals) + x_jitter, y_vals, 
+                      alpha=0.6, s=100, c='navy', edgecolors='black', linewidth=1, zorder=3)
+        
+        ax.set_xlabel(param_name.replace('_', ' ').title(), fontsize=18, fontweight='bold')
+        ax.set_xticklabels(categories, fontsize=14, rotation=15, ha='right')
+        ax.set_ylabel(metric_name, fontsize=18, fontweight='bold')
+        ax.set_title(f'{param_name.replace("_", " ").title()} vs {metric_name}', 
+                    fontsize=20, fontweight='bold', pad=15)
+        ax.grid(True, alpha=0.3, linestyle='--', axis='y')
+        ax.tick_params(axis='y', which='major', labelsize=16)
         return
     
     # Usa un colormap per rappresentare l'ordine dei trial
@@ -183,8 +261,6 @@ def plot_param_vs_objective(ax, trials: List[Dict[str, Any]], param_name: str,
         ax.set_xlabel(f'{param_name} (log scale)', fontsize=18, fontweight='bold')
     else:
         ax.set_xlabel(param_name.replace('_', ' ').title(), fontsize=18, fontweight='bold')
-    
-
     
     ax.set_ylabel(metric_name, fontsize=18, fontweight='bold')
     ax.set_title(f'{param_name.replace("_", " ").title()} vs {metric_name}', 
@@ -245,9 +321,10 @@ def generate_summary_plots(data: Dict[str, Any], output_path: str, metric_name: 
         best_value = data.get('best_value', min(t['value'] for t in trials if t['value'] is not None))
     
     # Identifica i parametri da plottare (max 3 scatter plots)
-    # Priorità: learning_rate, temperature, gamma, alpha, weight_decay, batch_size
-    priority_params = ['learning_rate', 'lr_embed', 'temperature', 'gamma', 'alpha', 
-                      'weight_decay', 'focal_gamma', 'focal_alpha']
+    # Priorità: learning_rate, lr_scheduler_type, temperature, gamma, alpha, weight_decay, batch_size
+    priority_params = ['learning_rate', 'lr_embed', 'lr_scheduler_type', 'temperature', 
+                      'gamma', 'alpha', 'weight_decay', 'focal_gamma', 'focal_alpha', 
+                      'focal_loss_gamma']
     
     params_to_plot = []
     for param in priority_params:
@@ -309,9 +386,10 @@ def print_study_info(data: Dict[str, Any]):
     print(f"🎯 Total trials: {data.get('n_trials', 0)}")
     
     # Calcola completed e pruned trials se non presenti
-    if 'all_trials' in data:
-        completed = sum(1 for t in data['all_trials'] if t.get('state') == 'TrialState.COMPLETE')
-        pruned = sum(1 for t in data['all_trials'] if t.get('state') == 'TrialState.PRUNED')
+    all_t = get_trials(data)
+    if all_t:
+        completed = sum(1 for t in all_t if t.get('state') == 'TrialState.COMPLETE')
+        pruned = sum(1 for t in all_t if t.get('state') == 'TrialState.PRUNED')
         print(f"✅ Completed trials: {data.get('completed_trials', completed)}")
         print(f"✂️  Pruned trials: {data.get('pruned_trials', pruned)}")
     else:

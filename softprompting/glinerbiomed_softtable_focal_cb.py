@@ -35,25 +35,24 @@ BATCH_SIZE = 32
 EPOCHS = 15
 
 # LEARNING RATES (Differenziati come richiesto dalla strategia avanzata)
-LR_EMBED = 5e-4   # Learning rate per la tabella Soft Embeddings
-LR_PROJ = 1e-4    # Learning rate per la Proiezione
+LR_EMBED = 0.0002904746249623042  # Learning rate per la tabella Soft Embeddings
+LR_PROJ = 5.590626798054344e-05   # Learning rate per la Proiezione
 
 WEIGHT_DECAY = 0.01
-TEMPERATURE = 0.2
+TEMPERATURE = 0.10710916173084943
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 50
 EARLY_STOPPING_PATIENCE = 4
 RANDOM_SEED = 42
 
 # PARAMETRI STRATEGIA AVANZATA (Class Balanced + Focal)
-GAMMA_FOCAL_LOSS = 4.0
-CB_BETA = 0.9999
+GAMMA_FOCAL_LOSS = 5.967773587959758
+CB_BETA = 0.999
 
 # ==========================================
 # KAGGLE / LOCAL PATHS
 # ==========================================
 if is_running_on_kaggle():
-    # Modifica qui il nome del dataset Kaggle se necessario
     path = "/kaggle/input/jnlpa-6-2k5-1-2-complete/" 
     # Modifica qui il path del modello su Kaggle se necessario
     MODEL_NAME = "/kaggle/input/glinerbismall2/" 

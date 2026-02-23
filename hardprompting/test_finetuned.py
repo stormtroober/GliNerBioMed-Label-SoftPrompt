@@ -16,7 +16,8 @@ import torch.nn.functional as F
 from gliner import GLiNER
 from transformers import AutoTokenizer
 from sklearn.metrics import precision_recall_fscore_support, classification_report
-from collections import Counter
+from collections import Counter, defaultdict
+import numpy as np
 import os
 from datetime import datetime
 
@@ -25,6 +26,7 @@ from datetime import datetime
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TEST_PATH = "../dataset/test_dataset_tknlvl_bi.json"
+TEST_SPAN_PATH = "../dataset/test_dataset_span_bi.json"
 LABEL2DESC_PATH = "../dataset/label2desc.json"
 LABEL2ID_PATH = "../dataset/label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
@@ -51,10 +53,19 @@ with open(LABEL2ID_PATH) as f:
 id2label = {v: k for k, v in label2id.items()}
 label_names = list(label2desc.keys())
 
-print(f"📚 Caricamento test set da {TEST_PATH}...")
+print(f"📚 Caricamento test set (token-level) da {TEST_PATH}...")
 with open(TEST_PATH, "r") as f:
     test_records = json.load(f)
-print(f"✅ Caricati {len(test_records)} esempi di test")
+print(f"✅ Caricati {len(test_records)} esempi di test (token-level)")
+
+print(f"📚 Caricamento test set (span-level) da {TEST_SPAN_PATH}...")
+with open(TEST_SPAN_PATH, "r") as f:
+    span_records = json.load(f)
+print(f"✅ Caricati {len(span_records)} esempi di test (span-level)")
+
+if len(test_records) != len(span_records):
+    print(f"⚠️  ATTENZIONE: numero di esempi diverso ({len(test_records)} vs {len(span_records)}). "
+          "La valutazione span potrebbe essere inaccurata.")
 
 # ==========================================================
 # 2️⃣ FUNZIONI HELPER
@@ -66,7 +77,6 @@ def select_checkpoint_interactive(savings_dir="savings"):
     if not checkpoints:
         raise FileNotFoundError(f"Nessun checkpoint trovato in {savings_dir}/")
     
-    # Ordina per data di modifica (più recente prima)
     checkpoints_info = []
     for ckpt in checkpoints:
         path = os.path.join(savings_dir, ckpt)
@@ -81,7 +91,6 @@ def select_checkpoint_interactive(savings_dir="savings"):
     
     checkpoints_info.sort(key=lambda x: x['mtime'], reverse=True)
     
-    # Mostra menu
     print("\n" + "="*60)
     print("📦 SELEZIONE CHECKPOINT")
     print("="*60)
@@ -92,7 +101,6 @@ def select_checkpoint_interactive(savings_dir="savings"):
         print(f"{i}. {info['name']}")
         print(f"   📅 {date_str} | 💾 {info['size_mb']:.1f} MB")
     
-    # Input utente
     while True:
         try:
             choice = input(f"\n👉 Seleziona checkpoint (1-{len(checkpoints_info)}) [default: 1]: ").strip()
@@ -114,6 +122,7 @@ def select_checkpoint_interactive(savings_dir="savings"):
             print("\n\n❌ Operazione annullata.")
             exit(0)
 
+
 def compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj):
     """Embedda le descrizioni con encoder + projection."""
     desc_texts = [label2desc[k] for k in label_names]
@@ -124,8 +133,99 @@ def compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj):
     vecs = proj(pooled)
     return F.normalize(vecs, dim=-1)
 
-def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpoint_info=None):
-    """Valuta il modello sul test set."""
+
+def get_word_boundary_flags(subword_tokens):
+    """
+    Dato un elenco di subword token, restituisce una lista di booleani:
+    True se quel token è il PRIMO subword di una parola word-level, False altrimenti.
+    I token speciali ([CLS]/[SEP] ecc.) vengono marcati come False.
+    """
+    flags = []
+    for tok in subword_tokens:
+        if tok in ("[CLS]", "[SEP]", "<s>", "</s>", "<pad>"):
+            flags.append(False)
+        elif tok.startswith("▁") or tok.startswith("Ġ"):
+            flags.append(True)
+        elif not flags:
+            flags.append(True)
+        else:
+            flags.append(False)
+    return flags
+
+
+def subword_preds_to_word_preds(subword_tokens, subword_preds, subword_labels):
+    """
+    Mappa le predizioni subword → predizioni word-level usando la strategia
+    'first-subword': la label del primo subword di ogni parola è la label della parola.
+    """
+    flags = get_word_boundary_flags(subword_tokens)
+    word_preds, word_trues = [], []
+    for flag, pred, true in zip(flags, subword_preds, subword_labels):
+        if flag and true != -100:
+            word_preds.append(pred)
+            word_trues.append(true)
+    return word_preds, word_trues
+
+
+def extract_spans_from_word_seq(word_labels, background_label_id):
+    """
+    Dato un elenco di label word-level, estrae span contigui dello stesso label
+    (diverso da background_label_id) come set di tuple (start, end, label_id).
+    """
+    spans = set()
+    n = len(word_labels)
+    i = 0
+    while i < n:
+        lbl = word_labels[i]
+        if lbl != background_label_id:
+            j = i
+            while j < n and word_labels[j] == lbl:
+                j += 1
+            spans.add((i, j - 1, lbl))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def compute_span_metrics(tp_dict, fp_dict, fn_dict, support_dict, id2label, background_label_id):
+    """
+    Calcola metriche span-based per label e aggregate (macro/micro).
+    """
+    all_ids = sorted(set(list(tp_dict.keys()) + list(fp_dict.keys()) + list(fn_dict.keys())))
+    all_ids = [lid for lid in all_ids if lid != background_label_id]
+
+    p_list, r_list, f1_list = [], [], []
+    report_lines = []
+    header = f"{'Label':<25} {'P':>8} {'R':>8} {'F1':>8} {'Support':>10}"
+    report_lines.append(header)
+    report_lines.append("-" * 65)
+
+    for lid in all_ids:
+        tp = tp_dict[lid]; fp = fp_dict[lid]; fn = fn_dict[lid]; sup = support_dict[lid]
+        p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        name = id2label.get(lid, str(lid))
+        p_list.append(p); r_list.append(r); f1_list.append(f1)
+        report_lines.append(f"{name:<25} {p:>8.4f} {r:>8.4f} {f1:>8.4f} {sup:>10}")
+
+    macro_p  = float(np.mean(p_list))  if p_list  else 0.0
+    macro_r  = float(np.mean(r_list))  if r_list  else 0.0
+    macro_f1 = float(np.mean(f1_list)) if f1_list else 0.0
+
+    total_tp = sum(tp_dict[l] for l in all_ids)
+    total_fp = sum(fp_dict[l] for l in all_ids)
+    total_fn = sum(fn_dict[l] for l in all_ids)
+    micro_p  = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_r  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
+
+    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_lines
+
+
+def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpoint_info=None, span_records=None):
+    """Valuta il modello sul test set (token-level + opzionale span-level)."""
     print(f"\n🔍 Valutazione {model_name}...")
     
     txt_enc.eval()
@@ -134,19 +234,25 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
     
     y_true_all = []
     y_pred_all = []
+
+    # Span-based accumulatori
+    background_id = label2id.get("O", 5)
+    span_tp = defaultdict(int)
+    span_fp = defaultdict(int)
+    span_fn = defaultdict(int)
+    span_support = defaultdict(int)
+    n_span_skipped = 0
     
     with torch.no_grad():
-        # Precomputa label embeddings
         label_matrix = compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj).to(DEVICE)
         
-        for record in test_records:
-            # Ricrea sempre input_ids e attention_mask dai tokens
+        for idx, record in enumerate(test_records):
+            tokens = record["tokens"]
             labels = record["labels"]
-            tokens = record["tokens"]  # includono [CLS]/[SEP]
 
             ids = txt_tok.convert_tokens_to_ids(tokens)
 
-            # Troncamento sicuro su max length del modello, preservando primo e ultimo token
+            # Troncamento sicuro
             max_len = getattr(txt_tok, "model_max_length", 0) or 0
             if max_len > 0 and len(ids) > max_len:
                 if len(ids) >= 2 and max_len >= 2:
@@ -163,17 +269,47 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
             out_txt = txt_enc(input_ids=input_ids, attention_mask=attention_mask)
             H = F.normalize(out_txt.last_hidden_state, dim=-1)
             
-            # Similarità token-label
             logits = torch.matmul(H, label_matrix.T).squeeze(0)
             preds = logits.argmax(-1).cpu().numpy()
+            subword_preds_list = preds.tolist()
             
-            # Raccogli solo token validi (non -100)
-            for pred, true_label in zip(preds, labels):
+            # Token-level metrics
+            for pred, true_label in zip(subword_preds_list, labels):
                 if true_label != -100:
                     y_true_all.append(true_label)
                     y_pred_all.append(pred)
-    
-    # Calcola metriche
+
+            # ---- Span-based evaluation ----
+            if span_records is not None:
+                if idx < len(span_records):
+                    span_rec = span_records[idx]
+                    gt_ner = span_rec.get("ner", [])
+
+                    gt_spans = set()
+                    for s, e, lbl_str in gt_ner:
+                        lbl_int = int(lbl_str)
+                        if lbl_int != background_id:
+                            gt_spans.add((s, e, lbl_int))
+                            span_support[lbl_int] += 1
+
+                    word_preds, _ = subword_preds_to_word_preds(tokens, subword_preds_list, labels)
+                    pred_spans = extract_spans_from_word_seq(word_preds, background_id)
+
+                    for span in pred_spans:
+                        if span in gt_spans:
+                            span_tp[span[2]] += 1
+                        else:
+                            span_fp[span[2]] += 1
+                    for span in gt_spans:
+                        if span not in pred_spans:
+                            span_fn[span[2]] += 1
+                else:
+                    n_span_skipped += 1
+
+    if span_records is not None and n_span_skipped > 0:
+        print(f"⚠️  {n_span_skipped} esempi saltati nella valutazione span (indice fuori range).")
+
+    # Calcola metriche token-level
     all_label_ids = list(range(len(label_names)))
     
     prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
@@ -183,7 +319,6 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         y_true_all, y_pred_all, average="micro", zero_division=0, labels=all_label_ids
     )
     
-    # Report per classe
     class_report = classification_report(
         y_true_all, y_pred_all, 
         target_names=label_names,
@@ -191,22 +326,21 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         zero_division=0
     )
     
-    # Stampa risultati
+    # Stampa risultati token-level
     print(f"\n{'='*60}")
     print(f"📊 RISULTATI - {model_name}")
     print(f"{'='*60}")
     print(f"Totale token valutati: {len(y_true_all)}")
-    print(f"\n🎯 METRICHE AGGREGATE:")
+    print(f"\n🎯 METRICHE TOKEN-LEVEL AGGREGATE:")
     print(f"  Macro F1:  {f1_macro:.4f}")
     print(f"  Micro F1:  {f1_micro:.4f}")
     print(f"  Precision (macro): {prec_macro:.4f}")
     print(f"  Recall (macro):    {rec_macro:.4f}")
     print(f"  Precision (micro): {prec_micro:.4f}")
     print(f"  Recall (micro):    {rec_micro:.4f}")
-    
     print(f"\n📋 REPORT PER CLASSE:")
     print(class_report)
-    
+
     # Distribuzione predizioni vs ground truth
     pred_counts = Counter(y_pred_all)
     true_counts = Counter(y_true_all)
@@ -217,8 +351,28 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
     for label_id in sorted(pred_counts.keys(), key=lambda x: pred_counts[x], reverse=True)[:5]:
         label_name = id2label[label_id]
         print(f"{label_name:<15} {pred_counts[label_id]:<8} {true_counts.get(label_id, 0):<8}")
+
+    # Calcola e stampa metriche span-based
+    span_macro_p = span_macro_r = span_macro_f1 = 0.0
+    span_micro_p = span_micro_r = span_micro_f1 = 0.0
+    span_report_lines = []
+
+    if span_records is not None:
+        span_macro_p, span_macro_r, span_macro_f1, \
+        span_micro_p, span_micro_r, span_micro_f1, \
+        span_report_lines = compute_span_metrics(
+            span_tp, span_fp, span_fn, span_support, id2label, background_id
+        )
+        print(f"\n{'='*60}")
+        print(f"🎯 METRICHE SPAN-BASED (Exact Match, escluso 'O')")
+        print(f"{'='*60}")
+        print(f"  Macro P: {span_macro_p:.4f} | Macro R: {span_macro_r:.4f} | Macro F1: {span_macro_f1:.4f}")
+        print(f"  Micro P: {span_micro_p:.4f} | Micro R: {span_micro_r:.4f} | Micro F1: {span_micro_f1:.4f}")
+        print(f"\n📋 REPORT SPAN PER CLASSE:")
+        for line in span_report_lines:
+            print(line)
     
-    # Salva risultati con datetime nel nome
+    # Salva risultati
     os.makedirs("testresults", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"results_{model_name.replace(' ', '_').replace('-', '_')}_{timestamp}.md"
@@ -227,18 +381,15 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         f.write(f"# Risultati - {model_name}\n\n")
         f.write(f"**Data test:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
-        # Se abbiamo info dal checkpoint, includiamo tutti i dettagli
         if checkpoint_info:
             f.write(f"## Informazioni Checkpoint\n\n")
             f.write(f"**Checkpoint path:** `{checkpoint_info.get('checkpoint_path', 'N/A')}`\n\n")
             
-            # Dataset info
             f.write(f"### Dataset di Training\n\n")
             f.write(f"- **Nome dataset:** {checkpoint_info.get('dataset_name', 'N/A')}\n")
             f.write(f"- **Path dataset:** `{checkpoint_info.get('dataset_path', 'N/A')}`\n")
             f.write(f"- **Dimensione dataset:** {checkpoint_info.get('dataset_size', 'N/A')} samples\n\n")
             
-            # Iperparametri
             hyperparams = checkpoint_info.get('hyperparameters', {})
             if hyperparams:
                 f.write(f"### Iperparametri di Training\n\n")
@@ -254,7 +405,6 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
                 f.write(f"| Early Stopping Patience | {hyperparams.get('early_stopping_patience', 'N/A')} |\n")
                 f.write(f"| Random Seed | {hyperparams.get('random_seed', 'N/A')} |\n\n")
             
-            # Training info
             training_info = checkpoint_info.get('training_info', {})
             if training_info:
                 f.write(f"### Risultati Training\n\n")
@@ -266,7 +416,8 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         
         f.write(f"## Risultati Test\n\n")
         f.write(f"**Token valutati:** {len(y_true_all)}\n\n")
-        f.write(f"### Metriche aggregate\n\n")
+        
+        f.write(f"### Metriche Token-Level Aggregate\n\n")
         f.write(f"| Metrica | Valore |\n")
         f.write(f"|---------|--------|\n")
         f.write(f"| Macro F1 | {f1_macro:.4f} |\n")
@@ -276,7 +427,6 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         f.write(f"| Precision (micro) | {prec_micro:.4f} |\n")
         f.write(f"| Recall (micro) | {rec_micro:.4f} |\n\n")
         
-        # Distribuzione predizioni vs ground truth
         f.write(f"### Distribuzione Predizioni\n\n")
         f.write(f"| Label | Predizioni | Ground Truth |\n")
         f.write(f"|-------|------------|-------------|\n")
@@ -285,9 +435,20 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
             f.write(f"| {label_name} | {pred_counts.get(label_id, 0)} | {true_counts[label_id]} |\n")
         f.write(f"\n")
         
-        f.write(f"### Report per classe\n\n```\n{class_report}\n```\n")
+        f.write(f"### Report Token-Level per Classe\n\n```\n{class_report}\n```\n")
+
+        if span_records is not None:
+            f.write(f"\n## Metriche Span-Based (Exact Match, escluso 'O')\n")
+            f.write(f"| Metric | Precision | Recall | F1 |\n")
+            f.write(f"|--------|-----------|--------|---------|\n")
+            f.write(f"| **Macro** | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")
+            f.write(f"| **Micro** | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |\n")
+            f.write(f"\n### Report Span per Classe\n```\n")
+            for line in span_report_lines:
+                f.write(line + "\n")
+            f.write("```\n")
     
-    print(f"💾 Risultati salvati in: testresults/{filename}")
+    print(f"\n💾 Risultati salvati in: testresults/{filename}")
     
     return {
         'macro_f1': f1_macro,
@@ -295,7 +456,9 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
         'macro_precision': prec_macro,
         'macro_recall': rec_macro,
         'micro_precision': prec_micro,
-        'micro_recall': rec_micro
+        'micro_recall': rec_micro,
+        'span_macro_f1': span_macro_f1,
+        'span_micro_f1': span_micro_f1,
     }
 
 # ==========================================================
@@ -305,10 +468,8 @@ print("\n" + "="*60)
 print("🔸 MODELLO FINE-TUNATO")
 print("="*60)
 
-# Selezione interattiva checkpoint
 CHECKPOINT_PATH = select_checkpoint_interactive("savings")
 
-# Carica modello base
 model_ft = GLiNER.from_pretrained(MODEL_NAME)
 core_ft = model_ft.model
 
@@ -319,11 +480,9 @@ proj_ft = core_ft.token_rep_layer.labels_projection
 txt_tok = AutoTokenizer.from_pretrained(txt_enc_ft.config._name_or_path)
 lbl_tok = AutoTokenizer.from_pretrained(lbl_enc_ft.config._name_or_path)
 
-# Carica checkpoint
 print(f"📦 Caricamento checkpoint: {CHECKPOINT_PATH}")
 checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
 
-# Estrai informazioni dal checkpoint (nuovo formato)
 checkpoint_info = {
     'checkpoint_path': CHECKPOINT_PATH,
     'dataset_name': checkpoint.get('dataset_name', 'N/A'),
@@ -333,7 +492,6 @@ checkpoint_info = {
     'training_info': checkpoint.get('training_info', {}),
 }
 
-# Stampa info checkpoint
 print(f"📊 Dataset di training: {checkpoint_info['dataset_name']} ({checkpoint_info['dataset_size']} samples)")
 if checkpoint_info['hyperparameters']:
     hp = checkpoint_info['hyperparameters']
@@ -346,6 +504,9 @@ txt_enc_ft.to(DEVICE)
 lbl_enc_ft.to(DEVICE)
 proj_ft.to(DEVICE)
 
-results_ft = evaluate_model(txt_enc_ft, lbl_enc_ft, proj_ft, txt_tok, lbl_tok, "Fine_tuned", checkpoint_info)
+results_ft = evaluate_model(
+    txt_enc_ft, lbl_enc_ft, proj_ft, txt_tok, lbl_tok,
+    "Fine_tuned", checkpoint_info, span_records=span_records
+)
 
 print("\n✅ Valutazione completata!")

@@ -18,7 +18,6 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from gliner import GLiNER
 from tqdm import tqdm
 
-#layer in più per descrizioni, sblocca encoder input, dopo hard prompting
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================

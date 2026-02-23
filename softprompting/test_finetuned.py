@@ -21,10 +21,11 @@ import re
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-#PATH_DATASET = "../dataset"
-PATH_DATASET = "../dataset_bc5cdr"
+PATH_DATASET = "../dataset"
+#PATH_DATASET = "../dataset_bc5cdr"
 
 TEST_PATH = PATH_DATASET + "/test_dataset_tknlvl_bi.json"
+TEST_SPAN_PATH = PATH_DATASET + "/test_dataset_span_bi.json"
 LABEL2DESC_PATH = PATH_DATASET + "/label2desc.json"
 LABEL2ID_PATH = PATH_DATASET + "/label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
@@ -108,6 +109,116 @@ def truncate_tokens_safe(tokens, tokenizer, max_len=None):
     return tokens[:max_len]
 
 # ==========================================================
+# SPAN-BASED EVALUATION UTILITIES
+# ==========================================================
+
+def get_word_boundary_flags(subword_tokens):
+    """
+    Dato un elenco di subword token (SentencePiece con prefisso '▁' o token speciali
+    [CLS]/[SEP]), restituisce una lista di booleani: True se quel token è il PRIMO
+    subword di una parola word-level, False altrimenti.
+    I token speciali [CLS] e [SEP] vengono marcati come False (ignorati).
+    """
+    flags = []
+    for tok in subword_tokens:
+        if tok in ("[CLS]", "[SEP]", "<s>", "</s>", "<pad>"):
+            flags.append(False)   # token speciale: non è una parola
+        elif tok.startswith("▁") or tok.startswith("Ġ"):
+            flags.append(True)    # inizio di una nuova parola (SentencePiece / GPT2-BPE)
+        elif not flags:           # primo token assoluto se nessun prefisso (raro)
+            flags.append(True)
+        else:
+            flags.append(False)   # continuazione di subword
+    return flags
+
+
+def subword_preds_to_word_preds(subword_tokens, subword_preds, subword_labels):
+    """
+    Mappa le predizioni subword → predizioni word-level usando la strategia
+    'first-subword': la label del primo subword di ogni parola è la label della parola.
+
+    Restituisce:
+        word_preds  -- lista di int con predizioni word-level
+        word_trues  -- lista di int con etichette word-level (ground-truth)
+    """
+    flags = get_word_boundary_flags(subword_tokens)
+    word_preds = []
+    word_trues = []
+    for flag, pred, true in zip(flags, subword_preds, subword_labels):
+        if flag and true != -100:   # solo il primo subword di una parola reale
+            word_preds.append(pred)
+            word_trues.append(true)
+    return word_preds, word_trues
+
+
+def extract_spans_from_word_seq(word_labels, background_label_id):
+    """
+    Dato un elenco di label word-level, estrae span contigui dello stesso label
+    (diverso da background_label_id) come set di tuple (start, end, label_id).
+    start/end sono indici 0-based INCLUSIVI sulle parole.
+    """
+    spans = set()
+    n = len(word_labels)
+    i = 0
+    while i < n:
+        lbl = word_labels[i]
+        if lbl != background_label_id:
+            j = i
+            while j < n and word_labels[j] == lbl:
+                j += 1
+            spans.add((i, j - 1, lbl))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def compute_span_metrics(tp_dict, fp_dict, fn_dict, support_dict, id2label, background_label_id):
+    """
+    Calcola metriche span-based per label e aggregate (macro/micro).
+    Restituisce (macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_lines).
+    """
+    import numpy as np
+
+    # label ids presenti (esclude background)
+    all_ids = sorted(set(list(tp_dict.keys()) + list(fp_dict.keys()) + list(fn_dict.keys())))
+    all_ids = [lid for lid in all_ids if lid != background_label_id]
+
+    p_list, r_list, f1_list = [], [], []
+    report_lines = []
+    header = f"{'Label':<25} {'P':>8} {'R':>8} {'F1':>8} {'Support':>10}"
+    report_lines.append(header)
+    report_lines.append("-" * 65)
+
+    for lid in all_ids:
+        tp = tp_dict[lid]
+        fp = fp_dict[lid]
+        fn = fn_dict[lid]
+        sup = support_dict[lid]
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        name = id2label.get(lid, str(lid))
+        p_list.append(p)
+        r_list.append(r)
+        f1_list.append(f1)
+        report_lines.append(f"{name:<25} {p:>8.4f} {r:>8.4f} {f1:>8.4f} {sup:>10}")
+
+    macro_p  = float(np.mean(p_list))  if p_list  else 0.0
+    macro_r  = float(np.mean(r_list))  if r_list  else 0.0
+    macro_f1 = float(np.mean(f1_list)) if f1_list else 0.0
+
+    total_tp = sum(tp_dict[l] for l in all_ids)
+    total_fp = sum(fp_dict[l] for l in all_ids)
+    total_fn = sum(fn_dict[l] for l in all_ids)
+    micro_p  = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_r  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
+
+    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_lines
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 if __name__ == "__main__":
@@ -130,10 +241,19 @@ if __name__ == "__main__":
     num_labels = len(label_names)
     print(f"✅ Caricate {num_labels} label (ordinate per ID)")
 
-    print(f"\n📚 Caricamento TEST SET da {TEST_PATH}...")
+    print(f"\n📚 Caricamento TEST SET (token-level) da {TEST_PATH}...")
     with open(TEST_PATH, "r", encoding="utf-8") as f:
         test_records = json.load(f)
-    print(f"✅ Caricati {len(test_records)} esempi di test")
+    print(f"✅ Caricati {len(test_records)} esempi di test (token-level)")
+
+    print(f"\n📚 Caricamento TEST SET (span-level) da {TEST_SPAN_PATH}...")
+    with open(TEST_SPAN_PATH, "r", encoding="utf-8") as f:
+        span_records = json.load(f)
+    print(f"✅ Caricati {len(span_records)} esempi di test (span-level)")
+
+    if len(test_records) != len(span_records):
+        print(f"⚠️  ATTENZIONE: numero di esempi diverso ({len(test_records)} vs {len(span_records)}). "
+              "La valutazione span potrebbe essere inaccurata.")
 
     # 2. Caricamento Modello
     print("\n" + "="*70)
@@ -214,6 +334,17 @@ if __name__ == "__main__":
     y_true_all = []
     y_pred_all = []
     n_skipped = 0
+
+    # --- Span-based accumulatori ---
+    from collections import defaultdict
+    import numpy as np
+    # "background" nel dataset tknlvl corrisponde alla label con id == label2id.get("O", 5)
+    background_id = label2id.get("O", 5)
+    span_tp = defaultdict(int)
+    span_fp = defaultdict(int)
+    span_fn = defaultdict(int)
+    span_support = defaultdict(int)
+    n_span_skipped = 0
     
     with torch.no_grad():
         label_matrix = compute_label_matrix_from_soft_table(soft_table, proj).to(DEVICE)
@@ -242,12 +373,49 @@ if __name__ == "__main__":
             logits = torch.matmul(H, label_matrix.T).squeeze(0)
             preds = logits.argmax(-1).cpu().numpy()
             
-            for pred, true_label in zip(preds, labels):
+            # Collect token-based metrics
+            subword_preds_list = preds.tolist()
+            for pred, true_label in zip(subword_preds_list, labels):
                 if true_label != -100:
                     y_true_all.append(true_label)
                     y_pred_all.append(pred)
+
+            # ---- Span-based evaluation ----
+            # Abbiniamo al record span corrispondente (stesso indice)
+            if idx < len(span_records):
+                span_rec = span_records[idx]
+                gt_ner = span_rec.get("ner", [])  # [[start, end, label_id_str], ...]
+
+                # Ground-truth span set (esclude background)
+                gt_spans = set()
+                for s, e, lbl_str in gt_ner:
+                    lbl_int = int(lbl_str)
+                    if lbl_int != background_id:
+                        gt_spans.add((s, e, lbl_int))
+                        span_support[lbl_int] += 1
+
+                # Predizioni word-level dalla sequenza subword
+                word_preds, _ = subword_preds_to_word_preds(
+                    tokens, subword_preds_list, labels
+                )
+                pred_spans = extract_spans_from_word_seq(word_preds, background_id)
+
+                # TP / FP / FN
+                for span in pred_spans:
+                    if span in gt_spans:
+                        span_tp[span[2]] += 1
+                    else:
+                        span_fp[span[2]] += 1
+                for span in gt_spans:
+                    if span not in pred_spans:
+                        span_fn[span[2]] += 1
+            else:
+                n_span_skipped += 1
     
     # 4. Report
+    if n_span_skipped > 0:
+        print(f"⚠️  {n_span_skipped} esempi saltati nella valutazione span (indice fuori range).")
+
     all_label_ids = list(range(num_labels))
     
     # Identifica ID della label "O" se presente
@@ -294,6 +462,22 @@ if __name__ == "__main__":
         print(f"\n🚀 METRICHE CLEAN (Esclusa 'O'):")
         print(f"  Macro F1 (No-O):   {f1_macro_no_o:.4f}")
         print(f"  Micro F1 (No-O):   {f1_micro_no_o:.4f}")
+
+    # ---- Span-based report ----
+    span_macro_p, span_macro_r, span_macro_f1, \
+    span_micro_p, span_micro_r, span_micro_f1, \
+    span_report_lines = compute_span_metrics(
+        span_tp, span_fp, span_fn, span_support, id2label, background_id
+    )
+
+    print(f"\n{'='*70}")
+    print(f"🎯 METRICHE SPAN-BASED (Exact Match, escluso background 'O')")
+    print(f"{'='*70}")
+    print(f"  Macro P:   {span_macro_p:.4f}  |  Macro R:   {span_macro_r:.4f}  |  Macro F1:   {span_macro_f1:.4f}")
+    print(f"  Micro P:   {span_micro_p:.4f}  |  Micro R:   {span_micro_r:.4f}  |  Micro F1:   {span_micro_f1:.4f}")
+    print(f"\n📋 REPORT SPAN PER CLASSE:")
+    for line in span_report_lines:
+        print(line)
     
     print(f"\n📋 REPORT PER CLASSE:")
     print(class_report)
@@ -359,7 +543,17 @@ if __name__ == "__main__":
              f.write(f"- **Macro F1 (No-O):** {f1_macro_no_o:.4f}\n")
              f.write(f"- **Micro F1 (No-O):** {f1_micro_no_o:.4f}\n")
 
-        f.write(f"\n## Report per classe\n```\n{class_report}\n```\n")
+        f.write(f"\n## Report Token-Level per classe\n```\n{class_report}\n```\n")
+
+        f.write(f"\n## Metriche Span-Based (Exact Match, escluso background 'O')\n")
+        f.write(f"| Metric | Precision | Recall | F1 |\n")
+        f.write(f"|------|-----------|--------|-----|\n")
+        f.write(f"| **Macro** | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")
+        f.write(f"| **Micro** | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |\n")
+        f.write(f"\n### Report Span per Classe\n```\n")
+        for line in span_report_lines:
+            f.write(line + "\n")
+        f.write("```\n")
     
     print(f"\n💾 Risultati salvati in: {filename}")
     print(f"✅ Test completato!")

@@ -363,7 +363,7 @@ def main():
         path = "/kaggle/input/jnlpa15k/"
         model_name = '/kaggle/input/glinerbismall2/'
     else:
-        path = "../dataset/"
+        path = "../dataset_bc5cdr/"
         model_name = "Ihor/gliner-biomed-bi-small-v1.0"
 
     test_path = path + "test_dataset_span_bi.json"

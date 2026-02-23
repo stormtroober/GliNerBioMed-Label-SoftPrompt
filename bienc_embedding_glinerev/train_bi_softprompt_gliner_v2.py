@@ -328,8 +328,8 @@ class SoftGlinerTrainer:
 # 3. DATA LOADING
 # ==========================================
 if is_running_on_kaggle():
-    MODEL_NAME = '/kaggle/input/glinerbismall2/'
-    path = "/kaggle/input/jnlpa-6-2k5-1-2-complete/"
+    MODEL_NAME = '/kaggle/input/datasets/alessandrobecci/glinerbismall2/'
+    path = "/kaggle/input/datasets/alessandrobecci/jnlpa-18-5k15-3-5-complete/"
 else:
     MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
     path = "../dataset/"
@@ -373,7 +373,7 @@ print(f"Labels found: {len(label_list)}")
 # ==========================================
 from collections import defaultdict
 
-def calculate_metrics(dataset, model, batch_size=1):
+def calculate_metrics(dataset, model, batch_size=16):
     """Funzione di valutazione robusta dalla v1"""
     import gc
     if torch.cuda.is_available():
@@ -567,7 +567,7 @@ baseline_output, baseline_f1 = model.evaluate(
     flat_ner=True,
     multi_label=False,
     threshold=0.5,
-    batch_size=8
+    batch_size=16
 )
 print(f"Baseline Results:\n{baseline_output}")
 print(f"Baseline F1: {baseline_f1:.4f}")
@@ -575,7 +575,7 @@ print("="*50)
 
 trainer_wrapper = SoftGlinerTrainer(
     model=model, train_dataset=train_dataset, val_dataset=val_dataset,
-    batch_size=8, num_epochs=5, learning_rate=1e-4, prompt_encoder_lr=5e-4, others_lr=1e-5, freeze_backbone=True
+    batch_size=16, num_epochs=15, learning_rate=1e-4, prompt_encoder_lr=0.00972703093124308, others_lr=0.00017752997104569565, freeze_backbone=True
 )
 
 print("Starting training...")
@@ -593,7 +593,7 @@ print("="*50)
 model.eval()
 
 # Usa calculate_metrics per output formattato con Macro/Micro
-metrics = calculate_metrics(test_dataset, model, batch_size=8)
+metrics = calculate_metrics(test_dataset, model, batch_size=16)
 
 # ==========================================
 # 6. SALVATAGGIO SELETTIVO (TUTTO IN UN UNICO .pt)
