@@ -571,6 +571,10 @@ for epoch in range(1, EPOCHS + 1):
         best_model_state = {
             'prompt_encoder': prompt_encoder.state_dict(),
             'config': {
+                # Dataset
+                'input_dir': input_dir,
+                'dataset_path': DATASET_PATH,
+
                 # Parametri generali di training
                 'batch_size': BATCH_SIZE,
                 'epochs': EPOCHS,

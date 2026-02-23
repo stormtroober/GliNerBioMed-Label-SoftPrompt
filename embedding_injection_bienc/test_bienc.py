@@ -13,7 +13,8 @@ from gliner import GLiNER
 from torch import nn
 from transformers import AutoTokenizer
 from sklearn.metrics import precision_recall_fscore_support, classification_report
-from collections import Counter
+from collections import Counter, defaultdict
+import numpy as np
 import os
 from tqdm import tqdm
 import subprocess
@@ -22,10 +23,11 @@ import subprocess
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-#prefix = "../dataset/"
-prefix = "../dataset_bc5cdr/"
+prefix = "../dataset/"
+#prefix = "../dataset_bc5cdr/"
 
 TEST_PATH = prefix + "test_dataset_tknlvl_bi.json"
+TEST_SPAN_PATH = prefix + "test_dataset_span_bi.json"
 LABEL2DESC_PATH = prefix + "label2desc.json"
 LABEL2ID_PATH = prefix + "label2id.json"
 MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
@@ -152,14 +154,42 @@ class MLPPromptEncoder(nn.Module):
 # ==========================================================
 # 2️⃣ SELEZIONE CHECKPOINT
 # ==========================================================
+def _resolve_dataset_label(conf: dict) -> str:
+    """Deduce una label leggibile per il dataset dal dizionario config."""
+    # 1. Chiave diretta (checkpoint nuovi)
+    val = conf.get('input_dir', '')
+    if not val:
+        # 2. Fallback: prova dataset_path o validation_file
+        val = conf.get('dataset_path', '') or conf.get('validation_file', '')
+    if not val:
+        return 'sconosciuto'
+    # Pulizia path comuni
+    if val.startswith('/kaggle/input/'):
+        val = val.replace('/kaggle/input/', '')
+    val = val.replace('../', 'locale/')
+    # Rimuovi nome file se è un path completo (es. "locale/dataset/train.json")
+    if val.endswith('.json'):
+        val = os.path.dirname(val)
+    return val.strip('/') or 'sconosciuto'
+
+
 def select_checkpoint_interactive():
     if not os.path.exists(SAVINGS_DIR): return None
     ckpts = [f for f in os.listdir(SAVINGS_DIR) if f.endswith('.pt')]
     if not ckpts: return None
     ckpts.sort(key=lambda x: os.path.getmtime(os.path.join(SAVINGS_DIR, x)), reverse=True)
-    
+
     print("\n📦 CHECKPOINT DISPONIBILI:")
-    for i, c in enumerate(ckpts[:10]): print(f"{i+1}. {c}")
+    for i, c in enumerate(ckpts[:10]):
+        ckpt_path = os.path.join(SAVINGS_DIR, c)
+        try:
+            ckpt_tmp = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            conf = ckpt_tmp.get('config', {})
+            dataset_label = _resolve_dataset_label(conf)
+            print(f"{i+1}. {c} | Dataset: {dataset_label}")
+        except Exception:
+            print(f"{i+1}. {c} | Dataset: Errore lettura")
+
     try:
         sel = int(input("\n👉 Scegli numero [1]: ") or 1) - 1
         return os.path.join(SAVINGS_DIR, ckpts[sel])
@@ -296,11 +326,110 @@ with torch.no_grad():
 print(f"✅ Matrice pronta: {label_matrix.shape}")
 
 # ==========================================================
-# 5️⃣ TEST LOOP (BATCHED)
+# 5️⃣ SPAN EVALUATION UTILITIES
+# ==========================================================
+def get_word_boundary_flags(subword_tokens):
+    """
+    Restituisce True per il primo subword di ogni parola word-level,
+    False per token speciali e continuazioni.
+    """
+    flags = []
+    for tok in subword_tokens:
+        if tok in ("[CLS]", "[SEP]", "<s>", "</s>", "<pad>"):
+            flags.append(False)
+        elif tok.startswith("▁") or tok.startswith("Ġ"):
+            flags.append(True)
+        elif not flags:
+            flags.append(True)
+        else:
+            flags.append(False)
+    return flags
+
+
+def subword_preds_to_word_preds(subword_tokens, subword_preds, subword_labels):
+    """
+    Mappa predizioni subword → word-level usando strategia 'first-subword'.
+    """
+    flags = get_word_boundary_flags(subword_tokens)
+    word_preds, word_trues = [], []
+    for flag, pred, true in zip(flags, subword_preds, subword_labels):
+        if flag and true != -100:
+            word_preds.append(pred)
+            word_trues.append(true)
+    return word_preds, word_trues
+
+
+def extract_spans_from_word_seq(word_labels, background_label_id):
+    """
+    Estrae span contigui dello stesso label (diverso da background)
+    come set di tuple (start, end, label_id). Indici 0-based inclusivi.
+    """
+    spans = set()
+    n = len(word_labels)
+    i = 0
+    while i < n:
+        lbl = word_labels[i]
+        if lbl != background_label_id:
+            j = i
+            while j < n and word_labels[j] == lbl:
+                j += 1
+            spans.add((i, j - 1, lbl))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def compute_span_metrics(tp_dict, fp_dict, fn_dict, support_dict, id2label, background_label_id):
+    """Calcola metriche span-based per label e aggregate (macro/micro)."""
+    all_ids = sorted(set(list(tp_dict.keys()) + list(fp_dict.keys()) + list(fn_dict.keys())))
+    all_ids = [lid for lid in all_ids if lid != background_label_id]
+
+    p_list, r_list, f1_list = [], [], []
+    report_lines = []
+    header = f"{'Label':<25} {'P':>8} {'R':>8} {'F1':>8} {'Support':>10}"
+    report_lines.append(header)
+    report_lines.append("-" * 65)
+
+    for lid in all_ids:
+        tp = tp_dict[lid]; fp = fp_dict[lid]; fn = fn_dict[lid]; sup = support_dict[lid]
+        p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        name = id2label.get(lid, str(lid))
+        p_list.append(p); r_list.append(r); f1_list.append(f1)
+        report_lines.append(f"{name:<25} {p:>8.4f} {r:>8.4f} {f1:>8.4f} {sup:>10}")
+
+    macro_p  = float(np.mean(p_list))  if p_list  else 0.0
+    macro_r  = float(np.mean(r_list))  if r_list  else 0.0
+    macro_f1 = float(np.mean(f1_list)) if f1_list else 0.0
+
+    total_tp = sum(tp_dict[l] for l in all_ids)
+    total_fp = sum(fp_dict[l] for l in all_ids)
+    total_fn = sum(fn_dict[l] for l in all_ids)
+    micro_p  = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    micro_r  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
+
+    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_lines
+
+
+# ==========================================================
+# 6️⃣ TEST LOOP (BATCHED)
 # ==========================================================
 BATCH_SIZE = 16
 with open(TEST_PATH) as f: test_data = json.load(f)
 print(f"\n🔍 Valutazione su {len(test_data)} record (Batch Size: {BATCH_SIZE})...")
+
+span_data = None
+if os.path.exists(TEST_SPAN_PATH):
+    with open(TEST_SPAN_PATH) as f: span_data = json.load(f)
+    print(f"📚 Caricati {len(span_data)} record span-level")
+    if len(test_data) != len(span_data):
+        print(f"⚠️  Numero esempi diverso ({len(test_data)} vs {len(span_data)}). "
+              "La valutazione span potrebbe essere inaccurata.")
+else:
+    print(f"⚠️  File span non trovato in {TEST_SPAN_PATH}. Valutazione span saltata.")
 
 y_true, y_pred = [], []
 
@@ -335,7 +464,16 @@ else:
     relevant_label_names = label_names
     print("⚠️  Classe 'O' non trovata. Calcolo standard su tutte le classi.")
 
+# Span accumulatori
+background_id = label2id.get("O", ignore_index if ignore_index != -1 else 0)
+span_tp = defaultdict(int)
+span_fp = defaultdict(int)
+span_fn = defaultdict(int)
+span_support = defaultdict(int)
+n_span_skipped = 0
+
 processed_count = 0
+global_sample_idx = 0  # indice assoluto del campione nel dataset
 
 with torch.no_grad():
     for batch_idx, batch_data in enumerate(tqdm(chunked(test_data, BATCH_SIZE), total=(len(test_data) + BATCH_SIZE - 1) // BATCH_SIZE)):
@@ -382,19 +520,52 @@ with torch.no_grad():
         # Argmax Predictions
         batch_preds = logits.argmax(-1).cpu().tolist() # (B, SeqLen)
         
-        # Collect Results (ignoring padding and -100 labels)
+        # Collect Results (ignoring padding and -100 labels) + Span evaluation
         for i, preds_seq in enumerate(batch_preds):
-            original_len = len(batch_input_ids[i]) # lunghezza reale senza padding
+            original_len = len(batch_input_ids[i])  # lunghezza reale senza padding
             valid_preds = preds_seq[:original_len]
             valid_labels = batch_labels[i]
-            
+
             for p, t in zip(valid_preds, valid_labels):
                 if t != -100:
                     y_true.append(t)
                     y_pred.append(p)
-        
+
+            # ---- Span-based evaluation ----
+            if span_data is not None and global_sample_idx < len(span_data):
+                # Nel bienc i token vengono passati as-is al text encoder (nessun CLS/SEP
+                # aggiunto manualmente nel forward pass), quindi batch_tokens[i] e
+                # valid_preds hanno sempre la stessa lunghezza. CLS/SEP eventualmente
+                # presenti nel dataset vengono già gestiti da get_word_boundary_flags
+                # (→ flag=False) e dai label -100, senza bisogno di trim manuale.
+                span_rec = span_data[global_sample_idx]
+                gt_ner = span_rec.get("ner", [])
+
+                gt_spans = set()
+                for s, e, lbl_str in gt_ner:
+                    lbl_int = int(lbl_str)
+                    if lbl_int != background_id:
+                        gt_spans.add((s, e, lbl_int))
+                        span_support[lbl_int] += 1
+
+                word_preds, _ = subword_preds_to_word_preds(batch_tokens[i], valid_preds, valid_labels)
+                pred_spans = extract_spans_from_word_seq(word_preds, background_id)
+
+                for span in pred_spans:
+                    if span in gt_spans:
+                        span_tp[span[2]] += 1
+                    else:
+                        span_fp[span[2]] += 1
+                for span in gt_spans:
+                    if span not in pred_spans:
+                        span_fn[span[2]] += 1
+            elif span_data is not None:
+                n_span_skipped += 1
+
+            global_sample_idx += 1
+
         processed_count += len(batch_data)
-        
+
         # Logging Intermedio
         if processed_count >= total_records or (processed_count % checkpoint_interval < BATCH_SIZE):
              if len(y_true) > 0:
@@ -408,14 +579,11 @@ with torch.no_grad():
                 # Print sovrascrive tqdm a volte, usiamo write
                 tqdm.write(f" [{progress:5.1f}%] Macro F1 (No O): {current_macro_f1:.4f} | Micro F1: {current_micro_f1:.4f}")
 
-# ==========================================================
-# 6️⃣ RISULTATI
-# ==========================================================
-from sklearn.metrics import confusion_matrix
-import datetime
+if n_span_skipped > 0:
+    print(f"⚠️  {n_span_skipped} record saltati nella valutazione span.")
 
 # ==========================================================
-# 6️⃣ RISULTATI
+# 7️⃣ RISULTATI
 # ==========================================================
 from sklearn.metrics import confusion_matrix
 import datetime
@@ -457,6 +625,26 @@ print(f"   • WEIGHTED: Precision={weighted_p:.4f} | Recall={weighted_r:.4f} | 
 
 print("\n📋 Classification Report (No O):")
 print(classification_report(y_true, y_pred, target_names=relevant_label_names, labels=relevant_label_ids, zero_division=0))
+
+# Span metrics
+span_macro_p = span_macro_r = span_macro_f1 = 0.0
+span_micro_p = span_micro_r = span_micro_f1 = 0.0
+span_report_lines = []
+
+if span_data is not None:
+    span_macro_p, span_macro_r, span_macro_f1, \
+    span_micro_p, span_micro_r, span_micro_f1, \
+    span_report_lines = compute_span_metrics(
+        span_tp, span_fp, span_fn, span_support, id2label, background_id
+    )
+    print(f"\n{'='*60}")
+    print(f"🎯 METRICHE SPAN-BASED (Exact Match, escluso 'O')")
+    print(f"{'='*60}")
+    print(f"  Macro P: {span_macro_p:.4f} | Macro R: {span_macro_r:.4f} | Macro F1: {span_macro_f1:.4f}")
+    print(f"  Micro P: {span_micro_p:.4f} | Micro R: {span_micro_r:.4f} | Micro F1: {span_micro_f1:.4f}")
+    print(f"\n📋 REPORT SPAN PER CLASSE:")
+    for line in span_report_lines:
+        print(line)
 
 # ==========================================================
 # 📊 EXPORT DETTAGLIATO
@@ -568,7 +756,18 @@ with open(filename, "w", encoding="utf-8") as f:
     
     f.write(f"## 📋 Classification Report (No 'O')\n\n")
     f.write(f"```\n{class_report}\n```\n\n")
-    
+
+    if span_data is not None:
+        f.write(f"## 🎯 Metriche Span-Based (Exact Match, escluso 'O')\n\n")
+        f.write(f"| Metric | Precision | Recall | F1 |\n")
+        f.write(f"|--------|-----------|--------|---------|\n")
+        f.write(f"| **Macro** | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")
+        f.write(f"| **Micro** | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |\n")
+        f.write(f"\n### Report Span per Classe\n```\n")
+        for line in span_report_lines:
+            f.write(line + "\n")
+        f.write("```\n\n")
+
     # Distribuzione predizioni vs ground truth
     f.write(f"## 🔢 Distribuzione Predizioni vs Ground Truth\n\n")
     f.write(f"| Classe | Predette | Vere | Differenza | % Coverage |\n")
