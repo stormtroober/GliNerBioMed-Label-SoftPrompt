@@ -18,6 +18,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 import subprocess
+import time
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
@@ -475,6 +476,7 @@ n_span_skipped = 0
 processed_count = 0
 global_sample_idx = 0  # indice assoluto del campione nel dataset
 
+infer_start_time = time.time()
 with torch.no_grad():
     for batch_idx, batch_data in enumerate(tqdm(chunked(test_data, BATCH_SIZE), total=(len(test_data) + BATCH_SIZE - 1) // BATCH_SIZE)):
         
@@ -582,6 +584,10 @@ with torch.no_grad():
 if n_span_skipped > 0:
     print(f"⚠️  {n_span_skipped} record saltati nella valutazione span.")
 
+infer_time = time.time() - infer_start_time
+samples_per_sec = len(test_data) / infer_time if infer_time > 0 else 0
+tokens_per_sec = len(y_true) / infer_time if infer_time > 0 else 0
+
 # ==========================================================
 # 7️⃣ RISULTATI
 # ==========================================================
@@ -619,6 +625,8 @@ true_counts = Counter(y_true)
 conf_matrix = confusion_matrix(y_true, y_pred, labels=all_label_ids)
 
 print(f"\n🏆 GLOBAL METRICS (No O Class):")
+print(f"   • Tempo Inferenza: {infer_time:.2f} s")
+print(f"   • Velocità: {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
 print(f"   • MACRO:    Precision={macro_p:.4f} | Recall={macro_r:.4f} | F1={macro_f1:.4f}")
 print(f"   • MICRO:    Precision={micro_p:.4f} | Recall={micro_r:.4f} | F1={micro_f1:.4f}")
 print(f"   • WEIGHTED: Precision={weighted_p:.4f} | Recall={weighted_r:.4f} | F1={weighted_f1:.4f}")
@@ -726,6 +734,13 @@ with open(filename, "w", encoding="utf-8") as f:
     # Metriche globali (NO O)
     f.write(f"## 📈 Metriche Globali (ESCLUSO 'O')\n\n")
     
+    f.write(f"### Performance Infrastruttura\n")
+    f.write(f"| Metrica | Valore |\n")
+    f.write(f"|:--------|:-------|\n")
+    f.write(f"| **Tempo Inferenza** | {infer_time:.2f} s |\n")
+    f.write(f"| **Samples/s** | {samples_per_sec:.2f} |\n")
+    f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n\n")
+
     f.write(f"### Riassunto Performance\n")
     f.write(f"| Average Type | Precision | Recall | F1-Score |\n")
     f.write(f"|:-------------|----------:|-------:|---------:|\n")

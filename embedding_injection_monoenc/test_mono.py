@@ -19,6 +19,7 @@ import os
 from tqdm import tqdm
 import subprocess
 import datetime
+import time
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
@@ -26,8 +27,8 @@ import datetime
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-DATASET = '../dataset_bc5cdr/'
-#DATASET = '../dataset/'
+#DATASET = '../dataset_bc5cdr/'
+DATASET = '../dataset/'
 
 
 TEST_PATH = DATASET + 'test_dataset_tknlvl_mono.json'
@@ -355,6 +356,7 @@ checkpoint_interval = max(1, total_records // 5)
 print(f"\n📊 Mostro metriche ogni {checkpoint_interval} record (~20%)\n")
 
 print(f"Testing...")
+infer_start_time = time.time()
 with torch.no_grad():
     for idx, rec in enumerate(tqdm(test_data), 1):
         tokens = rec["tokens"]
@@ -478,6 +480,10 @@ with torch.no_grad():
 if n_span_skipped > 0:
     print(f"⚠️  {n_span_skipped} record saltati nella valutazione span.")
 
+infer_time = time.time() - infer_start_time
+samples_per_sec = len(test_data) / infer_time if infer_time > 0 else 0
+tokens_per_sec = len(y_true) / infer_time if infer_time > 0 else 0
+
 # ==========================================================
 # 8️⃣ METRICS & SAVING
 # ==========================================================
@@ -489,6 +495,8 @@ micro_p, micro_r, micro_f1, _ = precision_recall_fscore_support(
 )
 
 print(f"\n🏆 GLOBAL TOKEN-LEVEL METRICS (No O Class):")
+print(f"   • Tempo Inferenza: {infer_time:.2f} s")
+print(f"   • Velocità: {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
 print(f"   • MACRO: F1={macro_f1:.4f}")
 print(f"   • MICRO: F1={micro_f1:.4f}")
 
@@ -534,6 +542,9 @@ with open(filename, "w", encoding="utf-8") as f:
 
     f.write(f"## Metriche Chiave\n")
     f.write(f"| Metric | Value |\n|---|---|\n")
+    f.write(f"| **Tempo Inferenza** | {infer_time:.2f} s |\n")
+    f.write(f"| **Samples/s** | {samples_per_sec:.2f} |\n")
+    f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n")
     f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
     f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
     

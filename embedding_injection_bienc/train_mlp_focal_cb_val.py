@@ -562,8 +562,12 @@ for epoch in range(1, EPOCHS + 1):
     epoch_duration = epoch_end_time - epoch_start_time
     epoch_times.append(epoch_duration)
     
+    it_per_sec = len(train_loader) / train_duration if train_duration > 0 else 0
+    samples_per_sec = it_per_sec * BATCH_SIZE
+    
     print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
     print(f"⏰ Epoch {epoch}/{EPOCHS} - End: {datetime.now().strftime('%H:%M:%S')} | Train: {train_duration:.2f}s | Val: {val_duration:.2f}s | Total: {epoch_duration:.2f}s")
+    print(f"⚡ Throughput: {it_per_sec:.2f} it/s | {samples_per_sec:.2f} samples/s")
     
     # Salva se migliora la VALIDATION loss (Early Stopping proxy)
     if avg_val_loss < best_loss:
@@ -637,6 +641,9 @@ if epoch_times:
     avg_train_time = total_train_time / len(train_times)
     avg_val_time = total_val_time / len(val_times)
     
+    avg_it_per_sec = len(train_loader) / avg_train_time if avg_train_time > 0 else 0
+    avg_samples_per_sec = avg_it_per_sec * BATCH_SIZE
+    
     print(f"\n📊 TIMING REPORT:")
     print(f"   Total Training Time: {total_time:.2f}s ({total_time/60:.2f}m)")
     print(f"   Total Train Phase Time: {total_train_time:.2f}s ({total_train_time/60:.2f}m)")
@@ -646,6 +653,7 @@ if epoch_times:
     print(f"   Average Validation Phase Time: {avg_val_time:.2f}s")
     print(f"   Min Epoch Time: {min(epoch_times):.2f}s")
     print(f"   Max Epoch Time: {max(epoch_times):.2f}s")
+    print(f"   Average Training Throughput: {avg_it_per_sec:.2f} it/s | {avg_samples_per_sec:.2f} samples/s")
     print(f"   Completed Epochs: {len(epoch_times)}/{EPOCHS}")
 
 try:

@@ -15,14 +15,15 @@ import os
 import datetime
 import argparse
 import re
+import time
 
 # ==========================================================
 # 🔧 CONFIGURAZIONE
 # ==========================================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-#PATH_DATASET = "../dataset"
-PATH_DATASET = "../dataset_bc5cdr"
+PATH_DATASET = "../dataset"
+#PATH_DATASET = "../dataset_bc5cdr"
 
 TEST_PATH = PATH_DATASET + "/test_dataset_tknlvl_bi.json"
 TEST_SPAN_PATH = PATH_DATASET + "/test_dataset_span_bi.json"
@@ -358,6 +359,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         label_matrix = compute_label_matrix_from_soft_table(soft_table, proj).to(DEVICE)
         
+        infer_start_time = time.time()
         for idx, record in enumerate(test_records):
             tokens = record["tokens"]
             labels = record["labels"]
@@ -436,6 +438,10 @@ if __name__ == "__main__":
                     )[2]
                     print(f"\n [{progress:5.1f}%] Macro F1 (No-O): {_mf1:.4f} | Micro F1 (No-O): {_uf1:.4f} | Tokens: {len(y_true_all):,}")
 
+    infer_time = time.time() - infer_start_time
+    samples_per_sec = len(test_records) / infer_time if infer_time > 0 else 0
+    tokens_per_sec = len(y_true_all) / infer_time if infer_time > 0 else 0
+
     # 4. Report
     if n_span_skipped > 0:
         print(f"⚠️  {n_span_skipped} esempi saltati nella valutazione span (indice fuori range).")
@@ -477,6 +483,8 @@ if __name__ == "__main__":
     print(f"{'='*70}")
     print(f"Checkpoint: {checkpoint_filename}")
     print(f"Token valutati: {len(y_true_all):,}")
+    print(f"Tempo di inferenza:  {infer_time:.2f} s")
+    print(f"Velocità:            {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
     
     print(f"\n🎯 METRICHE AGGREGATE (Tutte le label inclusa 'O'):")
     print(f"  Macro F1:          {f1_macro:.4f}")
@@ -559,6 +567,9 @@ if __name__ == "__main__":
                 f.write(f"- **{k}:** {v}\n")
         
         f.write(f"\n## Metriche aggregate (Standard)\n")
+        f.write(f"- **Token valutati:** {len(y_true_all):,}\n")
+        f.write(f"- **Tempo Inferenza:** {infer_time:.2f} s\n")
+        f.write(f"- **Velocità:** {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s\n\n")
         f.write(f"- **Macro F1:** {f1_macro:.4f}\n")
         f.write(f"- **Micro F1:** {f1_micro:.4f}\n")
 

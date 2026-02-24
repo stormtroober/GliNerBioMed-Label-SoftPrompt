@@ -123,6 +123,10 @@ def calculate_metrics(dataset, model, batch_size=8, config=None, save_dir=None):
     fn = defaultdict(int)
     support = defaultdict(int)
     
+    import time
+    start_time = time.time()
+    num_batches = (len(dataset) + batch_size - 1) // batch_size
+    
     # Process in batches
     for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
         batch_items = dataset[i:i+batch_size]
@@ -178,6 +182,15 @@ def calculate_metrics(dataset, model, batch_size=8, config=None, save_dir=None):
             for l, s, e in tps: tp[l] += 1
             for l, s, e in fps: fp[l] += 1
             for l, s, e in fns: fn[l] += 1
+
+    total_time = time.time() - start_time
+    iterations_per_second = num_batches / total_time if total_time > 0 else 0
+    samples_per_second = len(dataset) / total_time if total_time > 0 else 0
+
+    print(f"\n⏱️ INFERENCE TIMING INFO:")
+    print(f"  Total time: {total_time:.2f}s")
+    print(f"  Average Iterations/sec: {iterations_per_second:.2f} it/s")
+    print(f"  Average Samples/sec: {samples_per_second:.2f} samples/s\n")
 
     # Calculate Global Metrics
     p_s, r_s, f1_s = [], [], []
@@ -259,6 +272,11 @@ def calculate_metrics(dataset, model, batch_size=8, config=None, save_dir=None):
 | :--- | :--- | :--- | :--- |
 | **Macro** | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |
 | **Micro** | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |
+
+## Time & Performance
+- **Total Inference Time**: {total_time:.2f} s
+- **Iterations/sec**: {iterations_per_second:.2f} it/s
+- **Samples/sec**: {samples_per_second:.2f} samples/s
 
 ## Dataset Info
 - **Test Samples**: {len(dataset)}
@@ -363,7 +381,7 @@ def main():
         path = "/kaggle/input/jnlpa15k/"
         model_name = '/kaggle/input/glinerbismall2/'
     else:
-        path = "../dataset_bc5cdr/"
+        path = "../dataset/"
         model_name = "Ihor/gliner-biomed-bi-small-v1.0"
 
     test_path = path + "test_dataset_span_bi.json"

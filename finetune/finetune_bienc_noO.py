@@ -326,11 +326,15 @@ trainer = model.train_model(
 total_time = time.time() - start_time
 time_per_epoch = total_time / num_train_epochs
 time_per_step = total_time / total_steps
+it_per_sec = 1.0 / time_per_step if time_per_step > 0 else 0
+samples_per_sec = it_per_sec * batch_size
 
 print(f"\n⏱️ TRAINING COMPLETE:")
 print(f"  Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
 print(f"  Time per epoch: {time_per_epoch:.2f}s ({time_per_epoch/60:.2f} min)")
-print(f"  Time per step: {time_per_step:.2f}s\n")
+print(f"  Time per step: {time_per_step:.2f}s")
+print(f"  Iterations/sec: {it_per_sec:.2f} it/s")
+print(f"  Samples/sec: {samples_per_sec:.2f} samples/s\n")
 
 # Save the best model
 best_model_path = "models_short_label/best_model"
@@ -369,6 +373,8 @@ checkpoint = {
         "total_time_seconds": total_time,
         "time_per_epoch_seconds": time_per_epoch,
         "time_per_step_seconds": time_per_step,
+        "iterations_per_second": it_per_sec,
+        "samples_per_second": samples_per_sec,
         "total_steps": total_steps,
         "exclude_O_class": True,
         "timestamp": timestamp

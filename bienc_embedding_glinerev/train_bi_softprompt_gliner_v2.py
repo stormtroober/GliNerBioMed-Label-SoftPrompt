@@ -315,12 +315,24 @@ class SoftGlinerTrainer:
             gliner.training.Trainer = original_trainer_cls
         
         total_time = time.time() - start_time
+        total_steps = steps_per_epoch * self.config["num_epochs"]
         time_per_epoch = total_time / self.config["num_epochs"]
+        time_per_step = total_time / total_steps if total_steps > 0 else 0
+        iterations_per_second = 1.0 / time_per_step if time_per_step > 0 else 0
+        samples_per_second = iterations_per_second * self.config["batch_size"]
+        
+        self.training_metrics = {
+            "total_time_seconds": total_time,
+            "time_per_epoch_seconds": time_per_epoch,
+            "iterations_per_second": iterations_per_second,
+            "samples_per_second": samples_per_second
+        }
         
         print(f"\n⏱️ TRAINING COMPLETE:")
         print(f"  Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
-        print(f"  Time per epoch: {time_per_epoch:.2f}s ({time_per_epoch/60:.2f} min)")
-        print(f"  Time per step: {total_time / (steps_per_epoch * self.config['num_epochs']):.2f}s\n")
+        print(f"  Average Time per epoch: {time_per_epoch:.2f}s ({time_per_epoch/60:.2f} min)")
+        print(f"  Average Iterations/sec: {iterations_per_second:.2f} it/s")
+        print(f"  Average Samples/sec: {samples_per_second:.2f} samples/s\n")
         
         return trainer
 
@@ -575,7 +587,10 @@ print("="*50)
 
 trainer_wrapper = SoftGlinerTrainer(
     model=model, train_dataset=train_dataset, val_dataset=val_dataset,
-    batch_size=16, num_epochs=15, learning_rate=1e-4, prompt_encoder_lr=0.00972703093124308, others_lr=0.00017752997104569565, freeze_backbone=True
+    batch_size=16,
+     #num_epochs=15,
+     num_epochs=2,
+      learning_rate=1e-4, prompt_encoder_lr=0.00972703093124308, others_lr=0.00017752997104569565, freeze_backbone=True
 )
 
 print("Starting training...")
@@ -658,6 +673,9 @@ checkpoint = {
     
     # Timestamp
     "timestamp": timestamp,
+    
+    # Metriche di addestramento (tempi, iterazioni, ecc)
+    "training_metrics": getattr(trainer_wrapper, 'training_metrics', {}),
     
     # Metriche del test
     "test_metrics": metrics,

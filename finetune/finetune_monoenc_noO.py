@@ -9,8 +9,8 @@ from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
 import torch
-from gliner import GLiNER
 import shutil
+import time
 
 # Seed for reproducibility
 RANDOM_SEED = 42
@@ -289,6 +289,17 @@ use_fp16 = use_cuda and not use_bf16
 save_steps = 100
 logging_steps = save_steps
 
+print(f"\n⏱️ TRAINING TIMING INFO:")
+print(f"  Samples: {data_size}")
+print(f"  Batch size: {batch_size}")
+print(f"  Steps per epoch: {num_batches_per_epoch}")
+print(f"  Logging every: {logging_steps} steps")
+print(f"  Saving every: {save_steps} steps")
+print(f"  Total epochs: {num_train_epochs}")
+print(f"  Total steps: {total_steps}\n")
+
+start_time = time.time()
+
 trainer = model.train_model(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,  # ✅ Usa validation set, NON test set
@@ -316,6 +327,19 @@ trainer = model.train_model(
     fp16=use_fp16,
     report_to="none",
     )
+
+total_time = time.time() - start_time
+time_per_epoch = total_time / num_train_epochs
+time_per_step = total_time / total_steps
+it_per_sec = 1.0 / time_per_step if time_per_step > 0 else 0
+samples_per_sec = it_per_sec * batch_size
+
+print(f"\n⏱️ TRAINING COMPLETE:")
+print(f"  Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
+print(f"  Time per epoch: {time_per_epoch:.2f}s ({time_per_epoch/60:.2f} min)")
+print(f"  Time per step: {time_per_step:.2f}s")
+print(f"  Iterations/sec: {it_per_sec:.2f} it/s")
+print(f"  Samples/sec: {samples_per_sec:.2f} samples/s\n")
 
 from datetime import datetime
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -345,6 +369,12 @@ checkpoint = {
         "logging_steps": logging_steps,
         "random_seed": RANDOM_SEED,
         "focal_loss_gamma": FOCAL_LOSS_GAMMA,
+        "total_time_seconds": total_time,
+        "time_per_epoch_seconds": time_per_epoch,
+        "time_per_step_seconds": time_per_step,
+        "iterations_per_second": it_per_sec,
+        "samples_per_second": samples_per_sec,
+        "total_steps": total_steps,
         "timestamp": timestamp
     }
 }

@@ -19,6 +19,7 @@ from sklearn.metrics import precision_recall_fscore_support, classification_repo
 from collections import Counter, defaultdict
 import numpy as np
 import os
+import time
 from datetime import datetime
 
 # ==========================================================
@@ -265,6 +266,7 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
     with torch.no_grad():
         label_matrix = compute_label_matrix(label2desc, lbl_tok, lbl_enc, proj).to(DEVICE)
         
+        infer_start_time = time.time()
         for idx, record in enumerate(test_records):
             tokens = record["tokens"]
             labels = record["labels"]
@@ -340,6 +342,10 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
                     )[2]
                     print(f"\n [{progress:5.1f}%] Macro F1: {_mf1:.4f} | Micro F1: {_uf1:.4f} | Tokens: {len(y_true_all):,}")
 
+    infer_time = time.time() - infer_start_time
+    samples_per_sec = len(test_records) / infer_time if infer_time > 0 else 0
+    tokens_per_sec = len(y_true_all) / infer_time if infer_time > 0 else 0
+
     if span_records is not None and n_span_skipped > 0:
         print(f"⚠️  {n_span_skipped} esempi saltati nella valutazione span (indice fuori range).")
 
@@ -363,6 +369,8 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
     print(f"📊 RISULTATI - {model_name}")
     print(f"{'='*60}")
     print(f"Totale token valutati: {len(y_true_all)}")
+    print(f"Tempo di inferenza:  {infer_time:.2f} s")
+    print(f"Velocità:            {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
     print(f"\n🎯 METRICHE TOKEN-LEVEL AGGREGATE (No 'O' class):")
     print(f"  Macro F1:  {f1_macro:.4f}")
     print(f"  Micro F1:  {f1_micro:.4f}")
@@ -447,7 +455,9 @@ def evaluate_model(txt_enc, lbl_enc, proj, txt_tok, lbl_tok, model_name, checkpo
                 f.write(f"- **Modello Base:** `{training_info.get('model_name', 'N/A')}`\n\n")
         
         f.write(f"## Risultati Test\n\n")
-        f.write(f"**Token valutati:** {len(y_true_all)}\n\n")
+        f.write(f"- **Token valutati:** {len(y_true_all)}\n")
+        f.write(f"- **Tempo Inferenza:** {infer_time:.2f} s\n")
+        f.write(f"- **Velocità:** {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s\n\n")
         
         f.write(f"### Metriche Token-Level Aggregate (No 'O' class)\n\n")
         f.write(f"| Metrica | Valore |\n")

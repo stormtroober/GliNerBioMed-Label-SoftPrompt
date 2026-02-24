@@ -23,6 +23,7 @@ DATASET_DIRS = {
 # ==========================================
 def calculate_metrics(dataset, model, batch_size=8):
     import gc
+    import time
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
@@ -43,6 +44,7 @@ def calculate_metrics(dataset, model, batch_size=8):
     fn = defaultdict(int)
     support = defaultdict(int)
     
+    infer_start_time = time.time()
     for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
         batch_items = dataset[i:i+batch_size]
         batch_texts = [" ".join(d['tokenized_text']) for d in batch_items]
@@ -92,6 +94,12 @@ def calculate_metrics(dataset, model, batch_size=8):
             for l, s, e in fps: fp[l] += 1
             for l, s, e in fns: fn[l] += 1
 
+    infer_time = time.time() - infer_start_time
+    total_samples = len(dataset)
+    total_tokens = sum(len(d['tokenized_text']) for d in dataset)
+    samples_per_sec = total_samples / infer_time if infer_time > 0 else 0
+    tokens_per_sec = total_tokens / infer_time if infer_time > 0 else 0
+
     p_s, r_s, f1_s = [], [], []
     valid_labels = [l for l in label_list if support[l] > 0 or fp[l] > 0] 
     
@@ -131,13 +139,15 @@ def calculate_metrics(dataset, model, batch_size=8):
     micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
     
     print("\n## 📈 Global Metrics (From .pt checkpoint)\n")
+    print(f"   • Tempo Inferenza: {infer_time:.2f} s")
+    print(f"   • Velocità: {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
     print(f"### Performance Summary")
     print(f"| Average Type | Precision | Recall | F1-Score |")
     print(f"|:-------------|----------:|-------:|---------:|")
     print(f"| **Macro**    | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |")
     print(f"| **Micro**    | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |")
 
-    return macro_f1, micro_f1, "\n".join(report_lines)
+    return macro_f1, micro_f1, "\n".join(report_lines), infer_time, samples_per_sec, tokens_per_sec
 
 def convert_ids_to_labels(dataset, id_map):
     converted_count = 0
@@ -464,7 +474,7 @@ def main():
     test_dataset = convert_ids_to_labels(test_dataset, id2label)
     print(f'Final Test dataset size: {len(test_dataset)}')
     
-    macro_f1, micro_f1, report_str = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
+    macro_f1, micro_f1, report_str, infer_time, samples_per_sec, tokens_per_sec = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
     
     # Export Results
     TEST_RESULTS_DIR = os.path.join(script_dir, "test/results")
@@ -495,6 +505,9 @@ def main():
         # Metrics Section
         f.write("## 📊 Metriche Chiave\n")
         f.write("| Metric | Value |\n|---|---|\n")
+        f.write(f"| **Tempo Inferenza** | {infer_time:.2f} s |\n")
+        f.write(f"| **Samples/s** | {samples_per_sec:.2f} |\n")
+        f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n")
         f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
         f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
         

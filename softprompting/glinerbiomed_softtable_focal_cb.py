@@ -374,11 +374,17 @@ for epoch in range(1, EPOCHS + 1):
         
     avg_loss = total_loss / len(train_loader)
     epoch_time = time.time() - epoch_start_time
-    print(f"Epoch {epoch} | Train Loss: {avg_loss:.4f} | Time: {epoch_time:.1f}s")
+    train_it_per_sec = len(train_loader) / epoch_time
+    samples_per_sec = train_it_per_sec * BATCH_SIZE
+    current_lr_embed = optimizer.param_groups[0]['lr']
+    current_lr_proj = optimizer.param_groups[1]['lr']
     
     # VALIDATION
+    val_start_time = time.time()
     val_macro_f1, val_micro_f1 = validate(val_records, txt_enc, txt_tok, soft_table, proj, DEVICE)
-    print(f"Epoch {epoch} | Val Macro F1: {val_macro_f1:.4f} | Val Micro F1: {val_micro_f1:.4f}")
+    val_time = time.time() - val_start_time
+    
+    print(f"Epoch {epoch}/{EPOCHS} | train_loss={avg_loss:.4f} | val_macro_f1={val_macro_f1:.4f} val_micro_f1={val_micro_f1:.4f} | lr_embed={current_lr_embed:.2e} lr_proj={current_lr_proj:.2e} | train_time={epoch_time:.1f}s val_time={val_time:.1f}s | train_it/s={train_it_per_sec:.2f} samples/s={samples_per_sec:.2f}")
     
     # Check Early Stopping & Saving Best
     is_improved = early_stopping(val_macro_f1)

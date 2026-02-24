@@ -518,12 +518,16 @@ for epoch in range(1, EPOCHS + 1):
     val_mins, val_secs = divmod(val_time, 60)
     total_mins, total_secs = divmod(total_epoch_time, 60)
     
+    it_per_sec = len(train_loader) / train_time if train_time > 0 else 0
+    samples_per_sec = it_per_sec * BATCH_SIZE
+    
     print(f"\n{'='*80}")
     print(f"Epoch {epoch}/{EPOCHS} Summary:")
     print(f"  Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
     print(f"  Training Time:   {int(train_mins):2d}m {int(train_secs):02d}s")
     print(f"  Validation Time: {int(val_mins):2d}m {int(val_secs):02d}s")
     print(f"  Total Time:      {int(total_mins):2d}m {int(total_secs):02d}s")
+    print(f"  Throughput:      {it_per_sec:.2f} it/s | {samples_per_sec:.2f} samples/s")
     print(f"{'='*80}\n")
     
     # Save & Early Stopping (Structure Updated)

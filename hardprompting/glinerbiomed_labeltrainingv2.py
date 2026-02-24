@@ -36,7 +36,7 @@ VAL_SPLIT_RATIO = 0.2  # Usato solo se USE_SEPARATE_VAL_FILE = False
 # 🔄 Flag per gestione validation:
 # - True: usa file di validation separato (es. dataset_anatEM ha val_dataset_tknlvl_bi.json)
 # - False: split del training set (80% train, 20% val)
-USE_SEPARATE_VAL_FILE = False
+USE_SEPARATE_VAL_FILE = True
 
 # ==========================================
 # KAGGLE / LOCAL PATHS
@@ -325,6 +325,10 @@ for epoch in range(1, EPOCHS + 1):
         lbl_enc, proj, txt_enc, label2desc, optimizer, scheduler
     )
     
+    train_end_time = time.time()
+    train_duration = train_end_time - epoch_start_time
+    train_it_per_sec = len(train_loader) / train_duration if train_duration > 0 else 0
+    
     # ✨ Validation
     val_loss, val_acc = run_validation_epoch(
         tqdm(val_loader, desc=f"Epoch {epoch}/{EPOCHS} [Val]", leave=False),
@@ -340,7 +344,8 @@ for epoch in range(1, EPOCHS + 1):
     
     current_lr = scheduler.get_last_lr()[0]
     print(f"Epoch {epoch}/{EPOCHS} | train_loss={train_loss:.4f} train_acc={train_acc:.1f}% | "
-          f"val_loss={val_loss:.4f} val_acc={val_acc:.1f}% | lr={current_lr:.2e} | time={epoch_time:.1f}s")
+          f"val_loss={val_loss:.4f} val_acc={val_acc:.1f}% | lr={current_lr:.2e} | "
+          f"time={epoch_time:.1f}s | train_it/s={train_it_per_sec:.2f}")
     
     # ✨ Early stopping check basato su validation loss
     early_stopping(val_loss)
