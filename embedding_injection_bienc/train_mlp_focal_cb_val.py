@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import os
 import numpy as np
 import time
+from datetime import datetime, timedelta
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from collections import Counter
@@ -51,7 +52,7 @@ else:
     input_dir = "../dataset/"
     MODEL_NAME = "Ihor/gliner-biomed-bi-small-v1.0"
 
-DATASET_PATH = input_dir + "dataset_tokenlevel_simple.json"
+DATASET_PATH = input_dir + "dataset_tknlvl_bi.json"
 VAL_PATH = input_dir + "val_dataset_tknlvl_bi.json"
 LABEL2DESC_PATH = input_dir + "label2desc.json"
 LABEL2ID_PATH = input_dir + "label2id.json"    
@@ -293,6 +294,50 @@ prompt_encoder = MLPPromptEncoder(
 ).to(DEVICE)
 
 print(f"✨ MLP Prompt Encoder creato. Prompt Length: {PROMPT_LEN if PROMPT_LEN else 'Originale'}, Mode: {POOLING_MODE}")
+
+# ==========================================================
+# 🔢 PARAMETER SUMMARY
+# ==========================================================
+print("\n" + "="*70)
+print("PARAMETER SUMMARY (Training Method: MLP Prompt Encoder / Bi-Encoder)")
+print("="*70)
+print(f"  {'Component':<25} {'Total':>13}  {'Trainable':>13}  {'% Trainable'}")
+print(f"  {'-'*25} {'-'*13} {'-'*13} {'-'*12}")
+
+# Param ids EFFETTIVAMENTE nell'optimizer per i componenti GLiNER
+# rnn/span_rep_layer/prompt_rep_layer hanno requires_grad=True di default
+# ma non sono mai nel computation graph → mai aggiornati
+_trained_ids_gliner = {id(p) for p in proj.parameters()} if TRAIN_PROJECTION else set()
+
+_total_all = 0
+_trainable_all = 0
+
+# Itera su TUTTI i children del modello GLiNER caricato
+for _comp_name, _comp in model.model.named_children():
+    _comp_total     = sum(p.numel() for p in _comp.parameters())
+    _comp_trainable = sum(p.numel() for p in _comp.parameters() if id(p) in _trained_ids_gliner)
+    _comp_pct       = (_comp_trainable / _comp_total * 100) if _comp_total > 0 else 0.0
+    _status = "🔥" if _comp_trainable > 0 else "❄️"
+    print(f"  {_status} {_comp_name:<23} {_comp_total:>13,}  {_comp_trainable:>13,}  {_comp_pct:>10.2f}%")
+    _total_all     += _comp_total
+    _trainable_all += _comp_trainable
+
+# prompt_encoder è esterno al modello GLiNER
+# Escludo la embedding table (copia del vocab backbone): non è un parametro "nuovo"
+_pe_emb_size  = prompt_encoder.embedding.weight.numel()
+_pe_total_raw = sum(p.numel() for p in prompt_encoder.parameters())
+_pe_total     = _pe_total_raw - _pe_emb_size  # senza embedding table
+_pe_trainable = sum(p.numel() for p in prompt_encoder.parameters() if p.requires_grad) - _pe_emb_size
+_pe_pct       = (_pe_trainable / _pe_total * 100) if _pe_total > 0 else 0.0
+print(f"  🔥 {'prompt_encoder (MLP)':<23} {_pe_total:>13,}  {_pe_trainable:>13,}  {_pe_pct:>10.2f}%")
+print(f"  ·  {'  (emb table excl.)':<23} {_pe_emb_size:>13,}  {'[excluded]':>13}")
+_total_all     += _pe_total
+_trainable_all += _pe_trainable
+
+print(f"  {'-'*25} {'-'*13} {'-'*13} {'-'*12}")
+print(f"  {'TOTAL (excl. emb table)':<25} {_total_all:>13,}  {_trainable_all:>13,}")
+print(f"\n  📊 Trainable params (absolute): {_trainable_all:,}  ({_trainable_all / _total_all * 100:.2f}% of total)")
+print("="*70 + "\n")
 
 class TokenJsonDataset(Dataset):
     def __init__(self, path_json, tokenizer):

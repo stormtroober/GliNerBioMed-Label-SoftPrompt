@@ -83,6 +83,39 @@ for p in lbl_enc.parameters(): p.requires_grad = True
 for p in proj.parameters(): p.requires_grad = True
 
 # ==========================================================
+# 🔢 PARAMETER SUMMARY
+# ==========================================================
+print("\n" + "="*70)
+print("PARAMETER SUMMARY (Training Method: Hard Prompting / Label Encoder FT)")
+print("="*70)
+print(f"  {'Component':<25} {'Total':>13}  {'Trainable':>13}  {'% Trainable'}")
+print(f"  {'-'*25} {'-'*13} {'-'*13} {'-'*12}")
+
+# Param ids EFFETTIVAMENTE nell'optimizer (lbl_enc + proj)
+# rnn/span_rep_layer/prompt_rep_layer hanno requires_grad=True di default
+# ma non sono mai nel computation graph → mai aggiornati
+_trained_ids = (
+    {id(p) for p in lbl_enc.parameters()} |
+    {id(p) for p in proj.parameters()}
+)
+
+_total_all = 0
+_trainable_all = 0
+for _comp_name, _comp in core.named_children():
+    _comp_total     = sum(p.numel() for p in _comp.parameters())
+    _comp_trainable = sum(p.numel() for p in _comp.parameters() if id(p) in _trained_ids)
+    _comp_pct       = (_comp_trainable / _comp_total * 100) if _comp_total > 0 else 0.0
+    _status = "🔥" if _comp_trainable > 0 else "❄️"
+    print(f"  {_status} {_comp_name:<23} {_comp_total:>13,}  {_comp_trainable:>13,}  {_comp_pct:>10.2f}%")
+    _total_all     += _comp_total
+    _trainable_all += _comp_trainable
+
+print(f"  {'-'*25} {'-'*13} {'-'*13} {'-'*12}")
+print(f"  {'TOTAL':<25} {_total_all:>13,}  {_trainable_all:>13,}")
+print(f"\n  📊 Trainable params (absolute): {_trainable_all:,}  ({_trainable_all / _total_all * 100:.2f}% of total)")
+print("="*70 + "\n")
+
+# ==========================================================
 # 1️⃣ LABELS E DESCRIZIONI
 # ==========================================================
 with open(LABEL2DESC_PATH) as f: label2desc = json.load(f)

@@ -2,10 +2,13 @@
 test_baseline.py — Valutazione span-based del modello GLiNER baseline (no fine-tuning).
 
 Testa il modello baseline (bi-encoder o mono-encoder) su test_dataset_span_bi.json
-con la stessa utility di evaluate di finetune/test_finetuned.py:
+(bi) o test_dataset_span_mono.json (mono) con la stessa utility di evaluate di
+finetune/test_finetuned.py:
   - span exact-match (char → token mapping)
   - RUN 1 — NAMES:        label brevi ("protein", "dna", ...) come entity type
   - RUN 2 — DESCRIPTIONS: descrizioni estese da label2desc.json come entity type
+                           (per il mono-encoder le descrizioni sono troncate
+                            automaticamente al budget disponibile di token)
 
 Uso:
     python test_baseline.py
@@ -49,22 +52,30 @@ def calculate_metrics(dataset, model, label_list, batch_size=8):
         batch_size: dimensione batch per l'inferenza
 
     Returns:
-        (macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_str)
+        (macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_str,
+         total_inference_time, avg_iter_per_sec, samples_per_sec)
     """
     import gc
+    import time
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
 
     label_list = sorted(list(set(label_list)))
-    print(f"\nEvaluating on {len(dataset)} samples with {len(label_list)} labels: {label_list}")
+    n_samples = len(dataset)
+    print(f"\nEvaluating on {n_samples} samples with {len(label_list)} labels: {label_list}")
 
     tp = defaultdict(int)
     fp = defaultdict(int)
     fn = defaultdict(int)
     support = defaultdict(int)
 
-    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
+    batch_indices = list(range(0, n_samples, batch_size))
+    n_batches = len(batch_indices)
+
+    inference_start = time.perf_counter()
+
+    for i in tqdm(batch_indices, desc="Evaluating"):
         batch_items = dataset[i:i + batch_size]
         # GLiNER si aspetta testo stringa, non token separati
         batch_texts = [" ".join(d["tokenized_text"]) for d in batch_items]
@@ -116,6 +127,14 @@ def calculate_metrics(dataset, model, label_list, batch_size=8):
             for lbl, s, e in fps: fp[lbl] += 1
             for lbl, s, e in fns: fn[lbl] += 1
 
+    total_inference_time = time.perf_counter() - inference_start
+    avg_iter_per_sec = n_batches / total_inference_time if total_inference_time > 0 else 0.0
+    samples_per_sec  = n_samples / total_inference_time if total_inference_time > 0 else 0.0
+
+    print(f"\n⏱  Inference time : {total_inference_time:.2f}s")
+    print(f"   Avg iter/sec   : {avg_iter_per_sec:.2f}")
+    print(f"   Samples/sec    : {samples_per_sec:.2f}")
+
     # --- Per-label report ---
     valid_labels = sorted(set(list(tp.keys()) + list(fn.keys())))
     p_list, r_list, f1_list = [], [], []
@@ -158,7 +177,12 @@ def calculate_metrics(dataset, model, label_list, batch_size=8):
     print(f"| **Macro** | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |")
     print(f"| **Micro** | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |")
 
-    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, "\n".join(report_lines)
+    return (
+        macro_p, macro_r, macro_f1,
+        micro_p, micro_r, micro_f1,
+        "\n".join(report_lines),
+        total_inference_time, avg_iter_per_sec, samples_per_sec,
+    )
 
 
 def convert_ids_to_labels(dataset, id2label, filter_o=True):
@@ -183,34 +207,118 @@ def convert_ids_to_labels(dataset, id2label, filter_o=True):
     return new_dataset
 
 
-def calculate_metrics_with_desc(dataset, model, label2desc, batch_size=8):
+def compute_desc_max_tokens(model, label2desc, dataset, encoder_type,
+                             model_max_length=512, text_budget_tokens=150,
+                             overhead_tokens=16):
+    """
+    Calcola quanti token sono disponibili per ciascuna descrizione nel mono-encoder.
+
+    Per il mono-encoder GLiNER il template della sequenza è:
+        [CLS] <label1> [SEP] <label2> [SEP] ... [SEP] <token1> ... <tokenN> [SEP]
+    Tutto deve stare in model_max_length token.
+
+    Per il bi-encoder le label vengono encodate separatamente dal testo,
+    quindi non c'è limite pratico → ritorna None (nessun troncamento).
+
+    Args:
+        model:              istanza GLiNER già caricata
+        label2desc:         dict {nome_breve: descrizione}
+        dataset:            dataset di test (per stimare la lunghezza media del testo)
+        encoder_type:       "bi" | "mono"
+        model_max_length:   max token del modello (default 512)
+        text_budget_tokens: token riservati al testo (conservativo)
+        overhead_tokens:    token overhead (CLS, SEP per ogni label, ecc.)
+
+    Returns:
+        max_tokens_per_desc (int) oppure None se nessun troncamento necessario
+    """
+    if encoder_type == "bi":
+        print("  ℹ️  Bi-encoder: le label sono processate separatamente → nessun troncamento.")
+        return None
+
+    num_labels = len([k for k in label2desc if k != "O"])
+    if num_labels == 0:
+        return None
+
+    # Token stimati per i separatori (ogni label aggiunge ~2 token: [SEP] + whitespace)
+    sep_budget = num_labels * 2
+
+    # Budget disponibile per TUTTE le descrizioni
+    available = model_max_length - text_budget_tokens - overhead_tokens - sep_budget
+    available = max(available, num_labels * 5)  # almeno 5 token per label
+
+    # Budget per ciascuna descrizione
+    per_desc = available // num_labels
+
+    print(f"  ℹ️  Mono-encoder max_length={model_max_length}: "
+          f"{num_labels} label × {per_desc} token/label "
+          f"(text_budget={text_budget_tokens}, overhead={overhead_tokens+sep_budget})")
+    return per_desc
+
+
+def truncate_desc_by_tokens(desc, tokenizer, max_tokens):
+    """
+    Trunca una descrizione a max_tokens token usando il tokenizer del modello.
+    Aggiunge '...' se la stringa è stata troncata.
+    """
+    tokens = tokenizer.encode(desc, add_special_tokens=False)
+    if len(tokens) <= max_tokens:
+        return desc
+    truncated_ids = tokens[:max_tokens]
+    truncated_str = tokenizer.decode(truncated_ids, skip_special_tokens=True,
+                                     clean_up_tokenization_spaces=True)
+    return truncated_str.rstrip() + "..."
+
+
+def calculate_metrics_with_desc(dataset, model, label2desc, batch_size=8,
+                                max_tokens_per_desc=None):
     """
     Come calculate_metrics, ma usa le DESCRIZIONI estese come entity type passato a GLiNER.
     Il modello restituirà predizioni con label = descrizione;
     queste vengono rimappate al nome breve per il confronto con i GT span.
 
     Args:
-        dataset:    lista di record {"tokenized_text":[...], "ner":[[s,e,nome_breve],...]} 
-                    (già convertito con convert_ids_to_labels, filter_o=True)
-        model:      istanza GLiNER
-        label2desc: dict {nome_breve: descrizione_testuale}
-        batch_size: int
+        dataset:             lista di record {"tokenized_text":[...], "ner":[[s,e,nome_breve],...]} 
+                             (già convertito con convert_ids_to_labels, filter_o=True)
+        model:               istanza GLiNER
+        label2desc:          dict {nome_breve: descrizione_testuale}
+        batch_size:          int
+        max_tokens_per_desc: int oppure None. Se specificato, troncamento automatico
+                             delle descrizioni via tokenizer del modello.
 
     Returns:
-        (macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_str)
+        (macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_str,
+         total_inference_time, avg_iter_per_sec, samples_per_sec)
     """
     import gc
+    import time
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
 
-    # Costruiamo i due dizionari di mapping (escludiamo 'O')
-    name_to_desc = {k: v for k, v in label2desc.items() if k != "O"}
-    desc_to_name = {v: k for k, v in name_to_desc.items()}
-    desc_list = sorted(name_to_desc.values())          # lista descrizioni per il modello
-    label_list = sorted(name_to_desc.keys())           # nomi brevi, per i GT
+    # --- Troncamento descrizioni se richiesto ---
+    name_to_desc_orig = {k: v for k, v in label2desc.items() if k != "O"}
+    if max_tokens_per_desc is not None:
+        tokenizer = model.data_processor.transformer_tokenizer
+        name_to_desc = {}
+        print(f"\n  📐 Troncamento descrizioni a max {max_tokens_per_desc} token/label:")
+        for name, desc in name_to_desc_orig.items():
+            truncated = truncate_desc_by_tokens(desc, tokenizer, max_tokens_per_desc)
+            n_orig = len(tokenizer.encode(desc, add_special_tokens=False))
+            n_trunc = len(tokenizer.encode(truncated, add_special_tokens=False))
+            was_cut = "✂️" if n_trunc < n_orig else "✅"
+            print(f"    {was_cut} [{name}]: {n_orig} → {n_trunc} token")
+            name_to_desc[name] = truncated
+    else:
+        name_to_desc = name_to_desc_orig
 
-    print(f"\nEvaluating on {len(dataset)} samples — DESCRIPTION mode")
+    # Mapping bidirezionale desc ↔ nome breve (usato sia per l'input che per il match)
+    desc_to_name = {v: k for k, v in name_to_desc.items()}
+    desc_list  = sorted(name_to_desc.values())   # lista descrizioni (eventualmente troncate)
+    label_list = sorted(name_to_desc.keys())     # nomi brevi, per i GT
+
+    n_samples = len(dataset)
+    print(f"\nEvaluating on {n_samples} samples — DESCRIPTION mode")
     print(f"Using {len(desc_list)} descriptions (one per label, excluding 'O')")
 
     tp       = defaultdict(int)
@@ -218,7 +326,12 @@ def calculate_metrics_with_desc(dataset, model, label2desc, batch_size=8):
     fn       = defaultdict(int)
     support  = defaultdict(int)
 
-    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating (desc)"):
+    batch_indices = list(range(0, n_samples, batch_size))
+    n_batches = len(batch_indices)
+
+    inference_start = time.perf_counter()
+
+    for i in tqdm(batch_indices, desc="Evaluating (desc)"):
         batch_items = dataset[i:i + batch_size]
         batch_texts = [" ".join(d["tokenized_text"]) for d in batch_items]
 
@@ -247,7 +360,7 @@ def calculate_metrics_with_desc(dataset, model, label2desc, batch_size=8):
                     char_to_token[c] = t_i
                 cursor += len(token) + 1
 
-            # Predizioni: label è la descrizione → rimappa al nome breve
+            # Predizioni: label è la descrizione (eventualmente troncata) → rimappa al nome breve
             preds_raw = batch_preds[idx]
             pred_spans = set()
             for p in preds_raw:
@@ -269,6 +382,14 @@ def calculate_metrics_with_desc(dataset, model, label2desc, batch_size=8):
             for lbl, s, e in tps: tp[lbl] += 1
             for lbl, s, e in fps: fp[lbl] += 1
             for lbl, s, e in fns: fn[lbl] += 1
+
+    total_inference_time = time.perf_counter() - inference_start
+    avg_iter_per_sec = n_batches / total_inference_time if total_inference_time > 0 else 0.0
+    samples_per_sec  = n_samples / total_inference_time if total_inference_time > 0 else 0.0
+
+    print(f"\n⏱  Inference time : {total_inference_time:.2f}s")
+    print(f"   Avg iter/sec   : {avg_iter_per_sec:.2f}")
+    print(f"   Samples/sec    : {samples_per_sec:.2f}")
 
     # Report
     valid_labels = sorted(set(list(tp.keys()) + list(fn.keys())))
@@ -312,7 +433,12 @@ def calculate_metrics_with_desc(dataset, model, label2desc, batch_size=8):
     print(f"| **Macro** | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |")
     print(f"| **Micro** | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |")
 
-    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, "\n".join(report_lines)
+    return (
+        macro_p, macro_r, macro_f1,
+        micro_p, micro_r, micro_f1,
+        "\n".join(report_lines),
+        total_inference_time, avg_iter_per_sec, samples_per_sec,
+    )
 
 
 # ==========================================
@@ -378,7 +504,12 @@ def main():
 
     # --- Path dataset ---
     dataset_dir   = os.path.join(script_dir, DATASET_DIRS[dataset_name])
-    test_path     = os.path.join(dataset_dir, "test_dataset_span_bi.json")
+    # Il bi-encoder usa test_dataset_span_bi.json (span già in formato char-level compatibile)
+    # Il mono-encoder usa test_dataset_span_mono.json
+    if encoder_type == "bi":
+        test_path = os.path.join(dataset_dir, "test_dataset_span_bi.json")
+    else:
+        test_path = os.path.join(dataset_dir, "test_dataset_span_mono.json")
     label2id_path = os.path.join(dataset_dir, "label2id.json")
     label2desc_path = os.path.join(dataset_dir, LABEL2DESC_FILENAME)
 
@@ -440,7 +571,12 @@ def main():
     dataset_clean = convert_ids_to_labels(raw_dataset, id2label, filter_o=True)
     labels_clean  = sorted({lbl for item in dataset_clean for _, _, lbl in item["ner"]})
 
-    mac_p_n, mac_r_n, mac_f1_n, mic_p_n, mic_r_n, mic_f1_n, report_names = calculate_metrics(
+    (
+        mac_p_n, mac_r_n, mac_f1_n,
+        mic_p_n, mic_r_n, mic_f1_n,
+        report_names,
+        inf_time_n, iter_sec_n, samp_sec_n,
+    ) = calculate_metrics(
         dataset_clean, model, label_list=labels_clean, batch_size=args.batch_size
     )
 
@@ -451,9 +587,26 @@ def main():
     print("🔵 EVALUATION 2 — LABEL DESCRIPTIONS (Excluding 'O')")
     print("=" * 60)
 
+    # Calcola il budget di token per ciascuna descrizione
+    # (necessario solo per mono-encoder, dove label+testo devono stare in 512 token)
+    print("\nCalcolo budget token per le descrizioni...")
+    max_tokens_per_desc = compute_desc_max_tokens(
+        model=model,
+        label2desc=label2desc,
+        dataset=dataset_clean,
+        encoder_type=encoder_type,
+    )
+
     # dataset_clean già preparato sopra (stessi GT span, stessi nomi brevi)
-    mac_p_d, mac_r_d, mac_f1_d, mic_p_d, mic_r_d, mic_f1_d, report_desc = calculate_metrics_with_desc(
-        dataset_clean, model, label2desc=label2desc, batch_size=args.batch_size
+    (
+        mac_p_d, mac_r_d, mac_f1_d,
+        mic_p_d, mic_r_d, mic_f1_d,
+        report_desc,
+        inf_time_d, iter_sec_d, samp_sec_d,
+    ) = calculate_metrics_with_desc(
+        dataset_clean, model, label2desc=label2desc,
+        batch_size=args.batch_size,
+        max_tokens_per_desc=max_tokens_per_desc,
     )
 
     # ================================================================
@@ -476,6 +629,7 @@ def main():
         f.write(f"| **Encoder** | `{encoder_type}` |\n")
         f.write(f"| **Dataset** | `{dataset_name}` |\n")
         f.write(f"| **Test file** | `{os.path.basename(test_path)}` |\n")
+        f.write(f"| **Test samples** | `{len(dataset_clean)}` |\n")
         f.write(f"| **Batch size** | `{args.batch_size}` |\n")
         f.write(f"| **Timestamp** | `{timestamp}` |\n\n")
 
@@ -484,13 +638,27 @@ def main():
         f.write("| Metric | Precision | Recall | F1 |\n|---|---|---|---|\n")
         f.write(f"| **Macro** | {mac_p_n:.4f} | {mac_r_n:.4f} | **{mac_f1_n:.4f}** |\n")
         f.write(f"| **Micro** | {mic_p_n:.4f} | {mic_r_n:.4f} | **{mic_f1_n:.4f}** |\n\n")
+        f.write("| Timing | Value |\n|---|---|\n")
+        f.write(f"| **Total inference time** | `{inf_time_n:.2f} s` |\n")
+        f.write(f"| **Avg iterations/sec** | `{iter_sec_n:.2f}` |\n")
+        f.write(f"| **Samples/sec** | `{samp_sec_n:.2f}` |\n\n")
         f.write(f"```\n{report_names}\n```\n\n")
 
+        desc_trunc_note = (
+            f"`{max_tokens_per_desc}` token/label (troncato per mono-encoder)"
+            if max_tokens_per_desc is not None
+            else "nessun troncamento (bi-encoder, label processate separatamente)"
+        )
         f.write("## 🔵 Evaluation 2 — Label Descriptions (Excluding 'O')\n")
-        f.write("Entity types used: extended descriptions from label2desc.json\n\n")
+        f.write(f"Entity types used: extended descriptions from label2desc.json\n")
+        f.write(f"Description truncation: {desc_trunc_note}\n\n")
         f.write("| Metric | Precision | Recall | F1 |\n|---|---|---|---|\n")
         f.write(f"| **Macro** | {mac_p_d:.4f} | {mac_r_d:.4f} | **{mac_f1_d:.4f}** |\n")
         f.write(f"| **Micro** | {mic_p_d:.4f} | {mic_r_d:.4f} | **{mic_f1_d:.4f}** |\n\n")
+        f.write("| Timing | Value |\n|---|---|\n")
+        f.write(f"| **Total inference time** | `{inf_time_d:.2f} s` |\n")
+        f.write(f"| **Avg iterations/sec** | `{iter_sec_d:.2f}` |\n")
+        f.write(f"| **Samples/sec** | `{samp_sec_d:.2f}` |\n\n")
         f.write(f"```\n{report_desc}\n```\n")
 
     print(f"\n💾 Results saved to: {filename}")

@@ -216,7 +216,12 @@ def compute_span_metrics(tp_dict, fp_dict, fn_dict, support_dict, id2label, back
     micro_r  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
     micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) > 0 else 0.0
 
-    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, report_lines
+    total_support = sum(support_dict[l] for l in all_ids)
+    weighted_p = sum(p_list[i] * support_dict[all_ids[i]] for i in range(len(all_ids))) / total_support if total_support > 0 else 0.0
+    weighted_r = sum(r_list[i] * support_dict[all_ids[i]] for i in range(len(all_ids))) / total_support if total_support > 0 else 0.0
+    weighted_f1 = sum(f1_list[i] * support_dict[all_ids[i]] for i in range(len(all_ids))) / total_support if total_support > 0 else 0.0
+
+    return macro_p, macro_r, macro_f1, micro_p, micro_r, micro_f1, weighted_p, weighted_r, weighted_f1, report_lines
 
 
 # ==========================================================
@@ -459,6 +464,9 @@ if __name__ == "__main__":
     prec_micro, rec_micro, f1_micro, _ = precision_recall_fscore_support(
         y_true_all, y_pred_all, average="micro", zero_division=0, labels=all_label_ids
     )
+    prec_weighted, rec_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        y_true_all, y_pred_all, average="weighted", zero_division=0, labels=all_label_ids
+    )
     
     class_report = classification_report(
         y_true_all, y_pred_all, 
@@ -469,7 +477,10 @@ if __name__ == "__main__":
     )
 
     # --- METRICHE CLEAN (Senza O) ---
-    f1_macro_no_o, f1_micro_no_o = 0.0, 0.0
+    p_ma_no = r_ma_no = f1_macro_no_o = 0.0
+    p_mi_no = r_mi_no = f1_micro_no_o = 0.0
+    p_we_no = r_we_no = f1_weighted_no_o = 0.0
+    
     if o_label_id != -1 and len(no_o_label_ids) > 0:
         p_ma_no, r_ma_no, f1_macro_no_o, _ = precision_recall_fscore_support(
             y_true_all, y_pred_all, average="macro", zero_division=0, labels=no_o_label_ids
@@ -477,7 +488,10 @@ if __name__ == "__main__":
         p_mi_no, r_mi_no, f1_micro_no_o, _ = precision_recall_fscore_support(
             y_true_all, y_pred_all, average="micro", zero_division=0, labels=no_o_label_ids
         )
-    
+        p_we_no, r_we_no, f1_weighted_no_o, _ = precision_recall_fscore_support(
+            y_true_all, y_pred_all, average="weighted", zero_division=0, labels=no_o_label_ids
+        )
+
     print(f"\n{'='*70}")
     print(f"📊 RISULTATI TEST (SOFT TABLE)")
     print(f"{'='*70}")
@@ -487,17 +501,24 @@ if __name__ == "__main__":
     print(f"Velocità:            {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
     
     print(f"\n🎯 METRICHE AGGREGATE (Tutte le label inclusa 'O'):")
-    print(f"  Macro F1:          {f1_macro:.4f}")
-    print(f"  Micro F1:          {f1_micro:.4f}")
+    print(f"| Average Type | Precision | Recall | F1-Score |")
+    print(f"|:-------------|----------:|-------:|---------:|")
+    print(f"| **Macro**    | {prec_macro:.4f} | {rec_macro:.4f} | **{f1_macro:.4f}** |")
+    print(f"| **Micro**    | {prec_micro:.4f} | {rec_micro:.4f} | **{f1_micro:.4f}** |")
+    print(f"| Weighted     | {prec_weighted:.4f} | {rec_weighted:.4f} | {f1_weighted:.4f} |")
 
     if o_label_id != -1:
         print(f"\n🚀 METRICHE CLEAN (Esclusa 'O'):")
-        print(f"  Macro F1 (No-O):   {f1_macro_no_o:.4f}")
-        print(f"  Micro F1 (No-O):   {f1_micro_no_o:.4f}")
+        print(f"| Average Type | Precision | Recall | F1-Score |")
+        print(f"|:-------------|----------:|-------:|---------:|")
+        print(f"| **Macro**    | {p_ma_no:.4f} | {r_ma_no:.4f} | **{f1_macro_no_o:.4f}** |")
+        print(f"| **Micro**    | {p_mi_no:.4f} | {r_mi_no:.4f} | **{f1_micro_no_o:.4f}** |")
+        print(f"| Weighted     | {p_we_no:.4f} | {r_we_no:.4f} | {f1_weighted_no_o:.4f} |")
 
     # ---- Span-based report ----
     span_macro_p, span_macro_r, span_macro_f1, \
     span_micro_p, span_micro_r, span_micro_f1, \
+    span_weighted_p, span_weighted_r, span_weighted_f1, \
     span_report_lines = compute_span_metrics(
         span_tp, span_fp, span_fn, span_support, id2label, background_id
     )
@@ -505,8 +526,11 @@ if __name__ == "__main__":
     print(f"\n{'='*70}")
     print(f"🎯 METRICHE SPAN-BASED (Exact Match, escluso background 'O')")
     print(f"{'='*70}")
-    print(f"  Macro P:   {span_macro_p:.4f}  |  Macro R:   {span_macro_r:.4f}  |  Macro F1:   {span_macro_f1:.4f}")
-    print(f"  Micro P:   {span_micro_p:.4f}  |  Micro R:   {span_micro_r:.4f}  |  Micro F1:   {span_micro_f1:.4f}")
+    print(f"| Average Type | Precision | Recall | F1-Score |")
+    print(f"|:-------------|----------:|-------:|---------:|")
+    print(f"| **Macro**    | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |")
+    print(f"| **Micro**    | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |")
+    print(f"| Weighted     | {span_weighted_p:.4f} | {span_weighted_r:.4f} | {span_weighted_f1:.4f} |")
     print(f"\n📋 REPORT SPAN PER CLASSE:")
     for line in span_report_lines:
         print(line)
@@ -570,21 +594,29 @@ if __name__ == "__main__":
         f.write(f"- **Token valutati:** {len(y_true_all):,}\n")
         f.write(f"- **Tempo Inferenza:** {infer_time:.2f} s\n")
         f.write(f"- **Velocità:** {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s\n\n")
-        f.write(f"- **Macro F1:** {f1_macro:.4f}\n")
-        f.write(f"- **Micro F1:** {f1_micro:.4f}\n")
+        
+        f.write(f"| Average Type | Precision | Recall | F1-Score |\n")
+        f.write(f"|:-------------|----------:|-------:|---------:|\n")
+        f.write(f"| **Macro**    | {prec_macro:.4f} | {rec_macro:.4f} | **{f1_macro:.4f}** |\n")
+        f.write(f"| **Micro**    | {prec_micro:.4f} | {rec_micro:.4f} | **{f1_micro:.4f}** |\n")
+        f.write(f"| Weighted     | {prec_weighted:.4f} | {rec_weighted:.4f} | {f1_weighted:.4f} |\n")
 
         if o_label_id != -1:
              f.write(f"\n## Metriche Clean (No 'O')\n")
-             f.write(f"- **Macro F1 (No-O):** {f1_macro_no_o:.4f}\n")
-             f.write(f"- **Micro F1 (No-O):** {f1_micro_no_o:.4f}\n")
+             f.write(f"| Average Type | Precision | Recall | F1-Score |\n")
+             f.write(f"|:-------------|----------:|-------:|---------:|\n")
+             f.write(f"| **Macro**    | {p_ma_no:.4f} | {r_ma_no:.4f} | **{f1_macro_no_o:.4f}** |\n")
+             f.write(f"| **Micro**    | {p_mi_no:.4f} | {r_mi_no:.4f} | **{f1_micro_no_o:.4f}** |\n")
+             f.write(f"| Weighted     | {p_we_no:.4f} | {r_we_no:.4f} | {f1_weighted_no_o:.4f} |\n")
 
         f.write(f"\n## Report Token-Level per classe\n```\n{class_report}\n```\n")
 
         f.write(f"\n## Metriche Span-Based (Exact Match, escluso background 'O')\n")
-        f.write(f"| Metric | Precision | Recall | F1 |\n")
-        f.write(f"|------|-----------|--------|-----|\n")
-        f.write(f"| **Macro** | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")
-        f.write(f"| **Micro** | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |\n")
+        f.write(f"| Average Type | Precision | Recall | F1-Score |\n")
+        f.write(f"|:-------------|----------:|-------:|---------:|\n")
+        f.write(f"| **Macro**    | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")
+        f.write(f"| **Micro**    | {span_micro_p:.4f} | {span_micro_r:.4f} | **{span_micro_f1:.4f}** |\n")
+        f.write(f"| Weighted     | {span_weighted_p:.4f} | {span_weighted_r:.4f} | {span_weighted_f1:.4f} |\n")
         f.write(f"\n### Report Span per Classe\n```\n")
         for line in span_report_lines:
             f.write(line + "\n")

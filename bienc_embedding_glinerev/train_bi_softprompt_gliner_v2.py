@@ -228,22 +228,32 @@ class SoftGlinerTrainer:
             print(f"  {'Component':<25} {'Total':<15} {'Trainable':<15} {'% Trainable'}")
             print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
             
-            components = {
+            # ⚠️  prompt_encoder è annidato DENTRO token_rep_layer (tramite il wrapper).
+            # Per evitare double-counting, escludiamo i suoi param_id dagli altri componenti.
+            _pe = wrapped_encoder.prompt_encoder if hasattr(wrapped_encoder, 'prompt_encoder') else None
+            _pe_ids = {id(p) for p in _pe.parameters()} if _pe is not None else set()
+            
+            def _count(comp, exclude_ids=set()):
+                total     = sum(p.numel() for p in comp.parameters() if id(p) not in exclude_ids)
+                trainable = sum(p.numel() for p in comp.parameters() if id(p) not in exclude_ids and p.requires_grad)
+                return total, trainable
+
+            gliner_components = {
                 'token_rep_layer': getattr(model, 'token_rep_layer', None),
-                'rnn': getattr(model, 'rnn', None),
-                'span_rep_layer': getattr(model, 'span_rep_layer', None),
-                'prompt_rep_layer': getattr(model, 'prompt_rep_layer', None),
-                'prompt_encoder': wrapped_encoder.prompt_encoder if hasattr(wrapped_encoder, 'prompt_encoder') else None,
+                'rnn':             getattr(model, 'rnn', None),
+                'span_rep_layer':  getattr(model, 'span_rep_layer', None),
+                'prompt_rep_layer':getattr(model, 'prompt_rep_layer', None),
             }
             
             total_params = 0
             trainable_params = 0
             
-            for comp_name, comp in components.items():
+            for comp_name, comp in gliner_components.items():
                 if comp is None:
                     continue
-                comp_total = sum(p.numel() for p in comp.parameters())
-                comp_trainable = sum(p.numel() for p in comp.parameters() if p.requires_grad)
+                # Per token_rep_layer escludiamo prompt_encoder (è annidato dentro)
+                exclude = _pe_ids if comp_name == 'token_rep_layer' else set()
+                comp_total, comp_trainable = _count(comp, exclude)
                 comp_pct = (comp_trainable / comp_total * 100) if comp_total > 0 else 0
                 
                 status = "🔥" if comp_trainable > 0 else "❄️"
@@ -252,8 +262,18 @@ class SoftGlinerTrainer:
                 total_params += comp_total
                 trainable_params += comp_trainable
             
+            # prompt_encoder: contato UNA SOLA VOLTA, separatamente
+            if _pe is not None:
+                pe_total, pe_trainable = _count(_pe)
+                pe_pct = (pe_trainable / pe_total * 100) if pe_total > 0 else 0
+                status = "🔥" if pe_trainable > 0 else "❄️"
+                print(f"  {status} {'prompt_encoder':<23} {pe_total:>13,}  {pe_trainable:>13,}  {pe_pct:>10.2f}%")
+                total_params    += pe_total
+                trainable_params += pe_trainable
+            
             print(f"  {'-'*25} {'-'*15} {'-'*15} {'-'*12}")
-            print(f"  {'TOTAL':<25} {total_params:>13,}  {trainable_params:>13,}  {trainable_params/total_params*100:>10.2f}%")
+            print(f"  {'TOTAL':<25} {total_params:>13,}  {trainable_params:>13,}")
+            print(f"\n  📊 Trainable params (absolute): {trainable_params:,}  ({trainable_params / total_params * 100:.2f}% of total)")
             print("="*70 + "\n")
 
     def train(self):
@@ -567,23 +587,6 @@ print(f"🖥️ CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"🖥️ GPU: {torch.cuda.get_device_name(0)}")
 
-# ==========================================
-# 4.5. BASELINE TEST (PRE-TRAINING) - Usando GLiNER evaluate()
-# ==========================================
-print("\n" + "="*50)
-print("🔬 BASELINE EVALUATION (Pre-Training)")
-print("="*50)
-model.eval()
-baseline_output, baseline_f1 = model.evaluate(
-    test_data=test_dataset,
-    flat_ner=True,
-    multi_label=False,
-    threshold=0.5,
-    batch_size=16
-)
-print(f"Baseline Results:\n{baseline_output}")
-print(f"Baseline F1: {baseline_f1:.4f}")
-print("="*50)
 
 trainer_wrapper = SoftGlinerTrainer(
     model=model, train_dataset=train_dataset, val_dataset=val_dataset,
@@ -679,9 +682,6 @@ checkpoint = {
     
     # Metriche del test
     "test_metrics": metrics,
-    
-    # Baseline F1 pre-training
-    "baseline_f1": baseline_f1,
 }
 
 # Salva tutto in un unico file .pt
@@ -692,5 +692,5 @@ print("✅ Salvataggio completato.")
 print(f"\n✅ Script terminato.")
 print(f"📁 Directory Output: {save_dir}")
 print(f"📄 Checkpoint salvato in: {checkpoint_filename}")
-print(f"   Contenuto: trainable_params (RNN+SpanRep+PromptEncoder), architecture, hyperparameters, dataset_info, backbone, timestamp, test_metrics, baseline_f1")
+print(f"   Contenuto: trainable_params (RNN+SpanRep+PromptEncoder), architecture, hyperparameters, dataset_info, backbone, timestamp, test_metrics")
 print(f"\n⚠️  IMPORTANTE: Per riprodurre i risultati, usa questo checkpoint che contiene TUTTI i parametri allenati!")

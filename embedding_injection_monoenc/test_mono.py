@@ -27,8 +27,8 @@ import time
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-#DATASET = '../dataset_bc5cdr/'
-DATASET = '../dataset/'
+DATASET = '../dataset_bc5cdr/'
+#DATASET = '../dataset/'
 
 
 TEST_PATH = DATASET + 'test_dataset_tknlvl_mono.json'
@@ -497,8 +497,10 @@ micro_p, micro_r, micro_f1, _ = precision_recall_fscore_support(
 print(f"\n🏆 GLOBAL TOKEN-LEVEL METRICS (No O Class):")
 print(f"   • Tempo Inferenza: {infer_time:.2f} s")
 print(f"   • Velocità: {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
-print(f"   • MACRO: F1={macro_f1:.4f}")
-print(f"   • MICRO: F1={micro_f1:.4f}")
+print(f"\n| {'Metric':<8} | {'Precision':>10} | {'Recall':>8} | {'F1':>8} |")
+print(f"|{'-'*10}|{'-'*12}|{'-'*10}|{'-'*10}|")
+print(f"| {'Macro':<8} | {macro_p:>10.4f} | {macro_r:>8.4f} | {macro_f1:>8.4f} |")
+print(f"| {'Micro':<8} | {micro_p:>10.4f} | {micro_r:>8.4f} | {micro_f1:>8.4f} |")
 
 class_report = classification_report(
     y_true, y_pred, target_names=relevant_label_names, labels=relevant_label_ids, zero_division=0
@@ -540,18 +542,22 @@ with open(filename, "w", encoding="utf-8") as f:
     f.write(f"## 🔧 Training Configuration\n")
     f.write(f"{config_table}\n\n")
 
-    f.write(f"## Metriche Chiave\n")
+    f.write(f"## ⏱️ Inference Info\n")
     f.write(f"| Metric | Value |\n|---|---|\n")
     f.write(f"| **Tempo Inferenza** | {infer_time:.2f} s |\n")
     f.write(f"| **Samples/s** | {samples_per_sec:.2f} |\n")
-    f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n")
-    f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
-    f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
-    
-    f.write(f"## Report Token-Level\n```\n{class_report}\n```\n")
+    f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n\n")
+
+    f.write(f"## 🏷️ Token-Level Metrics (No O Class)\n")
+    f.write(f"| Metric | Precision | Recall | F1 |\n")
+    f.write(f"|--------|-----------|--------|---------|\n")
+    f.write(f"| **Macro** | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |\n")
+    f.write(f"| **Micro** | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |\n\n")
+
+    f.write(f"### Report Token-Level per Classe\n```\n{class_report}\n```\n")
 
     if span_data is not None:
-        f.write(f"\n## Metriche Span-Based (Exact Match, escluso 'O')\n")
+        f.write(f"\n## 🎯 Span-Based Metrics (Exact Match, No O Class)\n")
         f.write(f"| Metric | Precision | Recall | F1 |\n")
         f.write(f"|--------|-----------|--------|---------|\n")
         f.write(f"| **Macro** | {span_macro_p:.4f} | {span_macro_r:.4f} | **{span_macro_f1:.4f}** |\n")

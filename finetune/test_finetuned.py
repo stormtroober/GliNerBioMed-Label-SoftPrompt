@@ -142,12 +142,12 @@ def calculate_metrics(dataset, model, batch_size=8):
     print(f"   • Tempo Inferenza: {infer_time:.2f} s")
     print(f"   • Velocità: {samples_per_sec:.2f} samples/s | {tokens_per_sec:.2f} tokens/s")
     print(f"### Performance Summary")
-    print(f"| Average Type | Precision | Recall | F1-Score |")
-    print(f"|:-------------|----------:|-------:|---------:|")
-    print(f"| **Macro**    | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |")
-    print(f"| **Micro**    | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |")
+    print(f"| Metric | Precision | Recall | F1-Score |")
+    print(f"| :--- | :--- | :--- | :--- |")
+    print(f"| **Macro** | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |")
+    print(f"| **Micro** | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |")
 
-    return macro_f1, micro_f1, "\n".join(report_lines), infer_time, samples_per_sec, tokens_per_sec
+    return macro_f1, micro_f1, macro_p, macro_r, micro_p, micro_r, "\n".join(report_lines), infer_time, samples_per_sec, tokens_per_sec
 
 def convert_ids_to_labels(dataset, id_map):
     converted_count = 0
@@ -474,7 +474,7 @@ def main():
     test_dataset = convert_ids_to_labels(test_dataset, id2label)
     print(f'Final Test dataset size: {len(test_dataset)}')
     
-    macro_f1, micro_f1, report_str, infer_time, samples_per_sec, tokens_per_sec = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
+    macro_f1, micro_f1, macro_p, macro_r, micro_p, micro_r, report_str, infer_time, samples_per_sec, tokens_per_sec = calculate_metrics(test_dataset, model, batch_size=args.batch_size)
     
     # Export Results
     TEST_RESULTS_DIR = os.path.join(script_dir, "test/results")
@@ -504,12 +504,17 @@ def main():
         
         # Metrics Section
         f.write("## 📊 Metriche Chiave\n")
-        f.write("| Metric | Value |\n|---|---|\n")
+        f.write("| Metric | Value |\n| :--- | :--- |\n")
         f.write(f"| **Tempo Inferenza** | {infer_time:.2f} s |\n")
         f.write(f"| **Samples/s** | {samples_per_sec:.2f} |\n")
-        f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n")
-        f.write(f"| **Macro F1** | {macro_f1:.4f} |\n")
-        f.write(f"| **Micro F1** | {micro_f1:.4f} |\n\n")
+        f.write(f"| **Tokens/s** | {tokens_per_sec:.2f} |\n\n")
+
+        # Performance Summary Table
+        f.write("## 📈 Performance Summary\n")
+        f.write("| Metric | Precision | Recall | F1-Score |\n")
+        f.write("| :--- | :--- | :--- | :--- |\n")
+        f.write(f"| **Macro** | {macro_p:.4f} | {macro_r:.4f} | **{macro_f1:.4f}** |\n")
+        f.write(f"| **Micro** | {micro_p:.4f} | {micro_r:.4f} | **{micro_f1:.4f}** |\n\n")
         
         # Report Section
         f.write("## 📝 Report\n```\n")

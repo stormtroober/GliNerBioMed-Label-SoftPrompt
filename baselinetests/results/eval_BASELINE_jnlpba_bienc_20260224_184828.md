@@ -7,8 +7,9 @@
 | **Encoder** | `bi` |
 | **Dataset** | `jnlpba` |
 | **Test file** | `test_dataset_span_bi.json` |
+| **Test samples** | `2000` |
 | **Batch size** | `8` |
-| **Timestamp** | `20260220_161125` |
+| **Timestamp** | `20260224_184828` |
 
 ## 🟢 Evaluation 1 — Label Names (Excluding 'O')
 Entity types used: ['cell line', 'cell type', 'dna', 'protein', 'rna']
@@ -17,6 +18,12 @@ Entity types used: ['cell line', 'cell type', 'dna', 'protein', 'rna']
 |---|---|---|---|
 | **Macro** | 0.4543 | 0.5061 | **0.4754** |
 | **Micro** | 0.5675 | 0.6414 | **0.6022** |
+
+| Timing | Value |
+|---|---|
+| **Total inference time** | `60.93 s` |
+| **Avg iterations/sec** | `4.10` |
+| **Samples/sec** | `32.83` |
 
 ```
 Label                          | Prec.    | Rec.     | F1       | Supp.   
@@ -35,6 +42,12 @@ Entity types used: extended descriptions from label2desc.json
 |---|---|---|---|
 | **Macro** | 0.2523 | 0.0646 | **0.0935** |
 | **Micro** | 0.2568 | 0.0335 | **0.0593** |
+
+| Timing | Value |
+|---|---|
+| **Total inference time** | `69.56 s` |
+| **Avg iterations/sec** | `3.59` |
+| **Samples/sec** | `28.75` |
 
 ```
 Label                          | Prec.    | Rec.     | F1       | Supp.   
